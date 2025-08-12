@@ -1,9 +1,9 @@
 #include "utils.h"
 #include <Adafruit_APDS9960.h> // Adafruit_APDS9960. v1.3.0
-#include <EEPROM.h>
-#include <Freenove_WS2812_Lib_for_ESP32.h> // Freenove WS2812 Lib for ESP32. v1.0.5
+#include <FastLED.h> // Add this line
 #include <ICM_20948.h> // SparkFun ICM-20948 Arduino Library. v1.2.12
-#include <Servo.h> // ServoESP32. v1.03
+#include <ESP32Servo.h> // ESP32Servo by Kevin Harrington 3.0.8
+#include <EEPROM.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
@@ -87,7 +87,6 @@ pidConstants pidSpeed(110, 375, 2);
 kalmanFilter kfPID(6.0, 1.0, 1.0);
 pidController leftControl(kfPID, pidSpeed, samplingTimeS, minPWMValue, maxPWMValue);
 pidController rightControl(kfPID, pidSpeed, samplingTimeS, minPWMValue, maxPWMValue);
-
 const int observationPeriod = 28800; //us
 const int observationTime = 1600; //us
 const int numberOfCycles = observationPeriod / observationTime;
@@ -165,7 +164,9 @@ int sendMessages = 0;
 
 Servo frontServo;
 Adafruit_APDS9960 frontSensor;
-Freenove_ESP32_WS2812 strip = Freenove_ESP32_WS2812(1, ledPin);
+// Freenove_ESP32_WS2812 strip = Freenove_ESP32_WS2812(1, ledPin);
+#define NUM_LEDS 1
+CRGB leds[NUM_LEDS];
 WiFiUDP udp;
 ICM_20948_I2C imu;
 
@@ -274,11 +275,20 @@ void setup() {
     Serial.begin(115200);
   #endif
 
-  analogWriteFrequency(pwmFrequency);
-  analogWriteResolution(pwmResolution);
+  // Set PWM frequency and resolution for each H-bridge pin
+  analogWriteFrequency(leftMotorForward, pwmFrequency);
+  analogWriteFrequency(leftMotorBackward, pwmFrequency);
+  analogWriteFrequency(rightMotorForward, pwmFrequency);
+  analogWriteFrequency(rightMotorBackward, pwmFrequency);
+
+  analogWriteResolution(leftMotorForward, pwmResolution);
+  analogWriteResolution(leftMotorBackward, pwmResolution);
+  analogWriteResolution(rightMotorForward, pwmResolution);
+  analogWriteResolution(rightMotorBackward, pwmResolution);
 
   WiFi.begin(ssid, password);
-  strip.begin();
+  // strip.begin();
+  FastLED.addLeds<NEOPIXEL, ledPin>(leds, NUM_LEDS);
   WiFiStatus();
   ArduinoOTA.begin();
   udp.begin(localPort);
@@ -287,6 +297,10 @@ void setup() {
   Wire.setClock(400000);
   // setupIMU();
 
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
   frontServo.attach(frontServoPin);
   frontServo.write(90);
   delay(500);
@@ -495,8 +509,11 @@ void WiFiStatus() {
     ConfigureHBridge(0, 0);
     DebugSerialPrintln("Conectando WiFi ...");
     for (int brillo : { maxBrightness, 0 }) {
-      strip.setBrightness(brillo);
-      strip.setAllLedsColor(strip.Wheel(170));
+      // strip.setBrightness(brillo);
+      // strip.setAllLedsColor(strip.Wheel(170));
+      FastLED.setBrightness(brillo);
+      fill_solid(leds, NUM_LEDS, CHSV(170, 255, 255));
+      FastLED.show();
       delay(250);
     }
   }
@@ -515,8 +532,11 @@ void SetupFrontSensor() {
   while (!frontSensor.begin()) {
     DebugSerialPrintln("Fallo la inialización del sensor APDS-9960.");
     for (int brillo : { maxBrightness, 0 }) {
-      strip.setBrightness(brillo);
-      strip.setAllLedsColor(strip.Wheel(0));
+      // strip.setBrightness(brillo);
+      // strip.setAllLedsColor(strip.Wheel(0));
+      FastLED.setBrightness(brillo);
+      fill_solid(leds, NUM_LEDS, CHSV(0, 255, 255));
+      FastLED.show();
       delay(250);
     }
   }
@@ -541,8 +561,11 @@ void CommunicationTest(){
       }
     }
   } else {
-    strip.setBrightness(255);
-    strip.setAllLedsColor(strip.Wheel(0));
+    // strip.setBrightness(255);
+    // strip.setAllLedsColor(strip.Wheel(0));
+    FastLED.setBrightness(255);
+    fill_solid(leds, NUM_LEDS, CHSV(0, 255, 255));
+    FastLED.show();
     delay(500);
   }
 }
@@ -844,16 +867,25 @@ void ReadSensors() {
 
   if (debugUdp == 3) {
     if (leftObstacle || centralObstacle || rightObstacle) {
-      strip.setBrightness(maxBrightness);
-      strip.setAllLedsColor(strip.Wheel(200));
+      // strip.setBrightness(maxBrightness);
+      // strip.setAllLedsColor(strip.Wheel(200));
+      FastLED.setBrightness(maxBrightness);
+      fill_solid(leds, NUM_LEDS, CHSV(200, 255, 255));
+      FastLED.show();
     } else {
-      strip.setBrightness(0);
-      strip.setAllLedsColor(strip.Wheel(200));
+      // strip.setBrightness(0);
+      // strip.setAllLedsColor(strip.Wheel(200));
+      FastLED.setBrightness(0);
+      fill_solid(leds, NUM_LEDS, CHSV(200, 255, 255));
+      FastLED.show();
     }
   } else {
     if ((digitalRead(batteryStatus) == LOW) && ((millis() - lowBatteryTime) >= minLowBatteryTime)) {
-      strip.setBrightness(255);
-      strip.setAllLedsColor(strip.Wheel(120));
+      // strip.setBrightness(255);
+      // strip.setAllLedsColor(strip.Wheel(120));
+      FastLED.setBrightness(255);
+      fill_solid(leds, NUM_LEDS, CHSV(120, 255, 255));
+      FastLED.show();
     }
   }
 }
@@ -1128,8 +1160,11 @@ void setupIMU() {
     if (imu.status != ICM_20948_Stat_Ok) {
       DebugSerialPrintln("Fallo inicializando la IMU, provando de nuevo...");
       for (int brillo : { maxBrightness, 0 }) {
-        strip.setBrightness(brillo);
-        strip.setAllLedsColor(strip.Wheel(85));
+        // strip.setBrightness(brillo);
+        // strip.setAllLedsColor(strip.Wheel(85));
+        FastLED.setBrightness(brillo);
+        fill_solid(leds, NUM_LEDS, CHSV(85, 255, 255));
+        FastLED.show();
         delay(250);
       }
     } else {
@@ -1153,14 +1188,20 @@ void setupIMU() {
   if (!success) {
     DebugSerialPrintln("Fallo la inicializacion del DPM.");
     DebugSerialPrintln("Verifique que la linea 29 (#define ICM_20948_USE_DMP) de ICM_20948_C.h este sin comentar.");
-    strip.setBrightness(maxBrightness);
-    strip.setAllLedsColor(strip.Wheel(85));
+    // strip.setBrightness(maxBrightness);
+    // strip.setAllLedsColor(strip.Wheel(85));
+    FastLED.setBrightness(maxBrightness);
+    fill_solid(leds, NUM_LEDS, CHSV(85, 255, 255));
+    FastLED.show();
   }
 
   if (!EEPROM.begin(128)) {
     DebugSerialPrintln("Fallo la inicializacion de la EEPROM.");
-    strip.setBrightness(maxBrightness);
-    strip.setAllLedsColor(strip.Wheel(0));
+    // strip.setBrightness(maxBrightness);
+    // strip.setAllLedsColor(strip.Wheel(0));
+    FastLED.setBrightness(maxBrightness);
+    fill_solid(leds, NUM_LEDS, CHSV(0, 255, 255));
+    FastLED.show();
   }
 
   EEPROM.get(0, store);
@@ -1177,13 +1218,19 @@ void setupIMU() {
 
     if (!success) {
       DebugSerialPrintln("No se pudo restaurar la calibracion de la IMU.");
-      strip.setBrightness(maxBrightness);
-      strip.setAllLedsColor(strip.Wheel(0));
+      // strip.setBrightness(maxBrightness);
+      // strip.setAllLedsColor(strip.Wheel(0));
+      FastLED.setBrightness(maxBrightness);
+      fill_solid(leds, NUM_LEDS, CHSV(0, 255, 255));
+      FastLED.show();
     }
   } else {
     DebugSerialPrintln("No se encontro una calibracion valida para la IMU.");
-    strip.setBrightness(maxBrightness);
-    strip.setAllLedsColor(strip.Wheel(0));
+    // strip.setBrightness(maxBrightness);
+    // strip.setAllLedsColor(strip.Wheel(0));
+    FastLED.setBrightness(maxBrightness);
+    fill_solid(leds, NUM_LEDS, CHSV(0, 255, 255));
+    FastLED.show();
   }
 }
 
