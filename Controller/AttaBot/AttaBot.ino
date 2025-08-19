@@ -275,16 +275,24 @@ void setup() {
     Serial.begin(115200);
   #endif
 
-  // Set PWM frequency and resolution for each H-bridge pin
-  analogWriteFrequency(leftMotorForward, pwmFrequency);
-  analogWriteFrequency(leftMotorBackward, pwmFrequency);
-  analogWriteFrequency(rightMotorForward, pwmFrequency);
-  analogWriteFrequency(rightMotorBackward, pwmFrequency);
+  // ¡IMPORTANTE! Configurar servo ANTES que los motores
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  
+  frontServo.setPeriodHertz(50);
+  frontServo.attach(frontServoPin, 1000, 2000);
+  frontServo.write(90);  // <- AGREGAR ESTA LÍNEA
+  delay(1000);           // <- AUMENTAR EL DELAY
 
-  analogWriteResolution(leftMotorForward, pwmResolution);
-  analogWriteResolution(leftMotorBackward, pwmResolution);
-  analogWriteResolution(rightMotorForward, pwmResolution);
-  analogWriteResolution(rightMotorBackward, pwmResolution);
+
+  ledcAttach(leftMotorForward, pwmFrequency, pwmResolution);   // Pin 12
+  ledcAttach(leftMotorBackward, pwmFrequency, pwmResolution);  // Pin 14
+  ledcAttach(rightMotorForward, pwmFrequency, pwmResolution);  // Pin 13
+  ledcAttach(rightMotorBackward, pwmFrequency, pwmResolution); // Pin 15
+
+  ConfigureHBridge(0, 0);
 
   WiFi.begin(ssid, password);
   // strip.begin();
@@ -295,15 +303,7 @@ void setup() {
   DebugSerialPrintf("El servidor UDP se inició en el puerto: %u\n", localPort);
   Wire.begin();
   Wire.setClock(400000);
-  // setupIMU();
-
-  ESP32PWM::allocateTimer(0);
-  ESP32PWM::allocateTimer(1);
-  ESP32PWM::allocateTimer(2);
-  ESP32PWM::allocateTimer(3);
-  frontServo.attach(frontServoPin);
-  frontServo.write(90);
-  delay(500);
+  // setupIMU();         
 
   pinMode(leftEncoderC1, INPUT_PULLUP);
   pinMode(leftEncoderC2, INPUT_PULLUP);
@@ -922,19 +922,29 @@ void ResetPID() {
 ***************************************************************************************/
 void ConfigureHBridge(int leftWheelPWM, int rightWheelPWM) {
   if (leftWheelPWM >= 0) {
-    analogWrite(leftMotorBackward, 0);
-    analogWrite(leftMotorForward, leftWheelPWM);
-  } else if (leftWheelPWM < 0) {
-    analogWrite(leftMotorForward, 0);
-    analogWrite(leftMotorBackward, _abs(leftWheelPWM));
+    ledcWrite(1, 0);  // leftMotorBackward a 0
+    ledcWrite(0, leftWheelPWM);  // leftMotorForward
+  } else {
+    ledcWrite(0, 0);  // leftMotorForward a 0
+    ledcWrite(1, abs(leftWheelPWM));  // leftMotorBackward
   }
 
   if (rightWheelPWM >= 0) {
-    analogWrite(rightMotorBackward, 0);
-    analogWrite(rightMotorForward, rightWheelPWM);
-  } else if (rightWheelPWM < 0) {
-    analogWrite(rightMotorForward, 0);
-    analogWrite(rightMotorBackward, _abs(rightWheelPWM));
+    ledcWrite(3, 0);  // rightMotorBackward a 0
+    ledcWrite(2, rightWheelPWM);  // rightMotorForward
+  } else {
+    ledcWrite(2, 0);  // rightMotorForward a 0
+    ledcWrite(3, abs(rightWheelPWM));  // rightMotorBackward
+  }
+
+  if (leftWheelPWM == 0) {
+    ledcWrite(0, 0);  // leftMotorForward
+    ledcWrite(1, 0);  // leftMotorBackward
+  }
+
+  if (rightWheelPWM == 0) {
+    ledcWrite(2, 0);  // rightMotorForward
+    ledcWrite(3, 0);  // rightMotorBackward
   }
 }
 
