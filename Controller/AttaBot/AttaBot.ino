@@ -1,8 +1,9 @@
 #include "utils.h"
 #include <Adafruit_APDS9960.h> // Adafruit_APDS9960. v1.3.0
-#include <FastLED.h> // Add this line
+#include <FastLED.h> // FastLED by Daniel Garcia and Mark Kriegsman. v3.4.0
 #include <ICM_20948.h> // SparkFun ICM-20948 Arduino Library. v1.2.12
 #include <ESP32Servo.h> // ESP32Servo by Kevin Harrington 3.0.8
+
 #include <EEPROM.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
@@ -64,12 +65,13 @@ unsigned long previousMillisRW = 0;
 const unsigned int SteadyStateTime = 800;
 unsigned long SteadyStatePreviousMillis = millis();
 int millisDifference;
+
 volatile int leftPulseCount = 0;
 volatile int rightPulseCount = 0;
 int pastLeftPulseCount = 0;
 int pastRightPulseCount = 0;
-int pastLeftEncoder = 0;
-int pastRightEncoder = 0;
+//int pastLeftEncoder = 0;
+//int pastRightEncoder = 0;
 float currentLeftSpeed = 0.0;
 float currentRightSpeed = 0.0;
 const float distanceOffset = 1 * millimetersPerPulse;
@@ -162,9 +164,43 @@ pose robotPose(0, 0, 0);
 int countMessages = 0;
 int sendMessages = 0;
 
+// Estructura para manejo del servo no bloqueante
+struct ServoController {
+  enum State {
+    IDLE,
+    SWEEPING,
+    COMPLETED
+  };
+  
+  State state = IDLE;
+  int currentAngle = 90;
+  int targetAngle = 90;
+  int startAngle = 0;
+  int endAngle = 180;
+  int stepSize = 5;
+  int delayMs = 100;
+  unsigned long lastMoveTime = 0;
+  int direction = 1;
+  bool sweepActive = false;
+};
+
+ServoController servoCtrl;
+
+// Tabla de lookup para evitar cálculos en ISR
+// Precalculada para mejorar rendimiento
+const int8_t ENCODER_LOOKUP[16] = {
+  0, -1, 1, 0,   // 0000, 0001, 0010, 0011
+  1, 0, 0, -1,   // 0100, 0101, 0110, 0111
+  -1, 0, 0, 1,   // 1000, 1001, 1010, 1011
+  0, 1, -1, 0    // 1100, 1101, 1110, 1111
+};
+
+// Variables para estados previos (más eficiente)
+volatile uint8_t pastLeftEncoder = 0;
+volatile uint8_t pastRightEncoder = 0;
+
 Servo frontServo;
 Adafruit_APDS9960 frontSensor;
-// Freenove_ESP32_WS2812 strip = Freenove_ESP32_WS2812(1, ledPin);
 #define NUM_LEDS 1
 CRGB leds[NUM_LEDS];
 WiFiUDP udp;
@@ -181,17 +217,18 @@ ICM_20948_I2C imu;
  garantiza una actualización rápida y eficiente de los pulsos de la rueda.
 
 *****************************************************************************************/
+// ISR IZQUIERDA OPTIMIZADA
 void IRAM_ATTR LeftWheelPulses() {
-  int MSB = digitalRead(leftEncoderC2);
-  int LSB = digitalRead(leftEncoderC1);
-  int encoder = (MSB << 1) | LSB;
-  int sum = (pastLeftEncoder << 2) | encoder;
-  if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011) {
-    leftPulseCount++;
-  } else if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000) {
-    leftPulseCount--;
-  }
-  pastLeftEncoder = encoder;
+  // Leer ambos pines en una sola operación
+  uint8_t currentEncoder = (digitalRead(leftEncoderC2) << 1) | digitalRead(leftEncoderC1);
+  
+  // Crear índice para lookup table
+  uint8_t index = (pastLeftEncoder << 2) | currentEncoder;
+  
+  // Usar lookup table en lugar de if/else
+  leftPulseCount += ENCODER_LOOKUP[index];
+  
+  pastLeftEncoder = currentEncoder;
 }
 
 
@@ -205,17 +242,14 @@ void IRAM_ATTR LeftWheelPulses() {
  garantiza una actualización rápida y eficiente de los pulsos de la rueda.
 
 ***************************************************************************************/
+// ISR DERECHA OPTIMIZADA
 void IRAM_ATTR RightWheelPulses() {
-  int MSB = digitalRead(rightEncoderC1);
-  int LSB = digitalRead(rightEncoderC2);
-  int encoder = (MSB << 1) | LSB;
-  int sum = (pastRightEncoder << 2) | encoder;
-  if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011) {
-    rightPulseCount++;
-  } else if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000) {
-    rightPulseCount--;
-  }
-  pastRightEncoder = encoder;
+  uint8_t currentEncoder = (digitalRead(rightEncoderC1) << 1) | digitalRead(rightEncoderC2);
+  uint8_t index = (pastRightEncoder << 2) | currentEncoder;
+  
+  rightPulseCount += ENCODER_LOOKUP[index];
+  
+  pastRightEncoder = currentEncoder;
 }
 
 
@@ -261,6 +295,80 @@ void LowBattery() {
   }
 }
 
+// Función para iniciar sweep no bloqueante
+void startServoSweep(int startAngle = 0, int endAngle = 180, int stepSize = 5, int delayMs = 100) {
+  servoCtrl.startAngle = constrain(startAngle, 0, 180);
+  servoCtrl.endAngle = constrain(endAngle, 0, 180);
+  servoCtrl.stepSize = constrain(abs(stepSize), 1, 45);
+  servoCtrl.delayMs = constrain(delayMs, 10, 2000);
+  
+  servoCtrl.currentAngle = servoCtrl.startAngle;
+  servoCtrl.targetAngle = servoCtrl.endAngle;
+  servoCtrl.direction = (servoCtrl.endAngle > servoCtrl.startAngle) ? 1 : -1;
+  
+  servoCtrl.state = ServoController::SWEEPING;
+  servoCtrl.sweepActive = true;
+  servoCtrl.lastMoveTime = millis();
+  
+  frontServo.write(servoCtrl.currentAngle);
+}
+
+// Función para actualizar servo (llamar en loop principal)
+void updateServoSweep() {
+  if (servoCtrl.state != ServoController::SWEEPING) {
+    return;
+  }
+  
+  unsigned long currentTime = millis();
+  if (currentTime - servoCtrl.lastMoveTime < servoCtrl.delayMs) {
+    return; // Aún no es tiempo de mover
+  }
+  
+  // Mover al siguiente ángulo
+  servoCtrl.currentAngle += servoCtrl.direction * servoCtrl.stepSize;
+  
+  // Verificar si hemos llegado al final
+  bool reachedEnd = (servoCtrl.direction > 0) ? 
+                   (servoCtrl.currentAngle >= servoCtrl.endAngle) : 
+                   (servoCtrl.currentAngle <= servoCtrl.endAngle);
+  
+  if (reachedEnd) {
+    servoCtrl.currentAngle = servoCtrl.endAngle;
+    servoCtrl.state = ServoController::COMPLETED;
+    servoCtrl.sweepActive = false;
+  }
+  
+  frontServo.write(servoCtrl.currentAngle);
+  servoCtrl.lastMoveTime = currentTime;
+}
+
+// Función para verificar si el sweep está completo
+bool isServoSweepComplete() {
+  return servoCtrl.state == ServoController::COMPLETED;
+}
+
+// Función para detener el sweep
+void stopServoSweep() {
+  servoCtrl.state = ServoController::IDLE;
+  servoCtrl.sweepActive = false;
+}
+
+// Función helper para lectura segura de contadores
+void getEncoderCounts(int& leftCount, int& rightCount) {
+  noInterrupts();  // Desactivar interrupciones
+  leftCount = leftPulseCount;
+  rightCount = rightPulseCount;
+  interrupts();    // Reactivar interrupciones
+}
+
+// Función helper para reset seguro de contadores
+void resetEncoderCounts() {
+  noInterrupts();
+  leftPulseCount = 0;
+  rightPulseCount = 0;
+  interrupts();
+}
+
 
 /***************************************************************************************
 
@@ -275,7 +383,7 @@ void setup() {
     Serial.begin(115200);
   #endif
 
-  // ¡IMPORTANTE! Configurar servo ANTES que los motores
+ 
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
   ESP32PWM::allocateTimer(2);
@@ -283,8 +391,8 @@ void setup() {
   
   frontServo.setPeriodHertz(50);
   frontServo.attach(frontServoPin, 1000, 2000);
-  frontServo.write(90);  // <- AGREGAR ESTA LÍNEA
-  delay(1000);           // <- AUMENTAR EL DELAY
+  frontServo.write(90);  
+  delay(200);           
 
 
   ledcAttach(leftMotorForward, pwmFrequency, pwmResolution);   // Pin 12
@@ -295,7 +403,7 @@ void setup() {
   ConfigureHBridge(0, 0);
 
   WiFi.begin(ssid, password);
-  // strip.begin();
+
   FastLED.addLeds<NEOPIXEL, ledPin>(leds, NUM_LEDS);
   WiFiStatus();
   ArduinoOTA.begin();
@@ -353,6 +461,7 @@ void loop() {
   WiFiStatus();
   ReadUdpPackets();
   ReadSensors();
+  updateServoSweep();
 
   switch (state) {
     case WAIT: {
@@ -373,16 +482,27 @@ void loop() {
     }
 
     case MOVE: {
+      // Iniciar sweep si no está activo
+      if (!servoCtrl.sweepActive && !isServoSweepComplete()) {
+        startServoSweep(0, 180, 5, 100);
+      }
+      
+      // Actualizar servo de forma no bloqueante
+      updateServoSweep();
+      
+      // Continuar con el movimiento
       movementReady = MoveDistanceByWheel(instructionValue, instructionValue);
-
+      
       if (movementReady) {
+        stopServoSweep(); // Detener sweep al completar movimiento
         MessageDebugf("DEBUG: -1, ID: %s, Movimiento completado", robotID);
         state = STOP;
       } else if (leftObstacle || centralObstacle || rightObstacle) {
+        stopServoSweep(); // Detener sweep si hay obstáculo
         obstacleSensors = (leftObstacle << 2) | (centralObstacle << 1) | rightObstacle; 
         state = STOP;
       }
-
+      
       break;
     }
 
@@ -902,8 +1022,7 @@ void ResetPID() {
   leftControl.Reset();
   rightControl.Reset();
   debugCounter = 0;
-  leftPulseCount = 0;
-  rightPulseCount = 0;
+  resetEncoderCounts();     
   pastLeftPulseCount = 0;
   pastRightPulseCount = 0;
 }
@@ -1045,15 +1164,20 @@ bool MoveDistanceByWheel(float leftDistance, float rightDistance) {
   if (millisDifference < samplingTime) {
     return false;
   }
-
+  
   previousMillis = currentMillis;
-
-  // Se calculan las velocidades de ambas ruedas
-  currentLeftSpeed = ((leftPulseCount - pastLeftPulseCount) * millimetersPerPulse) / samplingTimeS;  // velocidad en mm/s
-  pastLeftPulseCount = leftPulseCount;
-  currentRightSpeed = ((rightPulseCount - pastRightPulseCount) * millimetersPerPulse) / samplingTimeS;  // velocidad en mm/s
-  pastRightPulseCount = rightPulseCount;
-
+  
+  // LECTURA SEGURA DE CONTADORES
+  int currentLeftCount, currentRightCount;
+  getEncoderCounts(currentLeftCount, currentRightCount);
+  
+  // Calcular velocidades usando valores seguros
+  currentLeftSpeed = ((currentLeftCount - pastLeftPulseCount) * millimetersPerPulse) / samplingTimeS;
+  pastLeftPulseCount = currentLeftCount;
+  currentRightSpeed = ((currentRightCount - pastRightPulseCount) * millimetersPerPulse) / samplingTimeS;
+  pastRightPulseCount = currentRightCount;
+  
+  // Resto del código...
   float leftWheelDistance = pastLeftPulseCount * millimetersPerPulse;
   float desiredLeftSpeed = DesiredSpeed(leftDistance, leftWheelDistance);
   int leftWheelPWM = leftControl.Calculate(desiredLeftSpeed, currentLeftSpeed);
@@ -1068,7 +1192,7 @@ bool MoveDistanceByWheel(float leftDistance, float rightDistance) {
   IsMoveFinished = IsMoveFinished || IsStationary(currentLeftSpeed, currentRightSpeed, leftWheelDistance, rightWheelDistance);
   
   if (debugUdp >= 2){
-    MessageDebugf(debugMessage, debugCounter, robotID, direction, leftPulseCount, rightPulseCount, currentLeftSpeed, currentRightSpeed, leftWheelPWM, rightWheelPWM,
+    MessageDebugf(debugMessage, debugCounter, robotID, direction, currentLeftCount, currentRightCount, currentLeftSpeed, currentRightSpeed, leftWheelPWM, rightWheelPWM,
                   leftControl.error, rightControl.error, leftControl.sumError, rightControl.sumError, leftWheelDistance, rightWheelDistance, millisDifference);
   }
 
