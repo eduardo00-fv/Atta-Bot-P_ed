@@ -1,10 +1,9 @@
 #include "utils.h"
 #include <Adafruit_APDS9960.h> // Adafruit_APDS9960. v1.3.0
-#include <FastLED.h> // FastLED by Daniel Garcia and Mark Kriegsman. v3.4.0
-#include <ICM_20948.h> // SparkFun ICM-20948 Arduino Library. v1.2.12
-#include <ESP32Servo.h> // ESP32Servo by Kevin Harrington 3.0.8
-
 #include <EEPROM.h>
+#include <FastLED.h>
+#include <ICM_20948.h> // SparkFun ICM-20948 Arduino Library. v1.2.12
+#include <ESP32Servo.h> // ESP32Servo Kevin Harrington v3.0.8
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
@@ -42,6 +41,7 @@
 
 #define batteryStatus 19
 #define ledPin 2
+#define NUM_LEDS 1
 #define AD0_VAL 1
 
 // Constantes para el WiFi
@@ -65,13 +65,12 @@ unsigned long previousMillisRW = 0;
 const unsigned int SteadyStateTime = 800;
 unsigned long SteadyStatePreviousMillis = millis();
 int millisDifference;
-
 volatile int leftPulseCount = 0;
 volatile int rightPulseCount = 0;
 int pastLeftPulseCount = 0;
 int pastRightPulseCount = 0;
-//int pastLeftEncoder = 0;
-//int pastRightEncoder = 0;
+int pastLeftEncoder = 0;
+int pastRightEncoder = 0;
 float currentLeftSpeed = 0.0;
 float currentRightSpeed = 0.0;
 const float distanceOffset = 1 * millimetersPerPulse;
@@ -89,6 +88,7 @@ pidConstants pidSpeed(110, 375, 2);
 kalmanFilter kfPID(6.0, 1.0, 1.0);
 pidController leftControl(kfPID, pidSpeed, samplingTimeS, minPWMValue, maxPWMValue);
 pidController rightControl(kfPID, pidSpeed, samplingTimeS, minPWMValue, maxPWMValue);
+
 const int observationPeriod = 28800; //us
 const int observationTime = 1600; //us
 const int numberOfCycles = observationPeriod / observationTime;
@@ -164,44 +164,26 @@ pose robotPose(0, 0, 0);
 int countMessages = 0;
 int sendMessages = 0;
 
-// Estructura para manejo del servo no bloqueante
 struct ServoController {
   enum State {
     IDLE,
-    SWEEPING,
-    COMPLETED
+    SWEEPING_CONTINUOUS
   };
   
   State state = IDLE;
   int currentAngle = 90;
-  int targetAngle = 90;
   int startAngle = 0;
   int endAngle = 180;
   int stepSize = 5;
-  int delayMs = 100;
+  int delayMs = 50;  // Más rápido: 20ms en lugar de 100ms
   unsigned long lastMoveTime = 0;
   int direction = 1;
   bool sweepActive = false;
 };
 
 ServoController servoCtrl;
-
-// Tabla de lookup para evitar cálculos en ISR
-// Precalculada para mejorar rendimiento
-const int8_t ENCODER_LOOKUP[16] = {
-  0, -1, 1, 0,   // 0000, 0001, 0010, 0011
-  1, 0, 0, -1,   // 0100, 0101, 0110, 0111
-  -1, 0, 0, 1,   // 1000, 1001, 1010, 1011
-  0, 1, -1, 0    // 1100, 1101, 1110, 1111
-};
-
-// Variables para estados previos (más eficiente)
-volatile uint8_t pastLeftEncoder = 0;
-volatile uint8_t pastRightEncoder = 0;
-
 Servo frontServo;
 Adafruit_APDS9960 frontSensor;
-#define NUM_LEDS 1
 CRGB leds[NUM_LEDS];
 WiFiUDP udp;
 ICM_20948_I2C imu;
@@ -217,18 +199,17 @@ ICM_20948_I2C imu;
  garantiza una actualización rápida y eficiente de los pulsos de la rueda.
 
 *****************************************************************************************/
-// ISR IZQUIERDA OPTIMIZADA
 void IRAM_ATTR LeftWheelPulses() {
-  // Leer ambos pines en una sola operación
-  uint8_t currentEncoder = (digitalRead(leftEncoderC2) << 1) | digitalRead(leftEncoderC1);
-  
-  // Crear índice para lookup table
-  uint8_t index = (pastLeftEncoder << 2) | currentEncoder;
-  
-  // Usar lookup table en lugar de if/else
-  leftPulseCount += ENCODER_LOOKUP[index];
-  
-  pastLeftEncoder = currentEncoder;
+  int MSB = digitalRead(leftEncoderC2);
+  int LSB = digitalRead(leftEncoderC1);
+  int encoder = (MSB << 1) | LSB;
+  int sum = (pastLeftEncoder << 2) | encoder;
+  if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011) {
+    leftPulseCount++;
+  } else if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000) {
+    leftPulseCount--;
+  }
+  pastLeftEncoder = encoder;
 }
 
 
@@ -242,14 +223,17 @@ void IRAM_ATTR LeftWheelPulses() {
  garantiza una actualización rápida y eficiente de los pulsos de la rueda.
 
 ***************************************************************************************/
-// ISR DERECHA OPTIMIZADA
 void IRAM_ATTR RightWheelPulses() {
-  uint8_t currentEncoder = (digitalRead(rightEncoderC1) << 1) | digitalRead(rightEncoderC2);
-  uint8_t index = (pastRightEncoder << 2) | currentEncoder;
-  
-  rightPulseCount += ENCODER_LOOKUP[index];
-  
-  pastRightEncoder = currentEncoder;
+  int MSB = digitalRead(rightEncoderC1);
+  int LSB = digitalRead(rightEncoderC2);
+  int encoder = (MSB << 1) | LSB;
+  int sum = (pastRightEncoder << 2) | encoder;
+  if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011) {
+    rightPulseCount++;
+  } else if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000) {
+    rightPulseCount--;
+  }
+  pastRightEncoder = encoder;
 }
 
 
@@ -295,27 +279,26 @@ void LowBattery() {
   }
 }
 
-// Función para iniciar sweep no bloqueante
-void startServoSweep(int startAngle = 0, int endAngle = 180, int stepSize = 5, int delayMs = 100) {
+// Función para iniciar sweep continuo no bloqueante
+void startContinuousServoSweep(int startAngle = 0, int endAngle = 180, int stepSize = 5, int delayMs = 20) {
   servoCtrl.startAngle = constrain(startAngle, 0, 180);
   servoCtrl.endAngle = constrain(endAngle, 0, 180);
   servoCtrl.stepSize = constrain(abs(stepSize), 1, 45);
-  servoCtrl.delayMs = constrain(delayMs, 10, 2000);
+  servoCtrl.delayMs = constrain(delayMs, 5, 100);  // Mínimo 5ms para movimiento rápido
   
   servoCtrl.currentAngle = servoCtrl.startAngle;
-  servoCtrl.targetAngle = servoCtrl.endAngle;
   servoCtrl.direction = (servoCtrl.endAngle > servoCtrl.startAngle) ? 1 : -1;
   
-  servoCtrl.state = ServoController::SWEEPING;
+  servoCtrl.state = ServoController::SWEEPING_CONTINUOUS;
   servoCtrl.sweepActive = true;
   servoCtrl.lastMoveTime = millis();
   
   frontServo.write(servoCtrl.currentAngle);
 }
 
-// Función para actualizar servo (llamar en loop principal)
+// Función para actualizar servo continuo (llamar en loop principal)
 void updateServoSweep() {
-  if (servoCtrl.state != ServoController::SWEEPING) {
+  if (servoCtrl.state != ServoController::SWEEPING_CONTINUOUS) {
     return;
   }
   
@@ -327,24 +310,22 @@ void updateServoSweep() {
   // Mover al siguiente ángulo
   servoCtrl.currentAngle += servoCtrl.direction * servoCtrl.stepSize;
   
-  // Verificar si hemos llegado al final
-  bool reachedEnd = (servoCtrl.direction > 0) ? 
-                   (servoCtrl.currentAngle >= servoCtrl.endAngle) : 
-                   (servoCtrl.currentAngle <= servoCtrl.endAngle);
-  
-  if (reachedEnd) {
+  // CAMBIO CLAVE: Verificar límites y cambiar dirección para barrido continuo
+  if (servoCtrl.currentAngle >= servoCtrl.endAngle) {
     servoCtrl.currentAngle = servoCtrl.endAngle;
-    servoCtrl.state = ServoController::COMPLETED;
-    servoCtrl.sweepActive = false;
+    servoCtrl.direction = -1;  // Cambiar dirección hacia atrás
+  } else if (servoCtrl.currentAngle <= servoCtrl.startAngle) {
+    servoCtrl.currentAngle = servoCtrl.startAngle;
+    servoCtrl.direction = 1;   // Cambiar dirección hacia adelante
   }
   
   frontServo.write(servoCtrl.currentAngle);
   servoCtrl.lastMoveTime = currentTime;
 }
 
-// Función para verificar si el sweep está completo
-bool isServoSweepComplete() {
-  return servoCtrl.state == ServoController::COMPLETED;
+// Función para verificar si el sweep está activo
+bool isServoSweepActive() {
+  return servoCtrl.sweepActive && (servoCtrl.state == ServoController::SWEEPING_CONTINUOUS);
 }
 
 // Función para detener el sweep
@@ -352,23 +333,6 @@ void stopServoSweep() {
   servoCtrl.state = ServoController::IDLE;
   servoCtrl.sweepActive = false;
 }
-
-// Función helper para lectura segura de contadores
-void getEncoderCounts(int& leftCount, int& rightCount) {
-  noInterrupts();  // Desactivar interrupciones
-  leftCount = leftPulseCount;
-  rightCount = rightPulseCount;
-  interrupts();    // Reactivar interrupciones
-}
-
-// Función helper para reset seguro de contadores
-void resetEncoderCounts() {
-  noInterrupts();
-  leftPulseCount = 0;
-  rightPulseCount = 0;
-  interrupts();
-}
-
 
 /***************************************************************************************
 
@@ -379,11 +343,10 @@ void resetEncoderCounts() {
 
 ***************************************************************************************/
 void setup() {
-  #ifdef DebugSerial
+  //#ifdef DebugSerial
     Serial.begin(115200);
-  #endif
+  //#endif
 
- 
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
   ESP32PWM::allocateTimer(2);
@@ -392,26 +355,40 @@ void setup() {
   frontServo.setPeriodHertz(50);
   frontServo.attach(frontServoPin, 1000, 2000);
   frontServo.write(90);  
-  delay(200);           
+  delay(200); 
 
+  
+  analogWrite(leftMotorForward, 0);
+  analogWrite(leftMotorBackward, 0);
+  analogWrite(rightMotorForward, 0);
+  analogWrite(rightMotorBackward, 0);
 
-  ledcAttach(leftMotorForward, pwmFrequency, pwmResolution);   // Pin 12
-  ledcAttach(leftMotorBackward, pwmFrequency, pwmResolution);  // Pin 14
-  ledcAttach(rightMotorForward, pwmFrequency, pwmResolution);  // Pin 13
-  ledcAttach(rightMotorBackward, pwmFrequency, pwmResolution); // Pin 15
+  analogWriteFrequency(leftMotorForward, pwmFrequency);
+  analogWriteFrequency(leftMotorBackward, pwmFrequency);
+  analogWriteFrequency(rightMotorForward, pwmFrequency);
+  analogWriteFrequency(rightMotorBackward, pwmFrequency);
 
-  ConfigureHBridge(0, 0);
+  analogWriteResolution(leftMotorForward, pwmResolution);
+  analogWriteResolution(leftMotorBackward, pwmResolution);
+  analogWriteResolution(rightMotorForward, pwmResolution);
+  analogWriteResolution(rightMotorBackward, pwmResolution);
 
   WiFi.begin(ssid, password);
 
-  FastLED.addLeds<NEOPIXEL, ledPin>(leds, NUM_LEDS);
+  FastLED.addLeds<WS2812, ledPin, GRB>(leds, NUM_LEDS);
+  FastLED.setBrightness(maxBrightness);
+
   WiFiStatus();
   ArduinoOTA.begin();
   udp.begin(localPort);
   DebugSerialPrintf("El servidor UDP se inició en el puerto: %u\n", localPort);
   Wire.begin();
   Wire.setClock(400000);
-  // setupIMU();         
+  // setupIMU();
+
+  frontServo.attach(frontServoPin);
+  frontServo.write(90);
+  delay(500);
 
   pinMode(leftEncoderC1, INPUT_PULLUP);
   pinMode(leftEncoderC2, INPUT_PULLUP);
@@ -462,6 +439,7 @@ void loop() {
   ReadUdpPackets();
   ReadSensors();
   updateServoSweep();
+  ReadSerialCommands();
 
   switch (state) {
     case WAIT: {
@@ -482,23 +460,23 @@ void loop() {
     }
 
     case MOVE: {
-      // Iniciar sweep si no está activo
-      if (!servoCtrl.sweepActive && !isServoSweepComplete()) {
-        startServoSweep(0, 180, 5, 100);
+      
+      if (!isServoSweepActive()) {
+        startContinuousServoSweep(0, 180, 5, 20);  
       }
       
-      // Actualizar servo de forma no bloqueante
+      
       updateServoSweep();
       
-      // Continuar con el movimiento
+      
       movementReady = MoveDistanceByWheel(instructionValue, instructionValue);
       
       if (movementReady) {
-        stopServoSweep(); // Detener sweep al completar movimiento
+        stopServoSweep(); 
         MessageDebugf("DEBUG: -1, ID: %s, Movimiento completado", robotID);
         state = STOP;
       } else if (leftObstacle || centralObstacle || rightObstacle) {
-        stopServoSweep(); // Detener sweep si hay obstáculo
+        stopServoSweep(); 
         obstacleSensors = (leftObstacle << 2) | (centralObstacle << 1) | rightObstacle; 
         state = STOP;
       }
@@ -616,6 +594,52 @@ void loop() {
   }
 }
 
+// CAMBIO: Función simple para establecer color de LED
+void setLedColor(uint8_t red, uint8_t green, uint8_t blue) {
+  leds[0] = CRGB(red, green, blue);
+  FastLED.show();
+}
+
+// CAMBIO: Función simple para establecer brillo
+void setLedBrightness(uint8_t brightness) {
+  FastLED.setBrightness(brightness);
+  FastLED.show();
+}
+
+void ReadSerialCommands() {
+  if (Serial.available()) {
+    String command = Serial.readString();
+    command.trim();
+    
+    int separatorIndex = command.indexOf('|');
+    String cmd = command.substring(0, separatorIndex);
+    String valueStr = command.substring(separatorIndex + 1);
+    int value = valueStr.toInt();
+    
+    if (cmd == "MOVE") {
+      fsmInstruction[0] = MOVE;
+      fsmInstruction[1] = value;
+      instructionList.push_back(fsmInstruction);
+      Serial.printf("Comando MOVE %d mm agregado\n", value);
+      
+    } else if (cmd == "TURN") {
+      fsmInstruction[0] = TURN;
+      fsmInstruction[1] = radians(value) * centerToWheelDistance;
+      instructionList.push_back(fsmInstruction);
+      Serial.printf("Comando TURN %d grados agregado\n", value);
+      
+    } else if (cmd == "STOP") {
+      instructionList.clear();
+      ConfigureHBridge(0, 0);
+      state = STOP;
+      Serial.println("Robot detenido");
+      
+    } else {
+      Serial.println("Comandos: MOVE|valor, TURN|valor, STOP");
+    }
+  }
+}
+
 
 /***************************************************************************************
 
@@ -628,14 +652,11 @@ void WiFiStatus() {
   while (WiFi.status() != WL_CONNECTED) {
     ConfigureHBridge(0, 0);
     DebugSerialPrintln("Conectando WiFi ...");
-    for (int brillo : { maxBrightness, 0 }) {
-      // strip.setBrightness(brillo);
-      // strip.setAllLedsColor(strip.Wheel(170));
-      FastLED.setBrightness(brillo);
-      fill_solid(leds, NUM_LEDS, CHSV(170, 255, 255));
-      FastLED.show();
-      delay(250);
-    }
+    setLedBrightness(maxBrightness);
+    setLedColor(0, 255, 255); // Cian 
+    delay(250);
+    setLedBrightness(0);
+    delay(250);
   }
 }
 
@@ -651,14 +672,11 @@ void WiFiStatus() {
 void SetupFrontSensor() {
   while (!frontSensor.begin()) {
     DebugSerialPrintln("Fallo la inialización del sensor APDS-9960.");
-    for (int brillo : { maxBrightness, 0 }) {
-      // strip.setBrightness(brillo);
-      // strip.setAllLedsColor(strip.Wheel(0));
-      FastLED.setBrightness(brillo);
-      fill_solid(leds, NUM_LEDS, CHSV(0, 255, 255));
-      FastLED.show();
-      delay(250);
-    }
+    setLedBrightness(maxBrightness);
+    setLedColor(255, 0, 0); // Rojo 
+    delay(250);
+    setLedBrightness(0);
+    delay(250);
   }
 }
 
@@ -681,11 +699,8 @@ void CommunicationTest(){
       }
     }
   } else {
-    // strip.setBrightness(255);
-    // strip.setAllLedsColor(strip.Wheel(0));
     FastLED.setBrightness(255);
-    fill_solid(leds, NUM_LEDS, CHSV(0, 255, 255));
-    FastLED.show();
+    setLedColor(255, 0, 0); // Rojo
     delay(500);
   }
 }
@@ -987,25 +1002,15 @@ void ReadSensors() {
 
   if (debugUdp == 3) {
     if (leftObstacle || centralObstacle || rightObstacle) {
-      // strip.setBrightness(maxBrightness);
-      // strip.setAllLedsColor(strip.Wheel(200));
-      FastLED.setBrightness(maxBrightness);
-      fill_solid(leds, NUM_LEDS, CHSV(200, 255, 255));
-      FastLED.show();
+      setLedBrightness(maxBrightness);
+      setLedColor(255, 128, 0); // Naranja 
     } else {
-      // strip.setBrightness(0);
-      // strip.setAllLedsColor(strip.Wheel(200));
-      FastLED.setBrightness(0);
-      fill_solid(leds, NUM_LEDS, CHSV(200, 255, 255));
-      FastLED.show();
+      setLedBrightness(0);
     }
   } else {
     if ((digitalRead(batteryStatus) == LOW) && ((millis() - lowBatteryTime) >= minLowBatteryTime)) {
-      // strip.setBrightness(255);
-      // strip.setAllLedsColor(strip.Wheel(120));
       FastLED.setBrightness(255);
-      fill_solid(leds, NUM_LEDS, CHSV(120, 255, 255));
-      FastLED.show();
+      setLedColor(255, 255, 0); // Amarillo 
     }
   }
 }
@@ -1022,7 +1027,8 @@ void ResetPID() {
   leftControl.Reset();
   rightControl.Reset();
   debugCounter = 0;
-  resetEncoderCounts();     
+  leftPulseCount = 0;
+  rightPulseCount = 0;
   pastLeftPulseCount = 0;
   pastRightPulseCount = 0;
 }
@@ -1041,29 +1047,19 @@ void ResetPID() {
 ***************************************************************************************/
 void ConfigureHBridge(int leftWheelPWM, int rightWheelPWM) {
   if (leftWheelPWM >= 0) {
-    ledcWrite(1, 0);  // leftMotorBackward a 0
-    ledcWrite(0, leftWheelPWM);  // leftMotorForward
-  } else {
-    ledcWrite(0, 0);  // leftMotorForward a 0
-    ledcWrite(1, abs(leftWheelPWM));  // leftMotorBackward
+    analogWrite(leftMotorBackward, 0);
+    analogWrite(leftMotorForward, leftWheelPWM);
+  } else if (leftWheelPWM < 0) {
+    analogWrite(leftMotorForward, 0);
+    analogWrite(leftMotorBackward, _abs(leftWheelPWM));
   }
 
   if (rightWheelPWM >= 0) {
-    ledcWrite(3, 0);  // rightMotorBackward a 0
-    ledcWrite(2, rightWheelPWM);  // rightMotorForward
-  } else {
-    ledcWrite(2, 0);  // rightMotorForward a 0
-    ledcWrite(3, abs(rightWheelPWM));  // rightMotorBackward
-  }
-
-  if (leftWheelPWM == 0) {
-    ledcWrite(0, 0);  // leftMotorForward
-    ledcWrite(1, 0);  // leftMotorBackward
-  }
-
-  if (rightWheelPWM == 0) {
-    ledcWrite(2, 0);  // rightMotorForward
-    ledcWrite(3, 0);  // rightMotorBackward
+    analogWrite(rightMotorBackward, 0);
+    analogWrite(rightMotorForward, rightWheelPWM);
+  } else if (rightWheelPWM < 0) {
+    analogWrite(rightMotorForward, 0);
+    analogWrite(rightMotorBackward, _abs(rightWheelPWM));
   }
 }
 
@@ -1164,20 +1160,15 @@ bool MoveDistanceByWheel(float leftDistance, float rightDistance) {
   if (millisDifference < samplingTime) {
     return false;
   }
-  
+
   previousMillis = currentMillis;
-  
-  // LECTURA SEGURA DE CONTADORES
-  int currentLeftCount, currentRightCount;
-  getEncoderCounts(currentLeftCount, currentRightCount);
-  
-  // Calcular velocidades usando valores seguros
-  currentLeftSpeed = ((currentLeftCount - pastLeftPulseCount) * millimetersPerPulse) / samplingTimeS;
-  pastLeftPulseCount = currentLeftCount;
-  currentRightSpeed = ((currentRightCount - pastRightPulseCount) * millimetersPerPulse) / samplingTimeS;
-  pastRightPulseCount = currentRightCount;
-  
-  // Resto del código...
+
+  // Se calculan las velocidades de ambas ruedas
+  currentLeftSpeed = ((leftPulseCount - pastLeftPulseCount) * millimetersPerPulse) / samplingTimeS;  // velocidad en mm/s
+  pastLeftPulseCount = leftPulseCount;
+  currentRightSpeed = ((rightPulseCount - pastRightPulseCount) * millimetersPerPulse) / samplingTimeS;  // velocidad en mm/s
+  pastRightPulseCount = rightPulseCount;
+
   float leftWheelDistance = pastLeftPulseCount * millimetersPerPulse;
   float desiredLeftSpeed = DesiredSpeed(leftDistance, leftWheelDistance);
   int leftWheelPWM = leftControl.Calculate(desiredLeftSpeed, currentLeftSpeed);
@@ -1192,7 +1183,7 @@ bool MoveDistanceByWheel(float leftDistance, float rightDistance) {
   IsMoveFinished = IsMoveFinished || IsStationary(currentLeftSpeed, currentRightSpeed, leftWheelDistance, rightWheelDistance);
   
   if (debugUdp >= 2){
-    MessageDebugf(debugMessage, debugCounter, robotID, direction, currentLeftCount, currentRightCount, currentLeftSpeed, currentRightSpeed, leftWheelPWM, rightWheelPWM,
+    MessageDebugf(debugMessage, debugCounter, robotID, direction, leftPulseCount, rightPulseCount, currentLeftSpeed, currentRightSpeed, leftWheelPWM, rightWheelPWM,
                   leftControl.error, rightControl.error, leftControl.sumError, rightControl.sumError, leftWheelDistance, rightWheelDistance, millisDifference);
   }
 
@@ -1293,14 +1284,11 @@ void setupIMU() {
     imu.begin(Wire, AD0_VAL);
     if (imu.status != ICM_20948_Stat_Ok) {
       DebugSerialPrintln("Fallo inicializando la IMU, provando de nuevo...");
-      for (int brillo : { maxBrightness, 0 }) {
-        // strip.setBrightness(brillo);
-        // strip.setAllLedsColor(strip.Wheel(85));
-        FastLED.setBrightness(brillo);
-        fill_solid(leds, NUM_LEDS, CHSV(85, 255, 255));
-        FastLED.show();
-        delay(250);
-      }
+      setLedBrightness(maxBrightness);
+      setLedColor(0, 255, 0); // Verde 
+      delay(250);
+      setLedBrightness(0);
+      delay(250);
     } else {
       success = true;
     }
@@ -1322,20 +1310,14 @@ void setupIMU() {
   if (!success) {
     DebugSerialPrintln("Fallo la inicializacion del DPM.");
     DebugSerialPrintln("Verifique que la linea 29 (#define ICM_20948_USE_DMP) de ICM_20948_C.h este sin comentar.");
-    // strip.setBrightness(maxBrightness);
-    // strip.setAllLedsColor(strip.Wheel(85));
-    FastLED.setBrightness(maxBrightness);
-    fill_solid(leds, NUM_LEDS, CHSV(85, 255, 255));
-    FastLED.show();
+    setLedBrightness(maxBrightness);
+    setLedColor(0, 255, 0); // Verde
   }
 
   if (!EEPROM.begin(128)) {
     DebugSerialPrintln("Fallo la inicializacion de la EEPROM.");
-    // strip.setBrightness(maxBrightness);
-    // strip.setAllLedsColor(strip.Wheel(0));
-    FastLED.setBrightness(maxBrightness);
-    fill_solid(leds, NUM_LEDS, CHSV(0, 255, 255));
-    FastLED.show();
+    setLedBrightness(maxBrightness);
+    setLedColor(255, 0, 0); // Rojo
   }
 
   EEPROM.get(0, store);
@@ -1352,19 +1334,13 @@ void setupIMU() {
 
     if (!success) {
       DebugSerialPrintln("No se pudo restaurar la calibracion de la IMU.");
-      // strip.setBrightness(maxBrightness);
-      // strip.setAllLedsColor(strip.Wheel(0));
-      FastLED.setBrightness(maxBrightness);
-      fill_solid(leds, NUM_LEDS, CHSV(0, 255, 255));
-      FastLED.show();
+      setLedBrightness(maxBrightness);
+      setLedColor(0, 255, 0); // Verde
     }
   } else {
     DebugSerialPrintln("No se encontro una calibracion valida para la IMU.");
-    // strip.setBrightness(maxBrightness);
-    // strip.setAllLedsColor(strip.Wheel(0));
-    FastLED.setBrightness(maxBrightness);
-    fill_solid(leds, NUM_LEDS, CHSV(0, 255, 255));
-    FastLED.show();
+    setLedBrightness(maxBrightness);
+    setLedColor(255, 0, 0); // Rojo
   }
 }
 
