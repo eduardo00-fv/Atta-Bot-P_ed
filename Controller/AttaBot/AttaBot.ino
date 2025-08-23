@@ -164,6 +164,7 @@ pose robotPose(0, 0, 0);
 int countMessages = 0;
 int sendMessages = 0;
 
+// Estructura para controlar el estado del servo y el barrido continuo
 struct ServoController {
   enum State {
     IDLE,
@@ -175,13 +176,14 @@ struct ServoController {
   int startAngle = 0;
   int endAngle = 180;
   int stepSize = 5;
-  int delayMs = 50;  // Más rápido: 20ms en lugar de 100ms
+  int delayMs = 50;  // Velocidad de barrido
   unsigned long lastMoveTime = 0;
   int direction = 1;
   bool sweepActive = false;
 };
 
 ServoController servoCtrl;
+
 Servo frontServo;
 Adafruit_APDS9960 frontSensor;
 CRGB leds[NUM_LEDS];
@@ -279,12 +281,16 @@ void LowBattery() {
   }
 }
 
-// Función para iniciar sweep continuo no bloqueante
+/***************************************************************************************
+
+  Función para iniciar el barrido continuo del servo (ángulo de 0 a 180 grados). 
+
+***************************************************************************************/
 void startContinuousServoSweep(int startAngle = 0, int endAngle = 180, int stepSize = 5, int delayMs = 20) {
   servoCtrl.startAngle = constrain(startAngle, 0, 180);
   servoCtrl.endAngle = constrain(endAngle, 0, 180);
   servoCtrl.stepSize = constrain(abs(stepSize), 1, 45);
-  servoCtrl.delayMs = constrain(delayMs, 5, 100);  // Mínimo 5ms para movimiento rápido
+  servoCtrl.delayMs = constrain(delayMs, 5, 100);  
   
   servoCtrl.currentAngle = servoCtrl.startAngle;
   servoCtrl.direction = (servoCtrl.endAngle > servoCtrl.startAngle) ? 1 : -1;
@@ -296,7 +302,13 @@ void startContinuousServoSweep(int startAngle = 0, int endAngle = 180, int stepS
   frontServo.write(servoCtrl.currentAngle);
 }
 
-// Función para actualizar servo continuo (llamar en loop principal)
+/***************************************************************************************
+
+  Función para actualizar el barrido continuo del servo. Esta función se llama periódicamente
+  y mueve el servo al siguiente ángulo según la dirección y el paso definidos. Si alcanza 
+  los límites, cambia la dirección del barrido.
+
+***************************************************************************************/
 void updateServoSweep() {
   if (servoCtrl.state != ServoController::SWEEPING_CONTINUOUS) {
     return;
@@ -304,13 +316,13 @@ void updateServoSweep() {
   
   unsigned long currentTime = millis();
   if (currentTime - servoCtrl.lastMoveTime < servoCtrl.delayMs) {
-    return; // Aún no es tiempo de mover
+    return; 
   }
   
   // Mover al siguiente ángulo
   servoCtrl.currentAngle += servoCtrl.direction * servoCtrl.stepSize;
   
-  // CAMBIO CLAVE: Verificar límites y cambiar dirección para barrido continuo
+  
   if (servoCtrl.currentAngle >= servoCtrl.endAngle) {
     servoCtrl.currentAngle = servoCtrl.endAngle;
     servoCtrl.direction = -1;  // Cambiar dirección hacia atrás
@@ -323,12 +335,18 @@ void updateServoSweep() {
   servoCtrl.lastMoveTime = currentTime;
 }
 
-// Función para verificar si el sweep está activo
+/***************************************************************************************
+
+  Función para verificar si el barrido del servo está activo y en estado de barrido continuo.  
+
+***************************************************************************************/
 bool isServoSweepActive() {
   return servoCtrl.sweepActive && (servoCtrl.state == ServoController::SWEEPING_CONTINUOUS);
 }
 
-// Función para detener el sweep
+/***************************************************************************************
+  Función para detener el barrido del servo y restablecer su estado a inactivo.
+***************************************************************************************/
 void stopServoSweep() {
   servoCtrl.state = ServoController::IDLE;
   servoCtrl.sweepActive = false;
@@ -343,9 +361,9 @@ void stopServoSweep() {
 
 ***************************************************************************************/
 void setup() {
-  //#ifdef DebugSerial
+  #ifdef DebugSerial
     Serial.begin(115200);
-  //#endif
+  #endif
 
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
@@ -356,7 +374,6 @@ void setup() {
   frontServo.attach(frontServoPin, 1000, 2000);
   frontServo.write(90);  
   delay(200); 
-
   
   analogWrite(leftMotorForward, 0);
   analogWrite(leftMotorBackward, 0);
@@ -439,7 +456,8 @@ void loop() {
   ReadUdpPackets();
   ReadSensors();
   updateServoSweep();
-  ReadSerialCommands();
+  // Descomentar solo en caso de prueba rapidas
+  //ReadSerialCommands();
 
   switch (state) {
     case WAIT: {
@@ -463,11 +481,9 @@ void loop() {
       
       if (!isServoSweepActive()) {
         startContinuousServoSweep(0, 180, 5, 20);  
-      }
+      }     
       
-      
-      updateServoSweep();
-      
+      updateServoSweep();      
       
       movementReady = MoveDistanceByWheel(instructionValue, instructionValue);
       
@@ -594,18 +610,38 @@ void loop() {
   }
 }
 
-// CAMBIO: Función simple para establecer color de LED
+/***************************************************************************************
+
+Funcion selector del color del strip LED. 
+
+***************************************************************************************/
 void setLedColor(uint8_t red, uint8_t green, uint8_t blue) {
   leds[0] = CRGB(red, green, blue);
   FastLED.show();
 }
 
-// CAMBIO: Función simple para establecer brillo
+/***************************************************************************************
+
+  Función para establecer el brillo del strip LED. 
+  
+  Esta función ajusta el brillo de los LEDs y actualiza la visualización.
+  
+  @param brightness El valor de brillo a establecer (0-255).
+
+***************************************************************************************/
 void setLedBrightness(uint8_t brightness) {
   FastLED.setBrightness(brightness);
   FastLED.show();
 }
 
+/***************************************************************************************
+
+  Función que lee los comandos enviados por el puerto serial y los procesa. 
+  Los comandos pueden ser "MOVE|valor", "TURN|valor" o "STOP". Dependiendo del comando, 
+  se actualiza la lista de instrucciones del robot y se envían mensajes de confirmación 
+  al puerto serial. Es solo de prueba y no se usa en el robot.
+
+***************************************************************************************/
 void ReadSerialCommands() {
   if (Serial.available()) {
     String command = Serial.readString();
