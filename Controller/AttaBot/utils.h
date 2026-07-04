@@ -869,4 +869,124 @@ struct ReactiveNav {
     }
 };
 
+
+/***************************************************************************************
+ * EKF descentralizado — estado [x, y, θ] en el marco de la cámara/ArUco.
+ * Port 1:1 de sim/ekf_sim.py (validado en sim 2026-07-04: 36mm de error medio
+ * con 25% de oclusión vs 53mm de odometría pura; termina GT a ciegas).
+ *
+ * predict(d, dθ): propaga con odometría — d en mm de encoders, dθ en grados
+ *   del gyro (ya escalado con yawScale). Llamar cada tick de lectura de IMU.
+ * updateAruco(x, y, θ): corrige con la pose ArUco de POSITION_RESPONSE.
+ *   La primera llamada inicializa el filtro. Devuelve la innovación de
+ *   posición (mm) — qué tan lejos venía la predicción de la medición.
+ *
+ * θ interno en radianes; grados solo en las fronteras.
+ ***************************************************************************************/
+static inline void Mat3Mult(const float A[3][3], const float B[3][3], float R[3][3]) {
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            R[i][j] = A[i][0] * B[0][j] + A[i][1] * B[1][j] + A[i][2] * B[2][j];
+}
+
+static inline void Mat3Inverse(const float A[3][3], float R[3][3]) {
+    float a = A[0][0], b = A[0][1], c = A[0][2];
+    float d = A[1][0], e = A[1][1], f = A[1][2];
+    float g = A[2][0], h = A[2][1], i = A[2][2];
+    float det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    R[0][0] = (e * i - f * h) / det; R[0][1] = (c * h - b * i) / det; R[0][2] = (b * f - c * e) / det;
+    R[1][0] = (f * g - d * i) / det; R[1][1] = (a * i - c * g) / det; R[1][2] = (c * d - a * f) / det;
+    R[2][0] = (d * h - e * g) / det; R[2][1] = (b * g - a * h) / det; R[2][2] = (a * e - b * d) / det;
+}
+
+struct EKFState {
+    bool initialized = false;
+    float x = 0, y = 0;   // mm
+    float th = 0;         // rad
+    float P[3][3] = {{0}};
+
+    // Ruido — mismos valores que sim/ekf_sim.py; calibrar en lab (Bloque A)
+    static constexpr float R_POS_SIGMA   = 30.0f;   // mm — jitter ArUco
+    static constexpr float R_ANG_SIGMA   = 2.0f;    // grados — jitter ArUco
+    static constexpr float Q_DIST_FRAC   = 0.02f;   // fracción de d por tick
+    static constexpr float Q_DIST_FLOOR  = 0.1f;    // mm por tick
+    static constexpr float Q_ANG_DRIFT   = 0.05f;   // grados por tick
+    static constexpr float Q_ANG_SCALE   = 0.005f;  // fracción de |dθ|
+
+    static float WrapRad(float a) {
+        while (a >  PI) a -= 2.0f * PI;
+        while (a < -PI) a += 2.0f * PI;
+        return a;
+    }
+
+    void Init(float px, float py, float angleDeg) {
+        x = px;  y = py;  th = WrapRad(angleDeg * DEG_TO_RAD);
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++) P[i][j] = 0;
+        P[0][0] = P[1][1] = R_POS_SIGMA * R_POS_SIGMA;
+        P[2][2] = (R_ANG_SIGMA * DEG_TO_RAD) * (R_ANG_SIGMA * DEG_TO_RAD);
+        initialized = true;
+    }
+
+    void Predict(float d, float dthDeg) {
+        if (!initialized) return;
+        float dth = dthDeg * DEG_TO_RAD;
+        float c = cosf(th), s = sinf(th);   // θ previo — también para F
+        x += d * c;
+        y += d * s;
+        th = WrapRad(th + dth);
+
+        float F[3][3] = {{1, 0, -d * s}, {0, 1, d * c}, {0, 0, 1}};
+        float Ft[3][3] = {{1, 0, 0}, {0, 1, 0}, {-d * s, d * c, 1}};
+        float FP[3][3], FPFt[3][3];
+        Mat3Mult(F, P, FP);
+        Mat3Mult(FP, Ft, FPFt);
+        float sd  = Q_DIST_FRAC * fabsf(d) + Q_DIST_FLOOR;
+        float sth = (Q_ANG_DRIFT + Q_ANG_SCALE * fabsf(dthDeg)) * DEG_TO_RAD;
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++) P[i][j] = FPFt[i][j];
+        P[0][0] += sd * sd;
+        P[1][1] += sd * sd;
+        P[2][2] += sth * sth;
+    }
+
+    float UpdateAruco(float zx, float zy, float zthDeg) {
+        if (!initialized) {
+            Init(zx, zy, zthDeg);
+            return 0.0f;
+        }
+        float nu[3] = {zx - x, zy - y, WrapRad(zthDeg * DEG_TO_RAD - th)};
+        float S[3][3];
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++) S[i][j] = P[i][j];
+        S[0][0] += R_POS_SIGMA * R_POS_SIGMA;
+        S[1][1] += R_POS_SIGMA * R_POS_SIGMA;
+        S[2][2] += (R_ANG_SIGMA * DEG_TO_RAD) * (R_ANG_SIGMA * DEG_TO_RAD);
+
+        float Sinv[3][3], K[3][3];
+        Mat3Inverse(S, Sinv);
+        Mat3Mult(P, Sinv, K);   // H = I → K = P·S⁻¹
+
+        x  += K[0][0] * nu[0] + K[0][1] * nu[1] + K[0][2] * nu[2];
+        y  += K[1][0] * nu[0] + K[1][1] * nu[1] + K[1][2] * nu[2];
+        th  = WrapRad(th + K[2][0] * nu[0] + K[2][1] * nu[1] + K[2][2] * nu[2]);
+
+        float IK[3][3], newP[3][3];
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+                IK[i][j] = (i == j ? 1.0f : 0.0f) - K[i][j];
+        Mat3Mult(IK, P, newP);
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++) P[i][j] = newP[i][j];
+
+        return sqrtf(nu[0] * nu[0] + nu[1] * nu[1]);
+    }
+
+    float AngleDeg() const {
+        float deg = th * RAD_TO_DEG;
+        while (deg < 0) deg += 360.0f;
+        return deg;
+    }
+};
+
 #endif // UTILS_H

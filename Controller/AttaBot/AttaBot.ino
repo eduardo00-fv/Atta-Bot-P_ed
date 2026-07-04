@@ -161,6 +161,7 @@ NavigationTarget navTarget;
 InterruptionContext intContext;
 EvasionTracker evasionTracker;
 CongregationState congregation;
+EKFState ekf;  // observador pasivo por ahora — la nav sigue usando robotPose
 ObstacleState obstacles;
 MovementMetrics movement;
 LedController ledCtrl;
@@ -310,6 +311,7 @@ void setLedBlink(uint8_t red, uint8_t green, uint8_t blue,
 void setupIMU();
 void SaveIMUBias(biasStore* store);
 void LeerYaw();
+void EkfTick();
 
 // ============================================================================
 // INTERRUPCIONES (ISR)
@@ -610,6 +612,7 @@ void loop() {
   if (imuAvailable && (millis() - lastImuRead >= imuReadInterval)) {
     lastImuRead = millis();
     LeerYaw();
+    EkfTick();
   }
 
 #ifdef DebugSerial
@@ -1904,6 +1907,38 @@ void ResetPID() {
   movement.Reset();
 }
 
+// EKF pasivo: propaga con gyro (Δθ) y encoders (Δd) en cada lectura de IMU.
+// No afecta la navegación todavía — es el observador a validar contra ArUco.
+void EkfTick() {
+  static bool yawInit = false;
+  static float prevYaw = 0;
+  static float prevAvgPulses = 0;
+
+  if (!yawInit) {
+    prevYaw = yaw;
+    yawInit = true;
+    return;
+  }
+
+  float dYaw = yaw - prevYaw;
+  if (dYaw >  180.0f) dYaw -= 360.0f;
+  if (dYaw < -180.0f) dYaw += 360.0f;
+  prevYaw = yaw;
+
+  // Δ distancia solo cuando las ruedas avanzan de verdad (en TURN los
+  // contadores suben pero el desplazamiento neto es ~0)
+  float avg = (movement.pastLeftPulseCount + movement.pastRightPulseCount) / 2.0f;
+  float d = 0.0f;
+  if (state == MOVE || state == REVERSE) {
+    float dAvg = avg - prevAvgPulses;
+    if (dAvg < 0) dAvg = avg;   // ResetPID reinició los contadores
+    d = dAvg * millimetersPerPulse * (state == REVERSE ? -1.0f : 1.0f);
+  }
+  prevAvgPulses = avg;
+
+  ekf.Predict(d, dYaw * yawScale);
+}
+
 void ConfigureHBridge(int leftWheelPWM, int rightWheelPWM) {
   if (leftWheelPWM >= 0) {
     ledcWrite(leftMotorBackward, 0);
@@ -2647,6 +2682,15 @@ void ReadUdpPackets() {
         "DEBUG: -1, ID: %s, Posición recibida: x=%.1f, y=%.1f, ángulo=%.1f",
         robotID.c_str(), robotPose.x, robotPose.y, robotPose.angle);
 
+    // EKF: corrección ArUco. La innovación mide qué tan lejos venía la
+    // predicción (encoders+gyro) de la cámara — la métrica de validación.
+    bool ekfWasInit = ekf.initialized;
+    float ekfInnov = ekf.UpdateAruco(robotPose.x, robotPose.y, robotPose.angle);
+    if (ekfWasInit) {
+      MessageDebugf("DEBUG: -1, ID: %s, EKF innov=%.0fmm est=(%.0f,%.0f,%.0f°)",
+                    robotID.c_str(), ekfInnov, ekf.x, ekf.y, ekf.AngleDeg());
+    }
+
     if (congregation.isLeader && congregation.leaderID != "-1") {
       char buffer[64];
       snprintf(buffer, sizeof(buffer), "LEADER_POSITION|%s|%.1f|%.1f|%.1f",
@@ -2821,13 +2865,14 @@ void ReadUdpPackets() {
         buffer, sizeof(buffer),
         "STATUS|ID:%s|State:%d|NAV:%d|Evading:%d|Obs:%d|"
         "Sensors:L%d-C%d-R%d|Pos:(%.1f,%.1f,%.1f)|"
-        "Goal:(%.1f,%.1f)|Yaw:%.1f|IMU:%d",
+        "Goal:(%.1f,%.1f)|Yaw:%.1f|IMU:%d|EKF:(%.0f,%.0f,%.0f)",
         robotID.c_str(), state, (int)nav.isActive, (int)isEvading,
         (int)obstacles.HasAnyObstacle(), (int)obstacles.leftObstacle,
         (int)obstacles.centralObstacle, (int)obstacles.rightObstacle,
         robotPose.x, robotPose.y, robotPose.angle,
         nav.goalX, nav.goalY,
-        yaw, (int)imuAvailable);
+        yaw, (int)imuAvailable,
+        ekf.x, ekf.y, ekf.AngleDeg());
     SendMessage(robots["Base"], buffer);
   }
 
