@@ -24,3 +24,4 @@ Base/Logs/
 
 # Figuras de salida de la simulación (se regeneran al correr la sim)
 sim_output_*.png
+Base/markers_svg/
