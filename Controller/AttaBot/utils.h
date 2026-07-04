@@ -611,6 +611,11 @@ struct CongregationState {
     const unsigned long requestTimeout = 5000;
     int followerIndex = 0;    // slot asignado por la Base (0-based)
     int totalFollowers = 1;   // total de seguidores en la congregación
+    float parkingDist = 300;  // mm del líder al slot — NAV_CONFIG|PARKING_DIST
+    float slotX = 0, slotY = 0;  // slot final (etapa 2 de la aproximación)
+    bool stagingDone = false;    // true al alcanzar el waypoint de aproximación
+    float slotAngle = 0;         // rad, latcheado al primer LEADER_POSITION
+    bool slotAngleSet = false;   // evita que el slot salte de lado en camino
 
     void Reset() {
         leaderID = "-1";
@@ -623,6 +628,11 @@ struct CongregationState {
         waitingForResponse = false;
         followerIndex = 0;
         totalFollowers = 1;
+        slotX = 0;
+        slotY = 0;
+        stagingDone = false;
+        slotAngle = 0;
+        slotAngleSet = false;
     }
     
     bool IsActive() {

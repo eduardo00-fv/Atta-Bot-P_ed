@@ -1397,11 +1397,22 @@ void ReactiveNavStep() {
   float y = robotPose.y;
 
   if (nav.HasReached(x, y)) {
-    MessageDebugf("DEBUG: -1, ID: %s, NAV: llegó a (%.1f,%.1f)",
-                  robotID.c_str(), x, y);
-    nav.Reset();
-    instructionList.clear();
-    return;
+    if (congregation.IsActive() && !congregation.isLeader &&
+        !congregation.stagingDone) {
+      // Etapa 1 (waypoint de aproximación) alcanzada: entrada radial al slot
+      congregation.stagingDone = true;
+      nav.goalX = congregation.slotX;
+      nav.goalY = congregation.slotY;
+      MessageDebugf("DEBUG: -1, ID: %s, NAV: staging listo, entrando al slot "
+                    "(%.1f,%.1f)",
+                    robotID.c_str(), nav.goalX, nav.goalY);
+    } else {
+      MessageDebugf("DEBUG: -1, ID: %s, NAV: llegó a (%.1f,%.1f)",
+                    robotID.c_str(), x, y);
+      nav.Reset();
+      instructionList.clear();
+      return;
+    }
   }
 
   if (nav.HasTimedOut()) {
@@ -2555,6 +2566,8 @@ void ReadUdpPackets() {
     congregation.isLeader = (congregation.leaderID == robotID);
     congregation.positionReceived = false;
     congregation.hasGlobalTarget = false;
+    congregation.stagingDone = false;
+    congregation.slotAngleSet = false;
     congregation.followerIndex  = arguments[2].toInt();
     congregation.totalFollowers = (arguments[3] != "") ? arguments[3].toInt() : 1;
 
@@ -2665,13 +2678,30 @@ void ReadUdpPackets() {
       float leaderX = arguments[2].toFloat();
       float leaderY = arguments[3].toFloat();
 
-      // Calcular punto de estacionamiento: slot en círculo alrededor del líder
-      // Distancia = 200mm (dos radios de robot + margen de 50mm)
-      const float PARKING_DIST = 200.0f;
+      // Calcular punto de estacionamiento: slot en círculo alrededor del líder.
+      // Aproximación en dos etapas: primero un waypoint en el mismo rayo del
+      // slot pero STAGING_MARGIN más lejos del líder, y de ahí entrada radial
+      // — la recta al goal nunca cruza el círculo de parking (ni al líder).
+      const float STAGING_MARGIN = 150.0f;
       int   n     = max(1, congregation.totalFollowers);
-      float angle = (2.0f * PI * congregation.followerIndex) / n;
-      float parkX = leaderX + PARKING_DIST * cos(angle);
-      float parkY = leaderY + PARKING_DIST * sin(angle);
+      if (!congregation.slotAngleSet) {
+        // n==1: slot del lado por donde viene el follower — evita slots contra
+        // la pared cuando el líder está cerca del borde (visto 2026-07-03).
+        // n>1: distribución fija por índice (única entre followers, pero ciega
+        // a paredes; asignación por la Base pendiente al escalar el enjambre).
+        congregation.slotAngle =
+            (n == 1) ? atan2(robotPose.y - leaderY, robotPose.x - leaderX)
+                     : (2.0f * PI * congregation.followerIndex) / n;
+        congregation.slotAngleSet = true;
+      }
+      float angle = congregation.slotAngle;
+      congregation.slotX = leaderX + congregation.parkingDist * cos(angle);
+      congregation.slotY = leaderY + congregation.parkingDist * sin(angle);
+      float goalDist = congregation.stagingDone
+                           ? congregation.parkingDist
+                           : congregation.parkingDist + STAGING_MARGIN;
+      float parkX = leaderX + goalDist * cos(angle);
+      float parkY = leaderY + goalDist * sin(angle);
 
       if (nav.isActive) {
         nav.goalX = parkX;
@@ -2685,8 +2715,10 @@ void ReadUdpPackets() {
           fsmInstruction[1] = 0;
           instructionList.push_back(fsmInstruction);
         }
-        MessageDebugf("DEBUG: -1, ID: %s, CONGREGATION: slot %d/%d → parking (%.1f,%.1f)",
-                      robotID.c_str(), congregation.followerIndex, n, parkX, parkY);
+        MessageDebugf("DEBUG: -1, ID: %s, CONGREGATION: slot %d/%d → %s (%.1f,%.1f)",
+                      robotID.c_str(), congregation.followerIndex, n,
+                      congregation.stagingDone ? "parking" : "staging",
+                      parkX, parkY);
       }
     }
   }
@@ -2733,6 +2765,14 @@ void ReadUdpPackets() {
         bug2.arrivalThreshold = newThr;       // compat Bug2 legacy
         char buf[60];
         snprintf(buf, sizeof(buf), "NAV_CONFIG: llegada=%.0fmm", newThr);
+        SendMessage(robots["Base"], buf);
+      }
+    } else if (arguments[1] == "PARKING_DIST") {
+      float newDist = arguments[2].toFloat();
+      if (newDist >= 150 && newDist <= 600) {
+        congregation.parkingDist = newDist;
+        char buf[60];
+        snprintf(buf, sizeof(buf), "NAV_CONFIG: parking=%.0fmm", newDist);
         SendMessage(robots["Base"], buf);
       }
     } else if (arguments[1] == "WHEEL_DIST") {
