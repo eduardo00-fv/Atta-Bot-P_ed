@@ -95,8 +95,12 @@ def handle_console(msg):
 while sup.step(dt) != -1:
     now = sup.getTime()
 
+    if occluded_until and now >= occluded_until:
+        occluded_until = 0.0
+        print(f'[base] cámara RESTAURADA (t={now:.1f}s)')
+
     # Log periódico de poses reales (para métricas/validación externa)
-    if now - last_pos_log >= 2.0:
+    if now - last_pos_log >= 0.5:
         last_pos_log = now
         for rid, node in sorted(robots.items()):
             x, y, ang = camera_pose(node)

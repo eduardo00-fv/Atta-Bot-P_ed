@@ -91,6 +91,7 @@ class AttabotFirmware:
         self.waiting_pos = False
         self.last_request = -1e9
         self.pose = None             # última pose ArUco recibida
+        self.last_ekfpose = 0.0      # telemetría EKFPOSE periódica
 
         # Congregación (port del firmware nuevo: staging + slot del lado propio)
         self.cong_leader = None
@@ -340,10 +341,24 @@ class AttabotFirmware:
                     self.handle(data.decode().strip())
             except BlockingIOError:
                 pass
+            # Cámara muda + EKF_NAV activo → seguir a ciegas con la pose EKF
+            # (el comportamiento objetivo del GT semi-continuo del Bloque A)
+            if self.nav.is_active and self.ekf_nav and self.waiting_pos \
+               and self.state == 'IDLE' and self.ekf.initialized \
+               and self.now_ms() - self.last_request > 1000:
+                self.waiting_pos = False
+                self.debug('sin cámara — continuando con pose EKF')
+                self.nav_step(self.ekf.pose())
             # Reintento de posición (como el firmware, cada 3s)
-            if self.nav.is_active and self.waiting_pos \
-               and self.now_ms() - self.last_request > 3000:
+            elif self.nav.is_active and self.waiting_pos \
+                    and self.now_ms() - self.last_request > 3000:
                 self.request_position()
+            # Telemetría: pose EKF cada 1s mientras navega (para graficar)
+            if self.nav.is_active and self.ekf.initialized \
+               and self.now_ms() - self.last_ekfpose > 1000:
+                self.last_ekfpose = self.now_ms()
+                ex, ey, eth = self.ekf.pose()
+                self.send_base(f'EKFPOSE|{self.robot_id}|{ex:.1f}|{ey:.1f}|{eth:.1f}')
 
 
 if __name__ == '__main__':
