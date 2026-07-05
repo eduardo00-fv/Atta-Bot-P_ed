@@ -14,6 +14,11 @@ o desde el menú de aplicaciones ("Webots") y luego `File → Open World`.
 
 ⚠ NO uses el `webots` de AUR (`/usr/bin/webots`) — segfaultea en esta máquina.
 
+⚠ **Una sola instancia a la vez**: los robots usan los puertos UDP 6060–606N;
+si abrís un segundo Webots con el mismo mundo, sus controllers mueren con
+"puerto ocupado". Cerrá el sobrante (`flatpak kill com.cyberbotics.webots`)
+y dale ⏮ Reset al que quede.
+
 ## 2. La ventana
 
 ```
