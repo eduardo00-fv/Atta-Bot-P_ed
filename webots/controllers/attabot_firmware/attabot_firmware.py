@@ -22,6 +22,7 @@ POSITION_RESPONSE|x|y|θ, GET_STATUS, EKF_NAV|0/1 (conmuta la nav a pose EKF),
 NAV_CONFIG|PARKING_DIST|mm.
 """
 
+import json
 import math
 import os
 import socket
@@ -45,6 +46,23 @@ TURN_MAX_COR = 4            # correcciones iterativas máximas
 SETTLE_MS    = 300
 
 BASE_ADDR = ('127.0.0.1', 6060)
+PROFILES_PATH = os.path.join(os.path.dirname(__file__), '..', '..',
+                             'robot_profiles.json')
+
+
+def load_profile(robot_id):
+    """Personalidad del robot real (ver robot_profiles.json). Sin perfil = ideal."""
+    try:
+        with open(PROFILES_PATH) as f:
+            p = json.load(f).get(robot_id, {})
+    except (FileNotFoundError, json.JSONDecodeError):
+        p = {}
+    return {
+        'gyro_scale':    p.get('gyro_scale', 1.0),
+        'yaw_scale_cal': p.get('yaw_scale_cal', 1.0),
+        'enc_scale':     p.get('enc_scale', 1.0),
+        'motor_bias':    p.get('motor_bias', 1.0),
+    }
 
 
 class AttabotFirmware:
@@ -53,6 +71,7 @@ class AttabotFirmware:
         self.dt = int(self.robot.getBasicTimeStep()) * 2   # 16 ms
         self.robot_id = self.robot.getCustomData() or '1'
         self.name = self.robot.getName()
+        self.profile = load_profile(self.robot_id)
 
         self.left = self.robot.getDevice('left wheel motor')
         self.right = self.robot.getDevice('right wheel motor')
@@ -122,19 +141,29 @@ class AttabotFirmware:
     def read_ir(self):
         return {k: (d.getValue() < IR_THRESHOLD_M) for k, d in self.irs.items()}
 
+    def set_wheels(self, vl, vr):
+        # Desbalance físico de motores del robot real (deriva en MOVE, giros
+        # imperfectos). El closed-loop de TURN y las correcciones ArUco/EKF
+        # lo compensan — igual que en el lab.
+        b = self.profile['motor_bias']
+        self.left.setVelocity(vl * b)
+        self.right.setVelocity(vr / b)
+
     def stop_motors(self):
-        self.left.setVelocity(0)
-        self.right.setVelocity(0)
+        self.set_wheels(0, 0)
 
     # ── Sensores → EKF (equivalente de EkfTick del firmware) ────────────────
     def sensor_tick(self):
         wz = self.gyro.getValues()[2]
         d_yaw = -math.degrees(wz) * (self.dt / 1000.0)   # CCW mundo → CW cámara
+        d_yaw *= self.profile['gyro_scale']      # error físico del sensor
+        d_yaw *= self.profile['yaw_scale_cal']   # corrección CALIBRATE (residuo real)
         self.yaw = (self.yaw + d_yaw) % 360
 
+        enc_scale = self.profile['enc_scale']    # residuo de calibración PPR
         el, er = self.enc_l.getValue(), self.enc_r.getValue()
-        d_l = (el - self.prev_enc[0]) * WHEEL_RADIUS_MM
-        d_r = (er - self.prev_enc[1]) * WHEEL_RADIUS_MM
+        d_l = (el - self.prev_enc[0]) * WHEEL_RADIUS_MM * enc_scale
+        d_r = (er - self.prev_enc[1]) * WHEEL_RADIUS_MM * enc_scale
         self.prev_enc = (el, er)
         d = (d_l + d_r) / 2.0 if self.state == 'MOVE' else 0.0
 
@@ -162,15 +191,14 @@ class AttabotFirmware:
             self.turn_lead = 0.0 if kind == 'TURNC' else TURN_LEAD
             self.state = 'TURN'
             s = TURN_SPEED if value >= 0 else -TURN_SPEED
-            self.left.setVelocity(s)
-            self.right.setVelocity(-s)
+            self.set_wheels(s, -s)
         else:  # MOVE
             self.move_target = abs(value)
             self.move_sign = 1 if value >= 0 else -1
             self.move_acc = 0.0
             self.state = 'MOVE'
-            self.left.setVelocity(MOVE_SPEED * self.move_sign)
-            self.right.setVelocity(MOVE_SPEED * self.move_sign)
+            self.set_wheels(MOVE_SPEED * self.move_sign,
+                            MOVE_SPEED * self.move_sign)
 
     def motion_tick(self):
         if self.state == 'TURN':

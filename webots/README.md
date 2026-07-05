@@ -56,11 +56,24 @@ echo -n "BROADCAST.CANCEL_CONGREGATION" | nc -u -w0 127.0.0.1 6060
 El supervisor imprime `POS|id|x|y|θ` (pose real, marco cámara) cada 2 s — la
 fuente de ground truth para métricas.
 
+## Asimetrías por robot (`robot_profiles.json`)
+
+Cada robot simulado hereda la **personalidad medida de su robot real**
+(calibraciones del lab 2026-06-18): error de escala del gyro + residuo de
+calibración (`yaw_scale_cal`), residuo de PPR (`enc_scale`), desbalance de
+motores (`motor_bias`) y el jitter ArUco de SU marca (`aruco_*_sigma` —
+la marca de Atta_1 es peor que la de Atta_2, como en el lab). Sin perfil
+para un id → robot ideal. Editá el JSON y ⏮ Reset para aplicar.
+
 ## Validado (2026-07-04, headless)
 
 - GT con física real: llegada a **6mm** del goal, TURN con corrección iterativa.
 - EKF a bordo: innovaciones de 30–37mm con jitter σ=30mm (sano).
 - Congregación 2 robots con parking v2 (staging + slot del lado del follower).
+- GT a ciegas (EKF_NAV + OCCLUDE 12s): evadió el obstáculo sin cámara y llegó
+  a 16mm del goal; re-adquisición con innovación de 26mm.
+- Con asimetrías activas: Atta_1 innov media 87mm / Atta_2 37mm (direccional-
+  mente igual al lab: la marca mala castiga), y ambos llegan (31mm / 14mm).
 
 ## Pendiente / ideas
 
@@ -68,4 +81,3 @@ fuente de ground truth para métricas.
   supervisor) para probar la base completa contra robots simulados.
 - Marker ArUco texturizado + cámara cenital renderizada para probar la
   detección cv2 de verdad (hoy la pose viene del supervisor con ruido).
-- Asimetrías por robot (escala de gyro/PPR) para replicar Atta_1 vs Atta_2.

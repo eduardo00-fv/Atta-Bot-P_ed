@@ -17,14 +17,29 @@ Consola: mandale UDP a 127.0.0.1:6060 con el formato del lab, p. ej.:
     echo -n "BROADCAST.EKF_NAV|1"    | nc -u -w0 127.0.0.1 6060
 """
 
+import json
 import math
+import os
 import random
 import socket
 
 from controller import Supervisor
 
 ARENA_W, ARENA_H = 2.4, 1.55          # m (Webots), arena centrada en el origen
-NOISE_POS, NOISE_ANG = 30.0, 2.0      # jitter ArUco del lab (mm, grados)
+NOISE_POS, NOISE_ANG = 30.0, 2.0      # jitter ArUco genérico (mm, grados)
+
+# Jitter POR ROBOT: la marca de cada robot real es distinta (robot_profiles.json)
+try:
+    with open(os.path.join(os.path.dirname(__file__), '..', '..',
+                           'robot_profiles.json')) as f:
+        PROFILES = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    PROFILES = {}
+
+
+def aruco_noise(rid):
+    p = PROFILES.get(rid, {})
+    return p.get('aruco_pos_sigma', NOISE_POS), p.get('aruco_ang_sigma', NOISE_ANG)
 
 sup = Supervisor()
 dt = int(sup.getBasicTimeStep()) * 2
@@ -123,9 +138,10 @@ while sup.step(dt) != -1:
                 if now < occluded_until:
                     continue                     # la base calla si no "ve"
                 x, y, ang = camera_pose(robots[sender])
-                x += random.gauss(0, NOISE_POS)
-                y += random.gauss(0, NOISE_POS)
-                ang = (ang + random.gauss(0, NOISE_ANG)) % 360
+                sp, sa = aruco_noise(sender)
+                x += random.gauss(0, sp)
+                y += random.gauss(0, sp)
+                ang = (ang + random.gauss(0, sa)) % 360
                 sock.sendto(f'POSITION_RESPONSE|{x:.1f}|{y:.1f}|{ang:.1f}'.encode(),
                             addr)
             elif msg.startswith('LEADER_POSITION'):
