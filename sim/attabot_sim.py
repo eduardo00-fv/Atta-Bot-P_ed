@@ -16,10 +16,16 @@ El eje Y apunta hacia abajo (igual que la cámara ArUco).
 import math
 import random
 import argparse
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
+
+# matplotlib es opcional — el port de ReactiveNav debe ser importable en
+# entornos sin él (p. ej. el controller de Webots); solo los plots lo requieren
+try:
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+except ImportError:
+    plt = mpatches = None
 
 
 # ── Constantes del robot (mismos valores que el firmware) ────────────────────

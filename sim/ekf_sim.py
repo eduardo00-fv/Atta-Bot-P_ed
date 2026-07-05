@@ -22,7 +22,10 @@ import math
 import random
 import argparse
 
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt   # opcional: solo para los plots
+except ImportError:
+    plt = None
 
 from attabot_sim import (
     SimRobot, SimWorld, ReactiveNav, normalize_angle,
