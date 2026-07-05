@@ -52,7 +52,12 @@ def camera_pose(node):
 
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind(('127.0.0.1', 6060))
+try:
+    sock.bind(('127.0.0.1', 6060))
+except OSError:
+    import sys
+    sys.exit('[base] puerto 6060 ocupado — ¿hay OTRO Webots abierto con este '
+             'mundo? Cerralo (flatpak kill com.cyberbotics.webots) y hacé Reset (⏮).')
 sock.setblocking(False)
 
 occluded_until = 0.0

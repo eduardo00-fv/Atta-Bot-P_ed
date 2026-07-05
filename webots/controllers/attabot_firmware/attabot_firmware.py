@@ -67,7 +67,12 @@ class AttabotFirmware:
             d.enable(self.dt)
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind(('127.0.0.1', 6060 + int(self.robot_id)))
+        try:
+            self.sock.bind(('127.0.0.1', 6060 + int(self.robot_id)))
+        except OSError:
+            sys.exit(f'[{self.name}] puerto {6060 + int(self.robot_id)} ocupado — '
+                     '¿hay OTRO Webots abierto con este mundo? Cerralo '
+                     '(flatpak kill com.cyberbotics.webots) y hacé Reset (⏮).')
         self.sock.setblocking(False)
 
         # Estado de movimiento
