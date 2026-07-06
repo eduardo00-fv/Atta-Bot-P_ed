@@ -12,6 +12,14 @@
                 "origin_y_mm": -341.6,
                 "reference_marker_id": "0"
         },
+        "simulation": {
+                "robot_host": "127.0.0.1",
+                "robot_port_base": 6060,
+                "vision_port": 6055,
+                "control_port": 6059,
+                "mm_per_px": 2.0,
+                "arena_mm": [2400, 1550]
+        },
         "udp_communication": {
                 "base_ip": "192.168.1.100",
                 "broadcast_ip": "192.168.1.255",

@@ -1,6 +1,6 @@
 import os
 os.environ['QT_QPA_PLATFORM'] = 'xcb'  # forzar xcb — cv2 no tiene plugin wayland
-import cv2, json, math, re, time, socket, threading, csv, multiprocessing, threading, platform
+import cv2, json, math, re, sys, time, socket, threading, csv, multiprocessing, threading, platform
 import numpy as np
 import readline
 from datetime import datetime
@@ -251,6 +251,85 @@ class Robot(object):
 
 
 
+class SimVision(object):
+    """
+    Fuente de visión para el modo simulación (--sim).
+
+    Reemplaza a la cámara física: recibe por UDP los paquetes 'CAM|id,x,y,ang;...'
+    que emite base_camera.py (el supervisor de Webots en modo solo-cámara) y
+    sintetiza un frame BGR equivalente para el resto del pipeline (video, mapa
+    de cobertura, debug). Las detecciones ya vienen en el marco de cámara del
+    lab (mm, y hacia abajo, ángulo CW) y CON el jitter ArUco aplicado por el
+    supervisor según robot_profiles.json — aquí no se agrega ruido.
+
+    La oclusión de cámara se simula con paquetes 'CAM|' vacíos (equivale a
+    tapar el lente: llegan frames pero sin markers detectados).
+    """
+
+    def __init__(self, base, visionPort, controlAddr):
+        self.base = base
+        self.controlAddr = controlAddr
+        self.detections = {}
+        self.lastPacketTime = 0.0
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self.sock.bind(('127.0.0.1', visionPort))
+        except OSError as e:
+            raise Exception(f'Puerto de visión sim {visionPort} ocupado '
+                            f'(¿otra base --sim corriendo?): {e}')
+        print(f'✓ Visión sim escuchando en 127.0.0.1:{visionPort} '
+              f'(feed CAM de base_camera.py)')
+        self._recvLoop()
+
+    @runOnThread
+    def _recvLoop(self):
+        """Actualiza las detecciones con cada paquete CAM del supervisor."""
+        while True:
+            data, _ = self.sock.recvfrom(2048)
+            msg = data.decode().strip()
+            if not msg.startswith('CAM|'):
+                continue
+            detections = {}
+            body = msg[4:]
+            if body:
+                for item in body.split(';'):
+                    rid, x, y, ang = item.split(',')
+                    detections[rid] = (round(float(x), 1), round(float(y), 1),
+                                       round(float(ang), 1))
+            self.detections = detections
+            self.lastPacketTime = time.time()
+
+    def snapshot(self):
+        """Detecciones vigentes. Feed muerto >1s (Webots pausado/cerrado) = vacío."""
+        if time.time() - self.lastPacketTime > 1.0:
+            return {}
+        return dict(self.detections)
+
+    def read(self):
+        """Equivalente de camera.read(): sintetiza el frame de la escena."""
+        time.sleep(0.02)   # pace mínimo; el gate de processInterval hace el resto
+        h, w = self.base.cameraResolution
+        frame = np.full((h, w, 3), 235, dtype=np.uint8)
+        mm = self.base.mmPixel
+        for rid, (x, y, ang) in self.snapshot().items():
+            px, py = int(x / mm), int(y / mm)
+            if not (0 <= px < w and 0 <= py < h):
+                continue
+            color = _ROBOT_COLORS_BGR[int(rid) % len(_ROBOT_COLORS_BGR)]
+            r = max(4, int(75 / mm))   # radio del cuerpo del AttaBot
+            cv2.circle(frame, (px, py), r, color, 2)
+            hx = px + int(r * 1.6 * math.cos(math.radians(ang)))
+            hy = py + int(r * 1.6 * math.sin(math.radians(ang)))
+            cv2.line(frame, (px, py), (hx, hy), color, 2)
+            cv2.putText(frame, rid, (px - 5, py + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+        return True, frame
+
+    def sendControl(self, message):
+        """Comando al supervisor de Webots (OCCLUDE.n, COLOR_QUERY.rid)."""
+        self.sock.sendto(message.encode(), self.controlAddr)
+
+
 class Base(object):
     """
     Clase Base para la gestión de un sistema de robots de enjambre con detección ArUco.
@@ -312,6 +391,11 @@ class Base(object):
         self.gui = None                   # referencia a AttaBotGUI (None = modo terminal)
         # --- Calibración por robot (CALIBRATE.robotId) ---
         self._calib = None                # estado de la rutina activa, None = inactiva
+        # --- Modo simulación (--sim): visión desde Webots, robots en localhost ---
+        self.simMode = False
+        self.simVision = None             # instancia de SimVision
+        self.simConfig = {}               # sección 'simulation' del JSON
+        self.logTag = ''                  # 'SIM_' en los nombres de log de sim
 
 
     def log(self, msg: str):
@@ -594,6 +678,25 @@ class Base(object):
         return None
 
 
+    def assignSimAddresses(self, configuredRobots):
+        """
+        Asigna direcciones a los robots en modo simulación.
+
+        En Webots cada controller escucha en 127.0.0.1:(puerto_base + id), así
+        que la asociación id → dirección es directa, sin la rutina de giro
+        del lab.
+
+        Parámetros:
+        - configuredRobots (set): Conjunto de IDs ya configurados (se llena aquí).
+        """
+        host = self.simConfig.get('robot_host', '127.0.0.1')
+        portBase = int(self.simConfig.get('robot_port_base', self.port))
+        for robot in self.robots.values():
+            robot.setupIP(f'{host}:{portBase + int(robot.id)}')
+            configuredRobots.add(robot.id)
+        self.printRobots()
+
+
     def setupMoveRobot(self, robotsIPs):
         """
         Envía instrucciones para girar al último robot de la lista robotsIPs.
@@ -645,6 +748,10 @@ class Base(object):
         with open(filePath, 'r') as file:
             configuration = json.load(file)
 
+        self.simConfig = configuration.get('simulation', {})
+        if self.simMode:
+            self.logTag = 'SIM_'
+
         self.configVisionSystem(configuration['vision_system'])
         self.configUdp(configuration['udp_communication'])
         self.generalConfig(configuration['general'])
@@ -682,9 +789,29 @@ class Base(object):
         Parámetros:
         - configuration (dict): Configuración UDP.
         """
+        self.port = configuration['port']
+
+        if self.simMode:
+            # La base toma 127.0.0.1:6060 — los controllers de Webots mandan
+            # todo ahí. Sin SO_REUSEPORT a propósito: si base_camera.py llega
+            # después, su bind falla y entra en modo solo-cámara (feed CAM).
+            self.baseIP = '127.0.0.1'
+            self.broadcastIP = '127.0.0.1'
+            self.networkInterface = None
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2**20)
+            try:
+                self.sock.bind(('127.0.0.1', self.port))
+                print(f'✓ Socket UDP bind exitoso en 127.0.0.1:{self.port} (SIM)')
+            except OSError as e:
+                print(f'✗ Puerto {self.port} ocupado: {e}')
+                print('  En modo sim la base debe iniciarse ANTES que Webots.')
+                print('  Cerrá Webots (flatpak kill com.cyberbotics.webots) y reintentá.')
+                raise
+            return
+
         self.baseIP = configuration['base_ip']
         self.broadcastIP = configuration['broadcast_ip']
-        self.port = configuration['port']
         self.networkInterface = configuration.get('network_interface', None)
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -738,6 +865,10 @@ class Base(object):
                 'path_cameraMatrix', 'path_distance', 'mmPixel',
                 'frame_processing_interval', 'marker_size_mm'
         """
+        if self.simMode:
+            self.configSimVision(configuration)
+            return
+
         self.setCamera(configuration)
 
         self.cameraMatriz = np.loadtxt(configuration['path_cameraMatrix'], dtype=float)
@@ -799,6 +930,37 @@ class Base(object):
 
         self.arucoDetector = cv2.aruco.ArucoDetector(arucoDict, arucoParams)
         print(f'✓ Detector ArUco inicializado — DICT_4X4_50, marker: {self.markerSizeMm}mm')
+
+
+    def configSimVision(self, configuration):
+        """
+        Configuración de visión en modo simulación: sin cámara física ni
+        calibración — las poses llegan por UDP desde el supervisor de Webots
+        (base_camera.py en modo solo-cámara). El frame se sintetiza en
+        SimVision.read() para que video/cobertura/debug sigan funcionando.
+
+        Parámetros:
+        - configuration (dict): sección 'vision_system' del JSON (se reusan
+          frame_processing_interval y debug_resolution; el resto se ignora).
+        """
+        sc = self.simConfig
+        self.processInterval = configuration['frame_processing_interval']
+        self.markerSizeMm = float(configuration['marker_size_mm'])
+        self.debugResolution = tuple(map(int, configuration['debug_resolution'].split('x')))
+        ref = configuration.get('reference_marker_id', '')
+        self.referenceMarkerId = str(ref) if ref != '' else None
+
+        # Escala del frame sintético: mm por píxel sobre el área de la arena
+        self.mmPixel = float(sc.get('mm_per_px', 2.0))
+        arenaW, arenaH = sc.get('arena_mm', [2400, 1550])
+        self.cameraResolution = (int(arenaH / self.mmPixel), int(arenaW / self.mmPixel))
+        self.bigCircleRadius = max(6, int((self.markerSizeMm / self.mmPixel) * 0.5))
+
+        visionPort = int(sc.get('vision_port', 6055))
+        controlAddr = ('127.0.0.1', int(sc.get('control_port', 6059)))
+        self.simVision = SimVision(self, visionPort, controlAddr)
+        h, w = self.cameraResolution
+        print(f'✓ Visión SIM inicializada — frame {w}x{h}px @ {self.mmPixel}mm/px')
 
 
     def setCamera(self, configuration):
@@ -931,10 +1093,15 @@ class Base(object):
         - frame (ndarray): Frame corregido por distorsión en BGR.
         - frameGray (ndarray): Frame en escala de grises.
         """
-        frame, frameGray = self.cameraCorrection(frame)
+        if self.simMode:
+            # Las detecciones vienen del feed CAM (ya en mm/grados del lab)
+            frameGray = None
+            raw = self.simVision.snapshot()
+        else:
+            frame, frameGray = self.cameraCorrection(frame)
+            raw = self.detectArucoMarkers(frame)
 
         # Detección ArUco — raw para desplazamiento/setup, suavizado para navegación
-        raw = self.detectArucoMarkers(frame)
         self.currentArucoDetections = raw
         self._smoothedArucoDetections = self._applyArucoEma(raw)
 
@@ -955,7 +1122,8 @@ class Base(object):
         """
         if self.gui is not None:
             return  # GUI recibe frames via frameSignal; no se necesita ventana separada
-        debugFrame = self.drawArucoDebug(frame.copy())
+        # En sim el frame ya viene anotado por SimVision (no hay markers que detectar)
+        debugFrame = frame.copy() if self.simMode else self.drawArucoDebug(frame.copy())
         resized = cv2.resize(debugFrame, self.debugResolution, interpolation=cv2.INTER_AREA)
         cv2.imshow('Debug ArUco', resized)
 
@@ -990,7 +1158,10 @@ class Base(object):
         failCount = 0
 
         while True:
-            ret, frame = self.camera.read()
+            if self.simMode:
+                ret, frame = self.simVision.read()
+            else:
+                ret, frame = self.camera.read()
 
             if not ret or frame is None:
                 failCount += 1
@@ -1028,8 +1199,15 @@ class Base(object):
 
                 if len(foundRobots) == self.numRobots:
                     print(f"[Búsqueda] Todos los robots encontrados: {sorted(foundRobots)}")
-                    robotsIPs = self.searchRobotsUdp()
-                    self.processFoundRobots(foundRobots)
+                    if self.simMode:
+                        # Identidad determinista en sim: id → 127.0.0.1:(6060+id).
+                        # No hace falta el giro de identificación ni el broadcast.
+                        self.processFoundRobots(foundRobots)
+                        self.assignSimAddresses(configuredRobots)
+                        robotsIPs = []
+                    else:
+                        robotsIPs = self.searchRobotsUdp()
+                        self.processFoundRobots(foundRobots)
 
             elif len(robotsIPs) != 0:
                 robotIP, isValidFrame = self.setupRobots(robotIP, robotsIPs, configuredRobots)
@@ -1183,7 +1361,8 @@ class Base(object):
         """
         Libera los recursos utilizados por la cámara y cierra las ventanas de OpenCV.
         """
-        self.camera.release()
+        if self.camera is not None:
+            self.camera.release()
 
         if self.frameQueue is not None:
             self.frameQueue.put(None)
@@ -1192,7 +1371,10 @@ class Base(object):
                 self.frameQueue.get()
             self.frameQueue.close()
 
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:
+            pass   # build de cv2 sin highgui (headless) — no hay ventanas que cerrar
 
 
     def addFrame(self, frame, resultsFrame, timeLog):
@@ -1238,7 +1420,7 @@ class Base(object):
     def createPositionLog(self):
         """Crea un archivo CSV de registro de posiciones de robots."""
         currentTime = datetime.now().strftime(r'%d-%m_%H-%M')
-        logName = f'Position_Log_{currentTime}_Robots_{self.numRobots}.csv'
+        logName = f'Position_Log_{self.logTag}{currentTime}_Robots_{self.numRobots}.csv'
         self.pathPositionLogs = os.path.join(self.pathPositionLogs, logName)
         header = ['time', 'idrobot', 'robot', 'x', 'y', 'angle',
                   'linearDisplacement', 'angularDisplacement']
@@ -1256,7 +1438,7 @@ class Base(object):
     def createConcoleLog(self):
         """Crea un archivo CSV de registro de mensajes UDP recibidos."""
         currentTime = datetime.now().strftime(r'%d-%m_%H-%M')
-        logName = f'Console_Log_{currentTime}_Robots_{self.numRobots}.csv'
+        logName = f'Console_Log_{self.logTag}{currentTime}_Robots_{self.numRobots}.csv'
         self.pathConsolelog = os.path.join(self.pathConsolelog, logName)
         header = ['time', 'idrobot', 'robot', 'message']
         with open(self.pathConsolelog, 'w', newline='') as f:
@@ -1302,8 +1484,27 @@ class Base(object):
         return list(robotsIPs)
 
 
+    def _robotAddr(self, ip):
+        """
+        Traduce la dirección de un robot a tupla (host, puerto).
+        Acepta 'ip' (lab: puerto común) o 'ip:puerto' (sim: puerto por robot).
+        """
+        if ':' in ip:
+            host, port = ip.rsplit(':', 1)
+            return (host, int(port))
+        return (ip, self.port)
+
+
     def sendInstructionBroadcast(self, instructions):
         """Envía instrucciones a todos los robots por broadcast."""
+        if self.simMode:
+            # En localhost no hay broadcast: se emula enviando a cada robot
+            for instruction in instructions:
+                for robot in self.robots.values():
+                    if robot.IP:
+                        self.sock.sendto(instruction.encode(), self._robotAddr(robot.IP))
+                print(f"(Broadcast sim) Mensaje enviado: {instruction}")
+            return
         for instruction in instructions:
             self.sock.sendto(instruction.encode(), (self.broadcastIP, self.port))
             print(f"(Broadcast) Mensaje enviado: {instruction}")
@@ -1312,7 +1513,7 @@ class Base(object):
     @runOnThread
     def sendInstruction(self, ip, instructions, printing):
         """
-        Envía instrucciones a un robot específico por IP.
+        Envía instrucciones a un robot específico por IP (o 'ip:puerto' en sim).
 
         Parámetros:
         - ip (str): Dirección IP del robot.
@@ -1320,7 +1521,7 @@ class Base(object):
         - printing (bool): Si True, imprime confirmación en consola.
         """
         for instruction in instructions:
-            self.sock.sendto(instruction.encode(), (ip, self.port))
+            self.sock.sendto(instruction.encode(), self._robotAddr(ip))
             name = next((robot.name for robot in self.robots.values() if robot.IP == ip), ip)
             if printing:
                 self.log(f'Mensaje enviado a {name}: {instruction}')
@@ -1337,20 +1538,23 @@ class Base(object):
         while True:
             data, addr = self.sock.recvfrom(1024)
             ip = addr[0]
+            # En sim todos los robots comparten 127.0.0.1 — la identidad la da
+            # el puerto de origen (cada controller tiene el suyo)
+            peer = f'{addr[0]}:{addr[1]}' if self.simMode else ip
 
-            if ip != self.baseIP:
+            if self.simMode or ip != self.baseIP:
                 message = data.decode()
                 timeLog = round(time.time() - self.startTime, 1)
 
                 robotFound = False
                 for robot in self.robots.values():
-                    if robot.IP == ip:
+                    if robot.IP == peer:
                         name, id = robot.name, robot.id
                         robotFound = True
                         break
 
                 if not robotFound:
-                    name, id = ip, "-1"
+                    name, id = peer, "-1"
 
                 self.addConcoleLog(timeLog, id, name, message)
 
@@ -1362,7 +1566,7 @@ class Base(object):
 
                 if command == 'REQUEST_POSITION':
                     if robotFound:
-                        self.sendPositionToRobot(ip, id)
+                        self.sendPositionToRobot(peer, id)
                     if len(parts) >= 5 and parts[1] == 'BUG2':
                         self.log(f'Solicitud GT {name}: {parts[2]} paso={parts[3]} dist={parts[4]}mm')
                     else:
@@ -1374,6 +1578,18 @@ class Base(object):
                         leaderX, leaderY, leaderAngle = float(parts[2]), float(parts[3]), float(parts[4])
                         self.updateRobotPosition(leaderID, leaderX, leaderY, leaderAngle)
                         self.log(f'Posición de líder {leaderID}: ({leaderX},{leaderY}) {leaderAngle}°')
+                        if self.simMode:
+                            # En el lab esto viaja por broadcast WiFi robot→robots;
+                            # en localhost la base lo retransmite a los seguidores
+                            for robot in self.robots.values():
+                                if robot.id != leaderID and robot.IP:
+                                    self.sendInstruction(robot.IP, [message], False)
+
+                elif command == 'COLOR_QUERY' and self.simMode:
+                    # APDS virtual: el supervisor de Webots conoce los colores
+                    # del mundo y responde COLOR_RESPONSE directo al robot
+                    if robotFound:
+                        self.simVision.sendControl(f'COLOR_QUERY.{id}')
 
                 elif command == 'CHECK_OBSTACLE':
                     continue
@@ -1766,6 +1982,13 @@ class Base(object):
                 self.startCongregation(instruction)
             elif robotId == 'CALIBRATE':
                 self.startCalibration(instruction)
+            elif robotId == 'OCCLUDE':
+                # Solo sim: tapa la cámara virtual n segundos (OCCLUDE.10)
+                if self.simMode:
+                    self.simVision.sendControl(f'OCCLUDE.{instruction}')
+                    print(f'Cámara sim ocluida por {instruction}s')
+                else:
+                    print('OCCLUDE solo existe en modo --sim')
             elif robotId == 'GOTO':
                 parts = instruction.split()
                 if len(parts) == 3:
@@ -1800,9 +2023,23 @@ base = Base()
 
 
 def main():
+    """
+    Uso:
+        python AttaBot_Base.py               # modo lab (cámara C920 + WiFi)
+        python AttaBot_Base.py --sim         # visión y robots desde Webots
+        python AttaBot_Base.py --sim --headless   # sin ventana de debug
+
+    En modo sim: iniciar la base ANTES que Webots (la base toma el puerto 6060
+    y base_camera.py, al encontrarlo ocupado, entra en modo solo-cámara).
+    """
     configurationFilePath = 'configSystem.json'
+    base.simMode = '--sim' in sys.argv
+    if base.simMode:
+        print('=== MODO SIMULACIÓN: visión y robots desde Webots ===')
     base.numRobots = int(input('Cantidad de robots en la prueba: '))
     base.readConfigFile(configurationFilePath)
+    if '--headless' in sys.argv:
+        base.debug = False
     base.cameraProcessing()
 
 
