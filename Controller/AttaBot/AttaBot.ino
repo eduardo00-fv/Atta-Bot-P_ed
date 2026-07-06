@@ -164,7 +164,6 @@ EKFState ekf;  // observador pasivo por ahora — la nav sigue usando robotPose
 ObstacleState obstacles;
 MovementMetrics movement;
 LedController ledCtrl;
-Bug2State bug2;
 
 // IMU — control de frecuencia de lectura
 unsigned long lastImuRead = 0;
@@ -280,12 +279,6 @@ float DesiredSpeed(float distance, float wheelDistance);
 bool IsStationary(float currentLeftSpeed, float currentRightSpeed,
                   float leftWheelDistance, float rightWheelDistance);
 void SelectMovementRW();
-
-// Navegación GT (Bug2 unificado)
-void InitiateBug2Navigation(float targetX, float targetY);
-void EnqueueNavStep(float targetX, float targetY, float maxSeg);
-void Bug2ProcessPosition();
-void Bug2WallFollowStep();
 
 // Auxiliares
 std::array<String, 5> SeparateCommand(const String &command, char delimiter);
@@ -917,28 +910,15 @@ void loop() {
       MessageDebugf("DEBUG: -1, ID: %s, No hay IP de base — abortando nav",
                     robotID.c_str());
       congregation.CompleteRequest();
-      bug2.Reset();
       state = WAIT;
       instructionValue = 500;
       break;
     }
 
     if (!congregation.waitingForResponse) {
-      // Mensaje enriquecido para Bug2; estándar para el resto
-      char reqMsg[96];
-      if (bug2.isActive) {
-        const char *subStr =
-            (bug2.subState == Bug2State::GOAL_SEEK) ? "SEEK" : "WALL";
-        snprintf(reqMsg, sizeof(reqMsg), "REQUEST_POSITION|BUG2|%s|%d|%.0f",
-                 subStr, bug2.wallFollowSteps,
-                 CalculateDistance(robotPose.x, robotPose.y,
-                                   bug2.goalX, bug2.goalY));
-      } else {
-        strcpy(reqMsg, "REQUEST_POSITION");
-      }
-      SendMessage(robots["Base"], reqMsg);
-      MessageDebugf("DEBUG: -1, ID: %s, Solicitud enviada: %s",
-                    robotID.c_str(), reqMsg);
+      SendMessage(robots["Base"], "REQUEST_POSITION");
+      MessageDebugf("DEBUG: -1, ID: %s, Solicitud enviada: REQUEST_POSITION",
+                    robotID.c_str());
       congregation.StartRequest();
     }
 
@@ -946,18 +926,6 @@ void loop() {
       MessageDebugf("DEBUG: -1, ID: %s, Timeout en REQUEST_POSITION",
                     robotID.c_str());
       congregation.CompleteRequest();
-
-      if (bug2.isActive || bug2.pendingInit) {
-        // Reintentar: la navegación sigue activa
-        fsmInstruction[0] = REQUEST_POSITION;
-        fsmInstruction[1] = 0;
-        instructionList.push_back(fsmInstruction);
-        MessageDebugf("DEBUG: -1, ID: %s, Reintentando REQUEST_POSITION",
-                      robotID.c_str());
-      } else {
-        bug2.Reset();
-      }
-
       state = WAIT;
       instructionValue = 500;
       break;
@@ -1000,36 +968,6 @@ void loop() {
                     "Re-escaneando.",
                     robotID.c_str(), timeSinceDetection);
       state = STOP;
-      break;
-    }
-
-    // GT activo: registrar hit y dejar que Bug2WallFollowStep maneje el rodeo
-    if (bug2.isActive) {
-      if (bug2.subState == Bug2State::GOAL_SEEK) {
-        bug2.RecordHitPoint(robotPose.x, robotPose.y);
-        MessageDebugf(
-            "DEBUG: -1, ID: %s, GT: obstáculo en SEEK -> hitPoint (%.1f,%.1f), "
-            "iniciando WALL_FOLLOW",
-            robotID.c_str(), robotPose.x, robotPose.y);
-      } else {
-        MessageDebugf("DEBUG: -1, ID: %s, GT: obstáculo en WALL_FOLLOW, "
-                      "re-evaluando",
-                      robotID.c_str());
-      }
-
-      instructionList.clear();
-      obstacleDetected = false;
-      // isEvading se mantiene true: READ_INSTRUCTION lo usaría para NO limpiar obstacles.
-      // Bug2WallFollowStep los limpia después de leerlos.
-      resumeScheduled = false;
-      intContext.Clear();
-      // No limpiar obstacles: Bug2WallFollowStep necesita el estado actual de sensores
-
-      fsmInstruction[0] = REQUEST_POSITION;
-      fsmInstruction[1] = 0;
-      instructionList.push_back(fsmInstruction);
-
-      state = READ_INSTRUCTION;
       break;
     }
 
@@ -1154,7 +1092,7 @@ void loop() {
         "DEBUG: -1, ID: %s, Resumiendo: estado=%d, valor=%.1f",
         robotID.c_str(), intContext.previousState, intContext.remainingValue);
 
-    if (bug2.isActive || nav.isActive) {
+    if (nav.isActive) {
       // Navegación activa: re-solicitar posición para recalcular ruta en vez
       // de terminar a ciegas el segmento interrumpido (nav.isActive faltaba
       // tras la migración a ReactiveNav — causaba desvíos largos al evadir)
@@ -1205,56 +1143,11 @@ void loop() {
     state = READ_INSTRUCTION;
     break;
   }
-
-    // =========================================================================
-    // BUG2 FSM CASES
-    // =========================================================================
-
-  case BUG2_SEEK: {
-    // Avance hacia el objetivo. Si hay obstáculo, pasa a WALL_FOLLOW.
-    if (obstacleDetected && obstacles.HasAnyObstacle()) {
-      MessageDebugf(
-          "DEBUG: -1, ID: %s, GT SEEK: obstáculo detectado -> WALL_FOLLOW",
-          robotID.c_str());
-
-      bug2.RecordHitPoint(robotPose.x, robotPose.y);
-      instructionList.clear();
-      obstacleDetected = false;
-      isEvading = true;  // evita que READ_INSTRUCTION limpie obstacles antes de WallFollowStep
-
-      state = ACTIVE_EVASION;
-      intContext.wasInterrupted = true;
-      intContext.previousState = BUG2_SEEK;
-    } else {
-      state = READ_INSTRUCTION;
-    }
-    break;
-  }
-
-  case BUG2_WALL_FOLLOW: {
-    // Rodeo de obstáculo. Si se detecta otro obstáculo, re-evalúa.
-    if (obstacleDetected && obstacles.HasAnyObstacle()) {
-      MessageDebugf(
-          "DEBUG: -1, ID: %s, GT WALL_FOLLOW: obstáculo adicional detectado",
-          robotID.c_str());
-
-      instructionList.clear();
-      obstacleDetected = false;
-      isEvading = true;  // evita que READ_INSTRUCTION limpie obstacles
-
-      state = ACTIVE_EVASION;
-      intContext.wasInterrupted = true;
-      intContext.previousState = BUG2_WALL_FOLLOW;
-    } else {
-      state = READ_INSTRUCTION;
-    }
-    break;
-  }
   }
 }
 
 // ============================================================================
-// FUNCIONES DE NAVEGACIÓN GT (Bug2 unificado — GOAL_SEEK + WALL_FOLLOW)
+// NAVEGACIÓN REACTIVA UNIFICADA — GT y Congregación
 // ============================================================================
 
 // Ejecuta un paso de navegación hacia (nav.goalX, nav.goalY).
@@ -1342,214 +1235,6 @@ void ReactiveNavStep() {
   if (seg > 10.0f) {
     fsmInstruction[0] = MOVE;
     fsmInstruction[1] = seg;
-    instructionList.push_back(fsmInstruction);
-    fsmInstruction[0] = WAIT;
-    fsmInstruction[1] = 300;
-    instructionList.push_back(fsmInstruction);
-  }
-
-  fsmInstruction[0] = REQUEST_POSITION;
-  fsmInstruction[1] = 0;
-  instructionList.push_back(fsmInstruction);
-}
-
-void InitiateBug2Navigation(float targetX, float targetY) {
-  bug2.Start(robotPose.x, robotPose.y, targetX, targetY);
-
-  MessageDebugf(
-      "DEBUG: -1, ID: %s, GT iniciado: start=(%.1f,%.1f), goal=(%.1f,%.1f)",
-      robotID.c_str(), robotPose.x, robotPose.y, targetX, targetY);
-  // No enqueues REQUEST_POSITION — el caller ya tiene robotPose válida y
-  // llama Bug2ProcessPosition() directamente para evitar un round-trip extra.
-}
-
-// Encola TURN + MOVE + REQUEST_POSITION hacia (targetX, targetY).
-// seg: distancia máxima del segmento. Compartido por GOAL_SEEK y futuros algoritmos.
-void EnqueueNavStep(float targetX, float targetY, float maxSeg) {
-  float deltaX = targetX - robotPose.x;
-  float deltaY = targetY - robotPose.y;
-  float dist   = sqrt(deltaX * deltaX + deltaY * deltaY);
-
-  float targetAngle = atan2(deltaY, deltaX) * RAD_TO_DEG;
-  float angleDiff   = NormalizeAngle(targetAngle - robotPose.angle);
-
-  float seg = (dist <= maxSeg) ? dist * 0.9f : maxSeg;
-  seg = constrain(seg, 10.0f, maxSeg);
-
-  if (abs(angleDiff) > 5.0f) {
-    fsmInstruction[0] = TURN;
-    fsmInstruction[1] = radians(angleDiff) * centerToWheelDistance;
-    instructionList.push_back(fsmInstruction);
-  }
-  if (seg > 10.0f) {
-    fsmInstruction[0] = MOVE;
-    fsmInstruction[1] = seg;
-    instructionList.push_back(fsmInstruction);
-  }
-  fsmInstruction[0] = WAIT;
-  fsmInstruction[1] = 300;
-  instructionList.push_back(fsmInstruction);
-  fsmInstruction[0] = REQUEST_POSITION;
-  fsmInstruction[1] = 0;
-  instructionList.push_back(fsmInstruction);
-}
-
-void Bug2ProcessPosition() {
-  if (!bug2.isActive) {
-    MessageDebugf("DEBUG: -1, ID: %s, Bug2 no está activo", robotID.c_str());
-    return;
-  }
-
-  float currentX = robotPose.x;
-  float currentY = robotPose.y;
-
-  // ¿Llegó al objetivo?
-  if (bug2.HasReachedGoal(currentX, currentY)) {
-    MessageDebugf("DEBUG: -1, ID: %s, Bug2: OBJETIVO ALCANZADO en (%.1f, %.1f)",
-                  robotID.c_str(), currentX, currentY);
-    bug2.Reset();
-    instructionList.clear();  // cancelar TURNs/MOVEs residuales de pasos anteriores
-    return;
-  }
-
-  // ¿Timeout?
-  if (bug2.HasTimedOut()) {
-    MessageDebugf("DEBUG: -1, ID: %s, Bug2: TIMEOUT. Abortando navegación.",
-                  robotID.c_str());
-    bug2.Reset();
-    return;
-  }
-
-  if (bug2.subState == Bug2State::GOAL_SEEK) {
-    // === GOAL SEEK: ir directo al objetivo ===
-    float distance = CalculateDistance(currentX, currentY, bug2.goalX, bug2.goalY);
-    MessageDebugf("DEBUG: -1, ID: %s, GT SEEK: dist=%.1fmm",
-                  robotID.c_str(), distance);
-    EnqueueNavStep(bug2.goalX, bug2.goalY, bug2.seekSegmentDistance);
-
-  } else if (bug2.subState == Bug2State::WALL_FOLLOW) {
-    // === WALL FOLLOW: rodear obstáculo ===
-    bug2.wallFollowSteps++;
-
-    MessageDebugf("DEBUG: -1, ID: %s, Bug2 WALL_FOLLOW: paso %d, "
-                  "pos=(%.1f,%.1f), distM=%.1f",
-                  robotID.c_str(), bug2.wallFollowSteps, currentX, currentY,
-                  bug2.DistanceToMLine(currentX, currentY));
-
-    // ¿Puede dejar de seguir la pared? (Condición Bug 2)
-    if (bug2.ShouldLeaveWall(currentX, currentY)) {
-      MessageDebugf("DEBUG: -1, ID: %s, Bug2: Cruzó Línea M más cerca del "
-                    "objetivo. Volviendo a SEEK.",
-                    robotID.c_str());
-      bug2.subState = Bug2State::GOAL_SEEK;
-
-      // Recalcular y volver a SEEK
-      fsmInstruction[0] = REQUEST_POSITION;
-      fsmInstruction[1] = 0;
-      instructionList.push_back(fsmInstruction);
-      return;
-    }
-
-    // ¿Loop completo? (el objetivo es inalcanzable)
-    if (bug2.HasCompletedLoop(currentX, currentY)) {
-      MessageDebugf("DEBUG: -1, ID: %s, Bug2: LOOP COMPLETO detectado. "
-                    "Objetivo inalcanzable.",
-                    robotID.c_str());
-      bug2.Reset();
-      return;
-    }
-
-    // ¿Demasiados pasos?
-    if (bug2.HasExceededMaxSteps()) {
-      MessageDebugf("DEBUG: -1, ID: %s, Bug2: Máximo de pasos WALL_FOLLOW "
-                    "alcanzado. Abortando.",
-                    robotID.c_str());
-      bug2.Reset();
-      return;
-    }
-
-    // Ejecutar un paso de seguimiento de pared
-    Bug2WallFollowStep();
-  }
-}
-
-void Bug2WallFollowStep() {
-  float turnAngle = 0;
-  float moveDistance = bug2.wallFollowSegment;
-
-  // Leer sensores de obstáculos actuales, luego limpiar estado para siguientes ciclos
-  bool frontBlocked =
-      obstacles.centralObstacle || obstacles.IsFrontalObstacle();
-  bool rightBlocked = obstacles.rightObstacle;
-  bool leftBlocked = obstacles.leftObstacle;
-  isEvading = false;
-  obstacles.Clear();
-
-  // Determinar dirección de rodeo en el primer paso si no fue asignada por comando
-  if (!bug2.directionAutoSet) {
-    if (rightBlocked && !leftBlocked) {
-      bug2.wallFollowDirection = 1;
-    } else if (leftBlocked && !rightBlocked) {
-      bug2.wallFollowDirection = -1;
-    }
-    // Si frontal o ambos lados: mantener dirección actual (default 1)
-    bug2.directionAutoSet = true;
-    MessageDebugf("DEBUG: -1, ID: %s, Bug2 WF: dirección auto=%d (L=%d,C=%d,R=%d)",
-                  robotID.c_str(), bug2.wallFollowDirection,
-                  (int)leftBlocked, (int)frontBlocked, (int)rightBlocked);
-  }
-
-  if (frontBlocked) {
-    bug2.lostWallSteps = 0;
-    turnAngle = -90 * bug2.wallFollowDirection;
-    moveDistance = 0;
-    MessageDebugf("DEBUG: -1, ID: %s, Bug2 WF: Pared frontal -> Girar %.0f°",
-                  robotID.c_str(), turnAngle);
-  } else if (rightBlocked && bug2.wallFollowDirection == 1) {
-    bug2.lostWallSteps = 0;
-    turnAngle = 0;
-    MessageDebugf(
-        "DEBUG: -1, ID: %s, Bug2 WF: Pared derecha -> Avanzar paralelo",
-        robotID.c_str());
-  } else if (leftBlocked && bug2.wallFollowDirection == -1) {
-    bug2.lostWallSteps = 0;
-    turnAngle = 0;
-    MessageDebugf(
-        "DEBUG: -1, ID: %s, Bug2 WF: Pared izquierda -> Avanzar paralelo",
-        robotID.c_str());
-  } else {
-    bug2.lostWallSteps++;
-    if (bug2.lostWallSteps >= bug2.maxLostWallSteps) {
-      MessageDebugf(
-          "DEBUG: -1, ID: %s, Bug2 WF: Sin pared por %d pasos -> GOAL_SEEK",
-          robotID.c_str(), bug2.lostWallSteps);
-      bug2.lostWallSteps = 0;
-      bug2.subState = Bug2State::GOAL_SEEK;
-      fsmInstruction[0] = REQUEST_POSITION;
-      fsmInstruction[1] = 0;
-      instructionList.push_back(fsmInstruction);
-      return;
-    }
-    turnAngle = bug2.wallFollowTurnAngle * bug2.wallFollowDirection;
-    MessageDebugf(
-        "DEBUG: -1, ID: %s, Bug2 WF: Sin pared (%d/%d) -> Girar %.0f°",
-        robotID.c_str(), bug2.lostWallSteps, bug2.maxLostWallSteps, turnAngle);
-  }
-
-  if (abs(turnAngle) > 1) {
-    fsmInstruction[0] = TURN;
-    fsmInstruction[1] = radians(turnAngle) * centerToWheelDistance;
-    instructionList.push_back(fsmInstruction);
-    // Pausa post-giro: deja que el robot pare y los sensores IR se estabilicen
-    // antes de la siguiente detección de obstáculos
-    fsmInstruction[0] = WAIT;
-    fsmInstruction[1] = 300;
-    instructionList.push_back(fsmInstruction);
-  }
-
-  if (moveDistance > 10) {
-    fsmInstruction[0] = MOVE;
-    fsmInstruction[1] = moveDistance;
     instructionList.push_back(fsmInstruction);
     fsmInstruction[0] = WAIT;
     fsmInstruction[1] = 300;
@@ -2024,7 +1709,6 @@ void ReadUdpPackets() {
       ipAddress.fromString(arguments[2]);
       robots["Broadcast"] = ipAddress;
       // Reset completo: limpia cualquier navegación activa de sesiones anteriores
-      bug2.Reset();
       instructionList.clear();
       isEvading = false;
       obstacles.Clear();
@@ -2134,10 +1818,6 @@ void ReadUdpPackets() {
 
   // POSE
   else if (command == "POSE") {
-    // Durante navegación Bug2 activa, ignorar POSE — robotPose solo se actualiza
-    // por POSITION_RESPONSE para evitar lecturas ArUco distorsionadas mid-rotación.
-    if (bug2.isActive) return;
-
     float newX = arguments[1].toFloat();
     float newY = arguments[2].toFloat();
     float newAngle = arguments[3].toFloat();
@@ -2284,10 +1964,10 @@ void ReadUdpPackets() {
     instructionList.push_back(fsmInstruction);
   }
 
-  // GT / GOTO / POSITIONGT / BUG2 — Navegación con evasión activa de obstáculos
-  // Uso: GT|x|y          — navega al objetivo con Bug2
+  // GT / GOTO / POSITIONGT / BUG2 — Navegación reactiva al objetivo
+  // ("BUG2" se acepta por compatibilidad; el algoritmo es ReactiveNav)
+  // Uso: GT|x|y          — navega al objetivo
   //      GT|x|y|seg      — ídem con segmento personalizado (50–400mm)
-  //      GT|x|y|dir      — dir=1 (pared derecha) o -1 (pared izquierda)
   else if (command == "GT" || command == "GOTO" ||
            command == "POSITIONGT" || command == "BUG2") {
     float targetX = arguments[1].toFloat();
@@ -2329,7 +2009,7 @@ void ReadUdpPackets() {
   // POSITION_RESPONSE
   else if (command == "POSITION_RESPONSE") {
     // Ignorar respuestas no solicitadas (paquetes residuales de sesiones anteriores)
-    if (!congregation.waitingForResponse && !bug2.pendingInit && !nav.pendingInit) {
+    if (!congregation.waitingForResponse && !nav.pendingInit) {
       MessageDebugf("DEBUG: -1, ID: %s, POSITION_RESPONSE ignorado (no esperado)",
                     robotID.c_str());
       return;
@@ -2448,14 +2128,13 @@ void ReadUdpPackets() {
                   robotID.c_str());
   }
 
-  // NAV_CONFIG — configura parámetros de GT (Bug2 seek)
+  // NAV_CONFIG — configura parámetros de navegación
   // Uso: NAV_CONFIG|SEGMENT_DIST|250   NAV_CONFIG|ARRIVAL_THRESHOLD|20
   else if (command == "NAV_CONFIG") {
     if (arguments[1] == "SEGMENT_DIST") {
       float newDist = arguments[2].toFloat();
       if (newDist >= 50 && newDist <= 400) {
-        nav.segmentDistance = newDist;        // ReactiveNav (GT/congregación actual)
-        bug2.seekSegmentDistance = newDist;   // compat Bug2 legacy
+        nav.segmentDistance = newDist;
         char buf[60];
         snprintf(buf, sizeof(buf), "NAV_CONFIG: segmento=%.0fmm", newDist);
         SendMessage(robots["Base"], buf);
@@ -2463,8 +2142,7 @@ void ReadUdpPackets() {
     } else if (arguments[1] == "ARRIVAL_THRESHOLD") {
       float newThr = arguments[2].toFloat();
       if (newThr >= 5 && newThr <= 200) {
-        nav.arrivalThreshold = newThr;        // ReactiveNav (GT/congregación actual)
-        bug2.arrivalThreshold = newThr;       // compat Bug2 legacy
+        nav.arrivalThreshold = newThr;
         char buf[60];
         snprintf(buf, sizeof(buf), "NAV_CONFIG: llegada=%.0fmm", newThr);
         SendMessage(robots["Base"], buf);
@@ -2547,7 +2225,6 @@ void ReadUdpPackets() {
 
   else if (command == "ABORT_NAV") {
     nav.Reset();
-    bug2.Reset();
     instructionList.clear();
     imuTurnActive       = false;  // si se abortó a mitad de un giro, no dejar el
     imuTurnIsCorrection = false;  // tracking IMU activo: el próximo TURN debe
