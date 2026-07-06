@@ -148,62 +148,6 @@ struct biasStore {
 };
 
 
-// ============================================================================
-// AUTOTUNING PID — Relay Method (Åström-Hägglund)
-// ============================================================================
-
-struct AutotuneState {
-  enum Phase : uint8_t { IDLE, WARMUP, MEASURING, DONE };
-
-  Phase phase         = IDLE;
-  float setpointMms   = 0.0f;   // velocidad objetivo para el test (mm/s)
-  float relayPWM      = 0.0f;   // amplitud del relay en cuentas PWM
-  float hysteresisMms = 5.0f;   // banda muerta para detección de cruce por cero (mm/s)
-
-  int8_t relayL = 1, relayR = -1;    // dirección actual del relay por rueda (+1/-1)
-  int8_t prevSignL = 0, prevSignR = 0; // signo previo del error para detección de cruce
-
-  unsigned long lastCrossL = 0, lastCrossR = 0; // timestamp último cruce por cero
-
-  static constexpr int kMaxSamples = 14; // máximo de semiciclos a registrar
-  float halfPeriodsL[kMaxSamples];
-  float halfPeriodsR[kMaxSamples];
-  float ampsL[kMaxSamples];
-  float ampsR[kMaxSamples];
-  int   samplesL = 0, samplesR = 0;
-
-  float peakL = 0.0f, peakR = 0.0f;  // pico de error en el semiciclo actual
-
-  unsigned long phaseStart = 0;
-
-  // Gains propuestos, pendientes de confirmación con SAVEPID
-  float pendingKp = -1.0f, pendingKi = -1.0f, pendingKd = -1.0f;
-
-  static constexpr unsigned long kWarmupMs   = 1500;  // ms de precalentamiento
-  static constexpr int           kMinSamples = 6;     // semiciclos mínimos para calcular
-  static constexpr unsigned long kTimeoutMs  = 60000; // ms máximos (T_half ≈ 8s → 7 muestras en 60s)
-
-  bool IsActive()          const { return phase != IDLE; }
-  bool HasPendingGains()   const { return pendingKp >= 0.0f; }
-  bool HasEnoughSamples()  const { return samplesL >= kMinSamples && samplesR >= kMinSamples; }
-
-  void Begin(float setpoint, float relay, float hyst) {
-    phase         = WARMUP;
-    phaseStart    = millis();
-    setpointMms   = setpoint;
-    relayPWM      = relay;
-    hysteresisMms = hyst;
-    relayL = 1; relayR = 1;   // STRAIGHT: ambas ruedas adelante para primer semiciclo
-    prevSignL = prevSignR = 0;
-    lastCrossL = lastCrossR = millis();
-    samplesL = samplesR = 0;
-    peakL = peakR = 0.0f;
-    pendingKp = pendingKi = pendingKd = -1.0f;
-  }
-
-  void Abort() { phase = IDLE; }
-};
-
 
 // ============================================================================
 // ENUMERACIONES
@@ -227,8 +171,7 @@ enum RobotState {
     REQUEST_POSITION,
     RESUME_AFTER_EVASION,
     BUG2_SEEK,
-    BUG2_WALL_FOLLOW,
-    AUTOTUNE
+    BUG2_WALL_FOLLOW
 };
 
 

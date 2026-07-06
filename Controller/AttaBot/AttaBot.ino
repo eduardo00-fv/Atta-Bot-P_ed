@@ -165,7 +165,6 @@ ObstacleState obstacles;
 MovementMetrics movement;
 LedController ledCtrl;
 Bug2State bug2;
-AutotuneState atState;
 
 // IMU — control de frecuencia de lectura
 unsigned long lastImuRead = 0;
@@ -278,8 +277,6 @@ void ConfigureHBridge(int leftWheelPWM, int rightWheelPWM);
 // Movimiento
 bool MoveDistanceByWheel(float leftDistance, float rightDistance);
 float DesiredSpeed(float distance, float wheelDistance);
-void RunAutotune();
-void FinishAutotune();
 bool IsStationary(float currentLeftSpeed, float currentRightSpeed,
                   float leftWheelDistance, float rightWheelDistance);
 void SelectMovementRW();
@@ -1253,11 +1250,6 @@ void loop() {
     }
     break;
   }
-
-  case AUTOTUNE: {
-    RunAutotune();
-    break;
-  }
   }
 }
 
@@ -1859,160 +1851,6 @@ bool IsStationary(float currentLeftSpeed, float currentRightSpeed,
   return false;
 }
 
-// ============================================================================
-// AUTOTUNING PID — Relay Method (Åström-Hägglund)
-// ============================================================================
-
-// Procesa un semiciclo del relay para una rueda.
-// Detecta cruce por cero con histéresis, registra semiperíodo y amplitud.
-static void RelayWheelStep(float currentSpeed, float setpoint,
-                            int8_t &relay, int8_t &prevSign,
-                            unsigned long &lastCross, float &peak,
-                            float *halfPeriods, float *amps, int &samples,
-                            unsigned long now, bool record,
-                            float hyst) {
-  float error = setpoint - currentSpeed;
-  if (fabsf(error) > peak) peak = fabsf(error);
-
-  int8_t sig = (error > hyst) ? 1 : (error < -hyst) ? -1 : 0;
-  if (sig != 0 && sig != prevSign) {
-    if (record && prevSign != 0 && samples < AutotuneState::kMaxSamples) {
-      float hp = (now - lastCross) / 1000.0f;
-      if (hp > 0.02f && hp < 30.0f) {  // descarta ruido (<20ms) y stalls (>30s)
-        halfPeriods[samples] = hp;
-        amps[samples]        = peak;
-        samples++;
-      }
-    }
-    relay     = sig;
-    prevSign  = sig;
-    lastCross = now;
-    peak      = 0.0f;
-  }
-}
-
-void FinishAutotune() {
-  auto mean = [](const float *arr, int n) -> float {
-    float s = 0.0f;
-    for (int i = 0; i < n; i++) s += arr[i];
-    return s / n;
-  };
-
-  float tuL = 2.0f * mean(atState.halfPeriodsL, atState.samplesL);
-  float auL = mean(atState.ampsL, atState.samplesL);
-  float tuR = 2.0f * mean(atState.halfPeriodsR, atState.samplesR);
-  float auR = mean(atState.ampsR, atState.samplesR);
-
-  // Solo mezclar ruedas con suficientes muestras; una sola muestra es ruido
-  float tu, au;
-  const char *wheelsUsed;
-  bool okL = atState.samplesL >= AutotuneState::kMinSamples;
-  bool okR = atState.samplesR >= AutotuneState::kMinSamples;
-  if (okL && okR) {
-    tu = (tuL + tuR) * 0.5f;
-    au = (auL + auR) * 0.5f;
-    wheelsUsed = "L+R";
-  } else if (okR) {
-    tu = tuR; au = auR;
-    wheelsUsed = "R";
-  } else {
-    tu = tuL; au = auL;
-    wheelsUsed = "L";
-  }
-
-  float ku = (4.0f * atState.relayPWM) / (PI * au);
-
-  // Tyreus-Luyben: más conservador que ZN clásico, mejor para motores con ruido
-  float kp = ku / 3.2f;
-  float ki = ku / (7.04f * tu);
-  float kd = ku * tu / 20.16f;
-
-  atState.pendingKp = kp;
-  atState.pendingKi = ki;
-  atState.pendingKd = kd;
-  atState.phase     = AutotuneState::DONE;
-  state = WAIT;
-
-  char buf[200];
-  snprintf(buf, sizeof(buf),
-           "AUTOTUNE OK [%s] sL=%d sR=%d: Tu=%.2fs Au=%.1f Ku=%.1f => Kp=%.2f Ki=%.2f Kd=%.3f | SAVEPID para guardar",
-           wheelsUsed, atState.samplesL, atState.samplesR, tu, au, ku, kp, ki, kd);
-  SendMessage(robots["Base"], buf);
-}
-
-void RunAutotune() {
-  currentMillis = millis();
-  millisDifference = currentMillis - movement.previousMillis;
-  if (millisDifference < samplingTime) return;
-  movement.previousMillis = currentMillis;
-
-  float leftSpeed  = (float)(movement.leftPulseCount  - movement.pastLeftPulseCount)
-                   * millimetersPerPulse / samplingTimeS;
-  float rightSpeed = (float)(movement.rightPulseCount - movement.pastRightPulseCount)
-                   * millimetersPerPulse / samplingTimeS;
-  movement.pastLeftPulseCount  = movement.leftPulseCount;
-  movement.pastRightPulseCount = movement.rightPulseCount;
-
-  unsigned long now = millis();
-  bool record = (atState.phase == AutotuneState::MEASURING);
-
-  RelayWheelStep(leftSpeed,   atState.setpointMms,  atState.relayL, atState.prevSignL,
-                 atState.lastCrossL, atState.peakL,
-                 atState.halfPeriodsL, atState.ampsL, atState.samplesL,
-                 now, record, atState.hysteresisMms);
-
-  RelayWheelStep(rightSpeed,  atState.setpointMms,  atState.relayR, atState.prevSignR,
-                 atState.lastCrossR, atState.peakR,
-                 atState.halfPeriodsR, atState.ampsR, atState.samplesR,
-                 now, record, atState.hysteresisMms);
-
-  // Marcha recta: relay=+1 → adelante → velocidad positiva sube hacia setpoint positivo.
-  ConfigureHBridge(atState.relayL * (int)atState.relayPWM,
-                   atState.relayR * (int)atState.relayPWM);
-
-  if (atState.phase == AutotuneState::WARMUP) {
-    if (now - atState.phaseStart >= AutotuneState::kWarmupMs) {
-      atState.phase      = AutotuneState::MEASURING;
-      atState.phaseStart = now;
-      // Reiniciar estado de medición limpio tras el precalentamiento
-      atState.lastCrossL = atState.lastCrossR = now;
-      atState.prevSignL  = atState.prevSignR  = 0;
-      atState.samplesL   = atState.samplesR   = 0;
-      atState.peakL      = atState.peakR      = 0.0f;
-    }
-    return;
-  }
-
-  // Diagnóstico periódico cada 4s
-  static unsigned long lastAutotuneLog = 0;
-  if (now - lastAutotuneLog >= 4000) {
-    lastAutotuneLog = now;
-    char dbg[120];
-    snprintf(dbg, sizeof(dbg),
-             "AUTOTUNE DBG: vL=%.1f vR=%.1f sL=%d sR=%d relL=%d relR=%d",
-             leftSpeed, rightSpeed, atState.samplesL, atState.samplesR,
-             (int)atState.relayL, (int)atState.relayR);
-    SendMessage(robots["Base"], dbg);
-  }
-
-  if (now - atState.phaseStart >= AutotuneState::kTimeoutMs) {
-    ConfigureHBridge(0, 0);
-    atState.Abort();
-    state = WAIT;
-    char buf[100];
-    snprintf(buf, sizeof(buf),
-             "AUTOTUNE: timeout — sL=%d sR=%d (necesita %d cada uno)",
-             atState.samplesL, atState.samplesR, AutotuneState::kMinSamples);
-    SendMessage(robots["Base"], buf);
-    return;
-  }
-
-  if (atState.HasEnoughSamples()) {
-    ConfigureHBridge(0, 0);
-    FinishAutotune();
-  }
-}
-
 bool MoveDistanceByWheel(float leftDistance, float rightDistance) {
   currentMillis = millis();
   millisDifference = currentMillis - movement.previousMillis;
@@ -2240,56 +2078,6 @@ void ReadUdpPackets() {
       fsmInstruction[1] = arguments[1].toInt();
     }
     instructionList.push_back(fsmInstruction);
-  }
-
-  // AUTOTUNE — inicia test de relay para calcular PID por robot
-  // Uso: AUTOTUNE           — inicia con parámetros por defecto
-  //      AUTOTUNE ABORT     — aborta test en curso
-  else if (command == "AUTOTUNE") {
-    if (arguments[1] == "ABORT") {
-      if (atState.IsActive()) {
-        ConfigureHBridge(0, 0);
-        atState.Abort();
-        state = WAIT;
-        SendMessage(robots["Base"], "AUTOTUNE: abortado");
-      } else {
-        SendMessage(robots["Base"], "AUTOTUNE: ningún test en curso");
-      }
-    } else if (state == WAIT) {
-      // relay alto (75%) + setpoint bajo (25%) garantiza que el motor cruza el setpoint
-      float relayAmp = maxPWMValue * 0.75f;
-      float setpoint = maxSpeed   * 0.25f;
-      atState.Begin(setpoint, relayAmp, 3.0f);
-      movement.pastLeftPulseCount  = movement.leftPulseCount;
-      movement.pastRightPulseCount = movement.rightPulseCount;
-      movement.previousMillis = millis();
-      ResetPID();
-      state = AUTOTUNE;
-      char buf[90];
-      snprintf(buf, sizeof(buf),
-               "AUTOTUNE iniciado: setpoint=%.1fmm/s relay=%d PWM (robot oscila adelante/atras ~60s)",
-               setpoint, (int)relayAmp);
-      SendMessage(robots["Base"], buf);
-    } else {
-      SendMessage(robots["Base"], "AUTOTUNE: el robot debe estar en WAIT");
-    }
-  }
-
-  // SAVEPID — guarda en flash los gains calculados por AUTOTUNE
-  else if (command == "SAVEPID") {
-    if (atState.HasPendingGains()) {
-      leftControl.pidConst.kp  = atState.pendingKp;
-      leftControl.pidConst.ki  = atState.pendingKi;
-      leftControl.pidConst.kd  = atState.pendingKd;
-      rightControl.pidConst.kp = atState.pendingKp;
-      rightControl.pidConst.ki = atState.pendingKi;
-      rightControl.pidConst.kd = atState.pendingKd;
-      SavePID(atState.pendingKp, atState.pendingKi, atState.pendingKd);
-      atState.pendingKp = atState.pendingKi = atState.pendingKd = -1.0f;
-      SendMessage(robots["Base"], "PID guardado en flash y aplicado");
-    } else {
-      SendMessage(robots["Base"], "SAVEPID: no hay gains pendientes — corre AUTOTUNE primero");
-    }
   }
 
   // RESET
