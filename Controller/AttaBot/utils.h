@@ -169,7 +169,30 @@ enum RobotState {
     IDENTIFY_OBSTACLE,
     ACTIVE_EVASION,
     REQUEST_POSITION,
-    RESUME_AFTER_EVASION
+    RESUME_AFTER_EVASION,
+    SEARCH_APPROACH
+};
+
+
+/***************************************************************************************
+ * Búsqueda semántica de objetos por color (SEARCH_OBJECT|<color>).
+ *
+ * El robot patrulla con RANDOM_WALK; al detectar un obstáculo con el sensor
+ * central se aproxima lento hasta el alcance del APDS9960, lee el color RGBC
+ * y decide: coincide → OBJECT_FOUND y se detiene; no coincide → evade con el
+ * patrón de retroceso estándar y sigue patrullando.
+ * Prototipo validado en Webots (AttaBot-Sim) el 2026-07-05.
+ ***************************************************************************************/
+struct SearchState {
+    bool active = false;
+    char targetColor[12] = "";
+    unsigned long approachStart = 0;
+
+    void Reset() {
+        active = false;
+        targetColor[0] = '\0';
+        approachStart = 0;
+    }
 };
 
 

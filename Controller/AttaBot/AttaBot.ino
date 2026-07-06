@@ -160,6 +160,12 @@ InterruptionContext intContext;
 EvasionTracker evasionTracker;
 CongregationState congregation;
 EKFState ekf;  // observador pasivo por ahora — la nav sigue usando robotPose
+SearchState search;
+
+// SEARCH_OBJECT: aproximación y clasificación de color
+const int SEARCH_CREEP_PWM = 70;         // PWM de aproximación lenta
+const uint8_t SEARCH_PROX_NEAR = 180;    // readProximity() ≥ esto = al alcance
+const unsigned long SEARCH_APPROACH_TIMEOUT = 6000;  // ms
 ObstacleState obstacles;
 MovementMetrics movement;
 LedController ledCtrl;
@@ -299,6 +305,9 @@ void setupIMU();
 void SaveIMUBias(biasStore* store);
 void LeerYaw();
 void EkfTick();
+bool MatchColor(const char *target, uint16_t r, uint16_t g, uint16_t b,
+                uint16_t c);
+void SearchEvadeAndResume();
 
 // ============================================================================
 // INTERRUPCIONES (ISR)
@@ -960,6 +969,23 @@ void loop() {
       obstacles.obstacleSensors = 0b010;
     }
 
+    // SEARCH activo: un obstáculo central es un CANDIDATO — aproximarse y
+    // leerle el color en vez de evadir (los laterales evaden normal)
+    if (search.active && obstacles.centralObstacle) {
+      instructionList.clear();
+      obstacleDetected = false;
+      isEvading = false;
+      resumeScheduled = false;
+      intContext.Clear();
+      obstacles.Clear();
+      search.approachStart = millis();
+      ConfigureHBridge(SEARCH_CREEP_PWM, SEARCH_CREEP_PWM);
+      MessageDebugf("DEBUG: -1, ID: %s, SEARCH: candidato central — aproximando",
+                    robotID.c_str());
+      state = SEARCH_APPROACH;
+      break;
+    }
+
     unsigned long timeSinceDetection = millis() - evasionStartTime;
     if (timeSinceDetection > 1500) {
       MessageDebugf("DEBUG: -1, ID: %s, Datos de obstáculo obsoletos (%lums). "
@@ -1139,6 +1165,60 @@ void loop() {
     evasionTracker.Reset();
 
     state = READ_INSTRUCTION;
+    break;
+  }
+
+  case SEARCH_APPROACH: {
+    // Aproximación lenta al candidato hasta el alcance del APDS9960 (~pocos
+    // cm), donde la lectura de color es confiable. Validado en sim (Webots).
+    if (!search.active || !frontSensorInitialized) {
+      ConfigureHBridge(0, 0);
+      state = READ_INSTRUCTION;
+      break;
+    }
+
+    if (millis() - search.approachStart > SEARCH_APPROACH_TIMEOUT) {
+      ConfigureHBridge(0, 0);
+      MessageDebugf("DEBUG: -1, ID: %s, SEARCH: aproximación agotada — evadiendo",
+                    robotID.c_str());
+      SearchEvadeAndResume();
+      break;
+    }
+
+    if (frontSensor.readProximity() < SEARCH_PROX_NEAR) {
+      break;   // seguir avanzando lento (motores ya configurados)
+    }
+
+    // Al alcance: detenerse y esperar una lectura de color válida (~100ms)
+    ConfigureHBridge(0, 0);
+    if (!frontSensor.colorDataReady()) {
+      break;
+    }
+    uint16_t r, g, b, c;
+    frontSensor.getColorData(&r, &g, &b, &c);
+    bool match = MatchColor(search.targetColor, r, g, b, c);
+    MessageDebugf("DEBUG: -1, ID: %s, SEARCH: RGBC=%u,%u,%u,%u → %s",
+                  robotID.c_str(), r, g, b, c,
+                  match ? search.targetColor : "no coincide");
+
+    if (match) {
+      // El objeto está ~100mm frente al robot
+      float ox = robotPose.x + 100.0f * cos(radians(robotPose.angle));
+      float oy = robotPose.y + 100.0f * sin(radians(robotPose.angle));
+      char buf[80];
+      snprintf(buf, sizeof(buf), "OBJECT_FOUND|%s|%.0f|%.0f|%s",
+               robotID.c_str(), ox, oy, search.targetColor);
+      SendMessage(robots["Base"], buf);
+      MessageDebugf("DEBUG: -1, ID: %s, OBJETO %s ENCONTRADO en (%.0f,%.0f)",
+                    robotID.c_str(), search.targetColor, ox, oy);
+      search.Reset();
+      frontSensor.enableColor(false);
+      instructionList.clear();
+      ledCtrl.setSolid(0, 255, 0, maxBrightness);
+      state = STOP;
+    } else {
+      SearchEvadeAndResume();
+    }
     break;
   }
   }
@@ -1486,6 +1566,39 @@ void EkfTick() {
   prevAvgPulses = avg;
 
   ekf.Predict(d, dYaw * yawScale);
+}
+
+// Clasifica una lectura RGBC del APDS9960 contra un color objetivo.
+// Umbrales de primera pasada — calibrar en lab con COLOR_READ.
+bool MatchColor(const char *target, uint16_t r, uint16_t g, uint16_t b,
+                uint16_t c) {
+  if (c < 10) return false;   // muy oscuro / sin señal útil
+  if (strcmp(target, "rojo") == 0)  return r > g * 3 / 2 && r > b * 3 / 2;
+  if (strcmp(target, "verde") == 0) return g > r * 3 / 2 && g > b * 3 / 2;
+  if (strcmp(target, "azul") == 0)  return b > r * 3 / 2 && b > g * 3 / 2;
+  return false;
+}
+
+// Candidato descartado (o inalcanzable): evadir con el patrón estándar de
+// retroceso y re-armar la patrulla RANDOM_WALK de la búsqueda.
+void SearchEvadeAndResume() {
+  instructionList.clear();
+  fsmInstruction[0] = REVERSE;
+  fsmInstruction[1] = reverseDistance * 2;
+  instructionList.push_back(fsmInstruction);
+  fsmInstruction[0] = TURN;
+  fsmInstruction[1] = radians(random(2) ? 60 : -60) * centerToWheelDistance;
+  instructionList.push_back(fsmInstruction);
+  fsmInstruction[0] = MOVE;
+  fsmInstruction[1] = 150;
+  instructionList.push_back(fsmInstruction);
+  fsmInstruction[0] = RANDOM_WALK;
+  fsmInstruction[1] = 600000;
+  instructionList.push_back(fsmInstruction);
+  obstacles.Clear();
+  obstacleDetected = false;
+  isEvading = false;
+  state = READ_INSTRUCTION;
 }
 
 void ConfigureHBridge(int leftWheelPWM, int rightWheelPWM) {
@@ -2220,8 +2333,49 @@ void ReadUdpPackets() {
         robotID.c_str());
   }
 
+  // SEARCH_OBJECT — búsqueda semántica por color (rojo/verde/azul)
+  // Patrulla con RANDOM_WALK, se aproxima a candidatos y les lee el color.
+  // Uso: SEARCH_OBJECT|rojo — ABORT_NAV la cancela. Prototipo validado en sim.
+  else if (command == "SEARCH_OBJECT") {
+    if (!frontSensorInitialized) {
+      SendMessage(robots["Base"], "SEARCH: APDS9960 no disponible");
+      return;
+    }
+    strncpy(search.targetColor, arguments[1].c_str(),
+            sizeof(search.targetColor) - 1);
+    search.targetColor[sizeof(search.targetColor) - 1] = '\0';
+    search.active = true;
+    frontSensor.enableColor(true);
+    instructionList.clear();
+    fsmInstruction[0] = RANDOM_WALK;
+    fsmInstruction[1] = 600000;   // patrulla de 10 min (se re-arma al evadir)
+    instructionList.push_back(fsmInstruction);
+    state = READ_INSTRUCTION;
+    MessageDebugf("DEBUG: -1, ID: %s, SEARCH: buscando objeto %s",
+                  robotID.c_str(), search.targetColor);
+  }
+
+  // COLOR_READ — lectura puntual RGBC para calibrar umbrales de color en lab
+  else if (command == "COLOR_READ") {
+    if (!frontSensorInitialized) {
+      SendMessage(robots["Base"], "COLOR_READ: APDS9960 no disponible");
+      return;
+    }
+    frontSensor.enableColor(true);
+    unsigned long t0 = millis();
+    while (!frontSensor.colorDataReady() && millis() - t0 < 300) delay(5);
+    uint16_t r, g, b, c;
+    frontSensor.getColorData(&r, &g, &b, &c);
+    if (!search.active) frontSensor.enableColor(false);
+    char buf[80];
+    snprintf(buf, sizeof(buf), "COLOR: R=%u G=%u B=%u C=%u", r, g, b, c);
+    SendMessage(robots["Base"], buf);
+  }
+
   else if (command == "ABORT_NAV") {
     nav.Reset();
+    if (search.active && frontSensorInitialized) frontSensor.enableColor(false);
+    search.Reset();
     instructionList.clear();
     imuTurnActive       = false;  // si se abortó a mitad de un giro, no dejar el
     imuTurnIsCorrection = false;  // tracking IMU activo: el próximo TURN debe
