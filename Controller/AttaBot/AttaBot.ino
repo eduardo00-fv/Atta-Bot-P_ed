@@ -157,7 +157,6 @@ volatile bool lateralSensorsEnabled = false;
 // VARIABLES GLOBALES REFACTORIZADAS (usando estructuras de utils.h)
 // ============================================================================
 
-NavigationTarget navTarget;
 InterruptionContext intContext;
 EvasionTracker evasionTracker;
 CongregationState congregation;
@@ -1266,131 +1265,6 @@ void loop() {
 // FUNCIONES DE NAVEGACIÓN GT (Bug2 unificado — GOAL_SEEK + WALL_FOLLOW)
 // ============================================================================
 
-// Código legado — ya no se llama. Se mantiene para referencia durante refactor.
-void InitiateIterativeNavigation(float targetX, float targetY) {
-  navTarget.targetX = targetX;
-  navTarget.targetY = targetY;
-  navTarget.StartNavigation();
-
-  MessageDebugf(
-      "DEBUG: -1, ID: %s, Navegación iterativa iniciada: objetivo=(%.1f, %.1f)",
-      robotID.c_str(), targetX, targetY);
-
-  fsmInstruction[0] = REQUEST_POSITION;
-  fsmInstruction[1] = 0;
-  instructionList.push_back(fsmInstruction);
-}
-
-void CalculateIterativeMovement() {
-  if (!navTarget.isActive) {
-    MessageDebugf("DEBUG: -1, ID: %s, NavigationTarget no está activo",
-                  robotID.c_str());
-    return;
-  }
-
-  if (navTarget.HasExceededMaxIterations()) {
-    MessageDebugf("DEBUG: -1, ID: %s, Límite de iteraciones alcanzado (%d). "
-                  "Abortando navegación.",
-                  robotID.c_str(), navTarget.maxIterations);
-    navTarget.Reset();
-    return;
-  }
-
-  if (navTarget.HasTimedOut()) {
-    MessageDebugf(
-        "DEBUG: -1, ID: %s, Timeout de navegación (>5min). Abortando.",
-        robotID.c_str());
-    navTarget.Reset();
-    return;
-  }
-
-  navTarget.currentIteration++;
-
-  float deltaX = navTarget.targetX - robotPose.x;
-  float deltaY = navTarget.targetY - robotPose.y;
-  float totalDistance = sqrt(deltaX * deltaX + deltaY * deltaY);
-
-  MessageDebugf("DEBUG: -1, ID: %s, Iteración %d: pos=(%.1f,%.1f), "
-                "target=(%.1f,%.1f), dist=%.1fmm",
-                robotID.c_str(), navTarget.currentIteration, robotPose.x,
-                robotPose.y, navTarget.targetX, navTarget.targetY,
-                totalDistance);
-
-  if (navTarget.IsInLoop(robotPose.x, robotPose.y)) {
-    MessageDebugf("DEBUG: -1, ID: %s, LOOP DETECTADO. Abortando navegación.",
-                  robotID.c_str());
-    navTarget.Reset();
-    return;
-  }
-
-  if (!navTarget.IsMakingProgress(totalDistance)) {
-    MessageDebugf(
-        "DEBUG: -1, ID: %s, Sin progreso en %d iteraciones. Abortando.",
-        robotID.c_str(), navTarget.maxIterationsWithoutProgress);
-    navTarget.Reset();
-    return;
-  }
-
-  navTarget.RecordPosition(robotPose.x, robotPose.y);
-
-  if (totalDistance < navTarget.arrivalThreshold) {
-    MessageDebugf("DEBUG: -1, ID: %s, Objetivo alcanzado. Distancia final: "
-                  "%.1fmm (iteraciones: %d)",
-                  robotID.c_str(), totalDistance, navTarget.currentIteration);
-    navTarget.Reset();
-    return;
-  }
-
-  float targetAngle = atan2(deltaY, deltaX) * RAD_TO_DEG;
-  float angleDiff = NormalizeAngle(targetAngle - robotPose.angle);
-
-  float segmentDistance;
-
-  if (totalDistance <= navTarget.segmentDistance) {
-    segmentDistance = totalDistance * 0.9;
-  } else {
-    segmentDistance = navTarget.segmentDistance;
-  }
-
-  segmentDistance = constrain(segmentDistance, navTarget.minSegmentDistance,
-                              navTarget.maxSegmentDistance);
-
-  MessageDebugf(
-      "DEBUG: -1, ID: %s, Segmento: dist=%.1fmm, ángulo=%.1f°, progreso=%d/%d",
-      robotID.c_str(), segmentDistance, angleDiff,
-      navTarget.maxIterationsWithoutProgress -
-          navTarget.iterationsWithoutProgress,
-      navTarget.maxIterationsWithoutProgress);
-
-  if (abs(angleDiff) > 5) {
-    fsmInstruction[0] = TURN;
-    fsmInstruction[1] = radians(angleDiff) * centerToWheelDistance;
-    instructionList.push_back(fsmInstruction);
-  }
-
-  if (segmentDistance > navTarget.minSegmentDistance) {
-    fsmInstruction[0] = MOVE;
-    fsmInstruction[1] = segmentDistance;
-    instructionList.push_back(fsmInstruction);
-  }
-
-  fsmInstruction[0] = REQUEST_POSITION;
-  fsmInstruction[1] = 0;
-  instructionList.push_back(fsmInstruction);
-
-  MessageDebugf("DEBUG: -1, ID: %s, Programando REQUEST_POSITION para "
-                "siguiente iteración",
-                robotID.c_str());
-}
-
-// ============================================================================
-// FUNCIONES DE NAVEGACIÓN BUG 2
-// ============================================================================
-
-// ============================================================================
-// NAVEGACIÓN REACTIVA UNIFICADA — GT y Congregación
-// ============================================================================
-
 // Ejecuta un paso de navegación hacia (nav.goalX, nav.goalY).
 // Calcula el ángulo hacia el objetivo y aplica bias reactivo si hay obstáculo
 // en los sensores IR. Encola TURN+WAIT+MOVE+WAIT+REQUEST_POSITION.
@@ -2313,7 +2187,6 @@ void ReadUdpPackets() {
       robots["Broadcast"] = ipAddress;
       // Reset completo: limpia cualquier navegación activa de sesiones anteriores
       bug2.Reset();
-      navTarget.Reset();
       instructionList.clear();
       isEvading = false;
       obstacles.Clear();
@@ -2607,7 +2480,6 @@ void ReadUdpPackets() {
     congregation.totalFollowers = (arguments[3] != "") ? arguments[3].toInt() : 1;
 
     nav.Reset();
-    navTarget.Reset();
     instructionList.clear();
 
     MessageDebugf("DEBUG: -1, ID: %s, Congregación iniciada. Líder: %s, slot: %d/%d",
@@ -2771,7 +2643,6 @@ void ReadUdpPackets() {
   else if (command == "CANCEL_CONGREGATION") {
     congregation.Reset();
     nav.Reset();
-    navTarget.Reset();
     instructionList.clear();
     state = STOP;
     MessageDebugf("DEBUG: -1, ID: %s, Congregación cancelada", robotID.c_str());
@@ -2797,7 +2668,6 @@ void ReadUdpPackets() {
       if (newDist >= 50 && newDist <= 400) {
         nav.segmentDistance = newDist;        // ReactiveNav (GT/congregación actual)
         bug2.seekSegmentDistance = newDist;   // compat Bug2 legacy
-        navTarget.segmentDistance = newDist;
         char buf[60];
         snprintf(buf, sizeof(buf), "NAV_CONFIG: segmento=%.0fmm", newDist);
         SendMessage(robots["Base"], buf);
@@ -2890,7 +2760,6 @@ void ReadUdpPackets() {
   else if (command == "ABORT_NAV") {
     nav.Reset();
     bug2.Reset();
-    navTarget.Reset();
     instructionList.clear();
     imuTurnActive       = false;  // si se abortó a mitad de un giro, no dejar el
     imuTurnIsCorrection = false;  // tracking IMU activo: el próximo TURN debe

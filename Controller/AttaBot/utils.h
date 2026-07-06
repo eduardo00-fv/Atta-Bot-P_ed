@@ -237,123 +237,6 @@ enum RobotState {
 // ============================================================================
 
 /***************************************************************************************
- * Estructura: NavigationTarget
- * 
- * Controla la navegación iterativa hacia un objetivo específico.
- * Sistema dinámico que avanza por segmentos hasta alcanzar el destino.
- ***************************************************************************************/
-struct NavigationTarget {
-    float targetX = 0;
-    float targetY = 0;
-    bool isActive = false;
-    
-    // Control de segmentos dinámico
-    float segmentDistance = 250;
-    float arrivalThreshold = 50;
-    float minSegmentDistance = 50;
-    float maxSegmentDistance = 350;
-    
-    // Contador de intentos
-    int maxIterations = 50;
-    int currentIteration = 0;
-    
-    // NUEVO: Detección de loops y progreso
-    struct PositionHistory {
-        float x, y;
-        unsigned long timestamp;
-    };
-    std::deque<PositionHistory> positionHistory;  // Últimas 10 posiciones
-    const int maxHistorySize = 10;
-    float lastDistance = 999999.0;  // Distancia en iteración anterior
-    int iterationsWithoutProgress = 0;
-    const int maxIterationsWithoutProgress = 6;
-    unsigned long navigationStartTime = 0;
-    const unsigned long maxNavigationTime = 300000;  // 5 minutos
-    
-    void Reset() {
-        isActive = false;
-        currentIteration = 0;
-        targetX = 0;
-        targetY = 0;
-        positionHistory.clear();
-        lastDistance = 999999.0;
-        iterationsWithoutProgress = 0;
-        navigationStartTime = 0;
-    }
-    
-    void StartNavigation() {
-        isActive = true;
-        currentIteration = 0;
-        positionHistory.clear();
-        lastDistance = 999999.0;
-        iterationsWithoutProgress = 0;
-        navigationStartTime = millis();
-    }
-    
-    bool HasExceededMaxIterations() {
-        return currentIteration >= maxIterations;
-    }
-    
-    bool HasTimedOut() {
-        return (millis() - navigationStartTime) > maxNavigationTime;
-    }
-    
-    bool IsInLoop(float currentX, float currentY) {
-        // Verificar si volvimos a una posición visitada recientemente
-        const float loopThreshold = 40.0;  // menor que arrivalThreshold para no disparar cerca del goal
-        
-        for (const auto& pos : positionHistory) {
-            float dx = currentX - pos.x;
-            float dy = currentY - pos.y;
-            float distance = sqrt(dx * dx + dy * dy);
-            
-            if (distance < loopThreshold) {
-                unsigned long timeSince = millis() - pos.timestamp;
-                // Si volvimos a una posición en menos de 30 segundos, es un loop
-                if (timeSince < 30000) {
-                    return true;
-                }
-            }
-        }
-        
-        return false;
-    }
-    
-    void RecordPosition(float x, float y) {
-        PositionHistory pos = {x, y, millis()};
-        positionHistory.push_back(pos);
-        
-        if (positionHistory.size() > maxHistorySize) {
-            positionHistory.pop_front();
-        }
-    }
-    
-    bool IsMakingProgress(float currentDistance) {
-        const float progressThreshold = 10.0;  // mínimo de progreso por iteración
-        
-        if (currentDistance >= lastDistance - progressThreshold) {
-            iterationsWithoutProgress++;
-        } else {
-            iterationsWithoutProgress = 0;
-        }
-        
-        lastDistance = currentDistance;
-        
-        return iterationsWithoutProgress < maxIterationsWithoutProgress;
-    }
-    
-    float GetDistanceToTarget(float currentX, float currentY) {
-        float deltaX = targetX - currentX;
-        float deltaY = targetY - currentY;
-        return sqrt(deltaX * deltaX + deltaY * deltaY);
-    }
-    
-    bool HasReachedTarget(float currentX, float currentY) {
-        return GetDistanceToTarget(currentX, currentY) < arrivalThreshold;
-    }
-};
-
-/***************************************************************************************
  * Calcula distancia euclidiana entre dos puntos
  ***************************************************************************************/
 inline float CalculateDistance(float x1, float y1, float x2, float y2) {
@@ -362,15 +245,6 @@ inline float CalculateDistance(float x1, float y1, float x2, float y2) {
     return sqrt(dx * dx + dy * dy);
 }
 
-
-/***************************************************************************************
- * Estructura: Bug2State
- * 
- * Implementa el algoritmo Bug 2 para navegación descentralizada.
- * El robot alterna entre ir directo al objetivo (GOAL_SEEK) y
- * rodear obstáculos (WALL_FOLLOW) usando la "Línea M" como
- * referencia para decidir cuándo puede dejar de seguir la pared.
- ***************************************************************************************/
 struct Bug2State {
     // === Sub-estados internos ===
     enum SubState { IDLE, GOAL_SEEK, WALL_FOLLOW };
