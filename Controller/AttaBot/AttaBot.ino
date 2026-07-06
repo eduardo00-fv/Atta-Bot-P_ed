@@ -144,7 +144,6 @@ int minLowBatteryTime = 200;
 
 // Contador de mensajes
 int countMessages = 0;
-int sendMessages = 0;
 
 // Servo
 bool frontSensorInitialized = false;
@@ -266,7 +265,6 @@ void ReadUdpPackets();
 void SendMessage(IPAddress host, const char *message);
 void SendPose();
 void MessageDebugf(const char *format, ...);
-void CommunicationTest();
 
 // Sensores y control
 void ReadSensors();
@@ -1716,7 +1714,6 @@ void ReadUdpPackets() {
       SendMessage(robots["Base"], "CONFIG|RECEIVED");
       debugUdp = 0;
       countMessages = 0;
-      sendMessages = 0;
 
     } else if (arguments[1] == "SAVE") {
       robots[arguments[2]] = udp.remoteIP();
@@ -2295,19 +2292,6 @@ void SelectMovementRW() {
   }
 
   instructionList.push_front(fsmInstruction);
-}
-
-void CommunicationTest() {
-  if (sendMessages < 500) {
-    sendMessages++;
-    for (const auto &pair : robots) {
-      if (pair.first != "Broadcast" && pair.first != "Base") {
-        SendMessage(pair.second, "COUNT_MESSAGE");
-      }
-    }
-  } else {
-    ledCtrl.setSolid(255, 0, 0, 255);
-  }
 }
 
 #ifdef DebugSerial
