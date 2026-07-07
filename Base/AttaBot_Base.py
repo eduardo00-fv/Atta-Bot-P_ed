@@ -396,6 +396,8 @@ class Base(object):
         self.simVision = None             # instancia de SimVision
         self.simConfig = {}               # sección 'simulation' del JSON
         self.logTag = ''                  # 'SIM_' en los nombres de log de sim
+        # --- Enjambre: broadcast periódico de posiciones (dispersión/flocking) ---
+        self._lastNeighborCast = 0.0
 
 
     def log(self, msg: str):
@@ -1267,6 +1269,22 @@ class Base(object):
                                     robot.previousPose, displacement)
         self._drawLegend(resultsFrame)
 
+        # NEIGHBOR_POSITIONS a 1 Hz: cada robot conoce dónde están los demás
+        # (insumo de dispersión y flocking; los firmware sin soporte lo ignoran)
+        now = time.time()
+        if now - self._lastNeighborCast >= 1.0:
+            self._lastNeighborCast = now
+            items = []
+            for robot in self.robots.values():
+                x, y, _ = robot.previousPose
+                if x != -1 and robot.IP:
+                    items.append(f'{robot.id},{x},{y}')
+            if len(items) >= 2:
+                message = 'NEIGHBOR_POSITIONS|' + ';'.join(items)
+                for robot in self.robots.values():
+                    if robot.IP:
+                        self.sock.sendto(message.encode(), self._robotAddr(robot.IP))
+
 
     def initializeVideoAndLogging(self, resolution):
         """
@@ -1661,6 +1679,109 @@ class Base(object):
         print(f"Congregación iniciada. Líder: {self.robots[leaderID].name}, {total} seguidor(es)")
 
 
+    def startFormation(self, args):
+        """
+        Inicia una formación: FORMATION.<figura> <líderID>
+        Figuras: linea (fila perpendicular al heading del líder), cuna (V detrás
+        del líder), circulo (distribución angular, como la congregación).
+
+        La base asigna los índices de slot conociendo dónde está cada follower
+        (mínimo cruce de trayectorias): para linea/cuna se ordenan por su
+        coordenada lateral respecto al heading del líder, para circulo por su
+        bearing alrededor del líder — el follower que ya está a la derecha
+        recibe el slot derecho.
+        """
+        parts = args.split()
+        if len(parts) not in (2, 3) or parts[0] not in ('linea', 'cuna', 'circulo'):
+            print('Formato: FORMATION.linea|cuna|circulo líderID [espaciado_mm]')
+            return
+        shape, leaderID = parts[0], parts[1]
+        spacing = float(parts[2]) if len(parts) == 3 else 300.0
+        if leaderID not in self.robots:
+            print(f'Error: Robot líder {leaderID} no encontrado')
+            return
+        lx, ly, lang = self.robots[leaderID].getPose()
+        if lx == -1:
+            print(f'Líder {leaderID} no visible por la cámara')
+            return
+
+        followers = sorted([rid for rid in self.robots if rid != leaderID])
+        n = len(followers)
+        rad = math.radians(lang)
+
+        def slotOffset(shape, idx, axisDeg):
+            """Réplica de formation_slot del robot — para validar límites."""
+            if shape == 'circulo':
+                ang = 2 * math.pi * idx / max(1, n)
+                return spacing * math.cos(ang), spacing * math.sin(ang)
+            pa = rad + math.pi / 2 + math.radians(axisDeg)
+            k = idx // 2 + 1
+            side = 1 if idx % 2 == 0 else -1
+            ox, oy = side * k * spacing * math.cos(pa), side * k * spacing * math.sin(pa)
+            if shape == 'cuna':
+                ox -= k * spacing * math.cos(rad)
+                oy -= k * spacing * math.sin(rad)
+            return ox, oy
+
+        # Validar que TODOS los slots caigan dentro del área visible (con
+        # margen para staging+robot). El frame define la arena: px × mm/px.
+        maxX = self.cameraResolution[1] * self.mmPixel
+        maxY = self.cameraResolution[0] * self.mmPixel
+        inset = 250.0
+
+        def fits(axisDeg):
+            for idx in range(n):
+                ox, oy = slotOffset(shape, idx, axisDeg)
+                if not (inset <= lx + ox <= maxX - inset and
+                        inset <= ly + oy <= maxY - inset):
+                    return False
+            return True
+
+        axis = 0.0
+        if not fits(0.0):
+            if shape == 'linea' and fits(90.0):
+                axis = 90.0
+                print('⚠ La fila perpendicular no cabe — usando el eje del '
+                      'heading del líder (columna)')
+            else:
+                print(f'✗ La formación {shape} no cabe donde está el líder '
+                      f'({lx:.0f},{ly:.0f}) — movelo lejos de los bordes')
+                return
+
+        pa = rad + math.pi / 2 + math.radians(axis)
+        px, py = math.cos(pa), math.sin(pa)   # eje efectivo de la fila
+
+        def followerKey(rid):
+            fx, fy, _ = self.robots[rid].getPose()
+            if fx == -1:
+                return 0.0
+            if shape == 'circulo':
+                return math.atan2(fy - ly, fx - lx) % (2 * math.pi)
+            return (fx - lx) * px + (fy - ly) * py
+
+        def slotKey(idx):
+            if shape == 'circulo':
+                return 2 * math.pi * idx / max(1, n)
+            return (1 if idx % 2 == 0 else -1) * (idx // 2 + 1)
+
+        rankedFollowers = sorted(followers, key=followerKey)
+        rankedSlots = sorted(range(n), key=slotKey)
+
+        self.congregationActive = True
+        self.leaderID = leaderID
+        self.sendInstruction(self.robots[leaderID].IP,
+                             [f'FORMATION|{shape}|{leaderID}|0|{n}|{axis:.0f}'], False)
+        for rank, rid in enumerate(rankedFollowers):
+            idx = rankedSlots[rank]
+            self.sendInstruction(self.robots[rid].IP,
+                                 [f'NAV_CONFIG|PARKING_DIST|{spacing:.0f}',
+                                  f'FORMATION|{shape}|{leaderID}|{idx}|{n}|{axis:.0f}'],
+                                 False)
+            print(f'  {self.robots[rid].name}: slot {idx} ({shape}, {spacing:.0f}mm)')
+        print(f'Formación {shape} iniciada. Líder: {self.robots[leaderID].name}, '
+              f'{n} seguidor(es)')
+
+
     def sendToGlobalPosition(self, robotID, targetX, targetY):
         """
         Envía un robot a una posición global específica.
@@ -1989,6 +2110,8 @@ class Base(object):
                 self.sendInstruction(robotIP, [instruction], True)
             elif robotId == 'CONGREGATION':
                 self.startCongregation(instruction)
+            elif robotId == 'FORMATION':
+                self.startFormation(instruction)
             elif robotId == 'CALIBRATE':
                 self.startCalibration(instruction)
             elif robotId == 'OCCLUDE':
