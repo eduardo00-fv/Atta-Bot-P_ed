@@ -1125,7 +1125,13 @@ class Base(object):
         # En sim el frame ya viene anotado por SimVision (no hay markers que detectar)
         debugFrame = frame.copy() if self.simMode else self.drawArucoDebug(frame.copy())
         resized = cv2.resize(debugFrame, self.debugResolution, interpolation=cv2.INTER_AREA)
-        cv2.imshow('Debug ArUco', resized)
+        try:
+            cv2.imshow('Debug ArUco', resized)
+        except cv2.error:
+            # build de cv2 sin highgui (headless): seguir sin ventana de debug
+            print('⚠ cv2 sin soporte de ventanas — debug visual desactivado '
+                  '(la vista queda en Webots)')
+            self.debug = False
 
 
     # =========================================================================

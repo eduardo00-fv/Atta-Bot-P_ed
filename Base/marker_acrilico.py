@@ -27,8 +27,19 @@ Geometría (DICT_4X4_50): 4x4 datos + borde negro = 6x6 módulos.
     y validar detección/jitter con la C920 antes de cortar toda la serie.
 
 Uso:
-  python3 Base/marker_acrilico.py              # ids 0-8, 80mm
+  python3 Base/marker_acrilico.py              # ids 0-8, 80mm (archivos por pieza)
   python3 Base/marker_acrilico.py 1 2 --size 80
+  python3 Base/marker_acrilico.py --sheet      # UNA lámina con TODOS los cortes
+
+Modo --sheet (lámina única de acrílico blanco, piezas negras con spray mate):
+  Genera markers_svg/sheet_corte_markers_<size>mm.svg con las 9 bases blancas
+  y las 9 capas caladas acomodadas en la misma lámina. Convención:
+    ROJO  = línea de CORTE (contornos y huecos)
+    AZUL  = GRABADO opcional (guía de pegado en la base + id de cada pieza;
+            los ids quedan ocultos: bajo la capa negra en la base, bajo el
+            spray en la capa calada)
+  El tamaño total de lámina requerido se imprime al final — si tu lámina es
+  más chica, generá subconjuntos: `python3 marker_acrilico.py 0 1 2 --sheet`.
 """
 import os
 import sys
@@ -122,6 +133,78 @@ def generateMarker(markerId, size):
     return blackIslands(black)
 
 
+def cutRect(x, y, w, h):
+    """Rectángulo de CORTE: contorno rojo hairline, sin relleno."""
+    return (f'  <rect x="{x:.3f}" y="{y:.3f}" width="{w:.3f}" height="{h:.3f}" '
+            f'fill="none" stroke="red" stroke-width="0.1"/>\n')
+
+
+def engraveText(x, y, text, sizeMm=5.0):
+    """Texto de GRABADO (azul). Convertir a trazos en Inkscape si el servicio
+    de corte lo pide (Trayecto → Objeto a trayecto)."""
+    return (f'  <text x="{x:.3f}" y="{y:.3f}" font-size="{sizeMm:.1f}" '
+            f'fill="blue" font-family="sans-serif" '
+            f'text-anchor="middle">{text}</text>\n')
+
+
+def generateSheet(ids, size, gap=3.0, margin=5.0):
+    """Lámina única: bases blancas + capas negras caladas, todo líneas de corte."""
+    module = size / MODULES
+    base = size + 2 * module
+    cols = 3
+    legendH = 7.0
+
+    rowsW = (len(ids) + cols - 1) // cols
+    rowsB = rowsW
+    sheetW = 2 * margin + cols * base + (cols - 1) * gap
+    whiteH = rowsW * base + (rowsW - 1) * gap
+    blackH = rowsB * size + (rowsB - 1) * gap
+    sheetH = margin + legendH + whiteH + 2 * gap + blackH + margin
+
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" '
+           f'width="{sheetW:.3f}mm" height="{sheetH:.3f}mm" '
+           f'viewBox="0 0 {sheetW:.3f} {sheetH:.3f}">\n')
+    svg += engraveText(sheetW / 2, margin + 4.5,
+                       f'ROJO=corte · AZUL=grabado · marker {size:.0f}mm · '
+                       f'base {base:.1f}mm · acrilico blanco 1.5mm', 4.0)
+
+    islandsAll = {}
+    yTop = margin + legendH
+
+    # Bloque superior: bases blancas (con guía de pegado + id grabados)
+    for i, markerId in enumerate(ids):
+        x = margin + (i % cols) * (base + gap)
+        y = yTop + (i // cols) * (base + gap)
+        svg += cutRect(x, y, base, base)
+        svg += (f'  <rect x="{x + module:.3f}" y="{y + module:.3f}" '
+                f'width="{size:.3f}" height="{size:.3f}" fill="none" '
+                f'stroke="blue" stroke-width="0.1"/>\n')
+        svg += engraveText(x + base / 2, y + base / 2, f'id {markerId}')
+
+    # Bloque inferior: capas negras caladas (id grabado en el borde inferior,
+    # que es siempre negro — queda bajo el spray)
+    yBlack = yTop + whiteH + 2 * gap
+    for i, markerId in enumerate(ids):
+        x = margin + (i % cols) * (size + gap)
+        y = yBlack + (i // cols) * (size + gap)
+        black = markerMatrix(markerId)
+        svg += cutRect(x, y, size, size)
+        for r, c0, length in whiteRuns(black):
+            svg += cutRect(x + c0 * module, y + r * module,
+                           length * module, module)
+        svg += engraveText(x + size / 2, y + size - module / 2 + 1.5,
+                           f'id {markerId}', 4.0)
+        islands = blackIslands(black)
+        if islands:
+            islandsAll[markerId] = islands
+
+    svg += '</svg>\n'
+    path = os.path.join(OUTDIR, f'sheet_corte_markers_{size:.0f}mm.svg')
+    with open(path, 'w') as f:
+        f.write(svg)
+    return path, sheetW, sheetH, islandsAll
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -129,12 +212,27 @@ def main():
                     help="ids de marker a generar (default: 0-8)")
     ap.add_argument("--size", type=float, default=80.0,
                     help="lado exterior del borde negro en mm (default: 80)")
+    ap.add_argument("--sheet", action="store_true",
+                    help="una sola lámina con todos los cortes (blancas + negras)")
     a = ap.parse_args()
 
     os.makedirs(OUTDIR, exist_ok=True)
     module = a.size / MODULES
     print(f"Marker {a.size:.0f}x{a.size:.0f}mm · módulo {module:.3f}mm · "
           f"base blanca {a.size + 2 * module:.3f}mm · salida: {OUTDIR}")
+
+    if a.sheet:
+        path, w, h, islands = generateSheet(a.ids, a.size)
+        print(f"\nLámina de corte: {path}")
+        print(f"Tamaño requerido: {w:.0f} x {h:.0f} mm "
+              f"(si tu lámina es menor, generá subconjuntos de ids)")
+        for markerId, cells in islands.items():
+            print(f"  ⚠ marker {markerId}: {len(cells)} celda(s) SUELTA(S) al "
+                  f"calar {cells} — recogerlas de la cama y pegarlas aparte")
+        print("Antes de mandar a cortar: revisar en Inkscape, unir huecos "
+              "adyacentes con Trayecto→Unión,\ny convertir los textos azules a "
+              "trayectos si el servicio lo pide.")
+        return
 
     for markerId in a.ids:
         islands = generateMarker(markerId, a.size)
