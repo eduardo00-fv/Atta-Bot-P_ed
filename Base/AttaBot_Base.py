@@ -1969,7 +1969,10 @@ class Base(object):
             BREAK
         """
         while True:
-            instructionRaw = input('').strip()
+            try:
+                instructionRaw = input('').strip()
+            except EOFError:
+                break   # stdin cerrado (proceso lanzado sin consola) = BREAK
             if instructionRaw == 'BREAK':
                 break
 
@@ -2034,6 +2037,7 @@ def main():
         python AttaBot_Base.py               # modo lab (cámara C920 + WiFi)
         python AttaBot_Base.py --sim         # visión y robots desde Webots
         python AttaBot_Base.py --sim --headless   # sin ventana de debug
+        python AttaBot_Base.py --sim --robots 2   # sin prompt interactivo
 
     En modo sim: iniciar la base ANTES que Webots (la base toma el puerto 6060
     y base_camera.py, al encontrarlo ocupado, entra en modo solo-cámara).
@@ -2042,7 +2046,11 @@ def main():
     base.simMode = '--sim' in sys.argv
     if base.simMode:
         print('=== MODO SIMULACIÓN: visión y robots desde Webots ===')
-    base.numRobots = int(input('Cantidad de robots en la prueba: '))
+    if '--robots' in sys.argv:
+        base.numRobots = int(sys.argv[sys.argv.index('--robots') + 1])
+        print(f'Cantidad de robots en la prueba: {base.numRobots}')
+    else:
+        base.numRobots = int(input('Cantidad de robots en la prueba: '))
     base.readConfigFile(configurationFilePath)
     if '--headless' in sys.argv:
         base.debug = False
