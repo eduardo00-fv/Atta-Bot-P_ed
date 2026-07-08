@@ -159,6 +159,7 @@ volatile bool lateralSensorsEnabled = false;
 InterruptionContext intContext;
 EvasionTracker evasionTracker;
 CongregationState congregation;
+DisperseState disperse;  // dispersión de enjambre (DISPERSE + NEIGHBOR_POSITIONS)
 EKFState ekf;  // observador pasivo por ahora — la nav sigue usando robotPose
 SearchState search;
 
@@ -285,7 +286,8 @@ bool IsStationary(float currentLeftSpeed, float currentRightSpeed,
 void SelectMovementRW();
 
 // Auxiliares
-std::array<String, 5> SeparateCommand(const String &command, char delimiter);
+std::array<String, 6> SeparateCommand(const String &command, char delimiter);
+void MaybeDisperseHop();
 bool IsRobotObstacle(float x2, float y2, float angle, int sensors, String id);
 void ReadSerialCommands();
 // Nota: CalculateDistance, NormalizeAngle e InRange están definidas inline en utils.h
@@ -1734,8 +1736,8 @@ void SendPose() {
   movement.previousMillis = millis();
 }
 
-std::array<String, 5> SeparateCommand(const String &command, char delimiter) {
-  std::array<String, 5> results;
+std::array<String, 6> SeparateCommand(const String &command, char delimiter) {
+  std::array<String, 6> results;
   int startIndex = 0;
   int endIndex;
   int count = 0;
@@ -1753,6 +1755,118 @@ std::array<String, 5> SeparateCommand(const String &command, char delimiter) {
   }
 
   return results;
+}
+
+// ============================================================================
+// DISPERSIÓN DE ENJAMBRE — port 1:1 de maybe_disperse_hop() del controller de
+// sim validado en Webots. Se llama al recibir NEIGHBOR_POSITIONS (1 Hz).
+// Constantes de arena = FOV útil del lab (2.4 x 1.55 m) con inset de 350mm para
+// que los saltos no apunten a la pared. Ajustar si cambia el montaje de cámara.
+// ============================================================================
+#define DISP_ARENA_XMIN 350.0f
+#define DISP_ARENA_XMAX 2050.0f
+#define DISP_ARENA_YMIN 350.0f
+#define DISP_ARENA_YMAX 1200.0f
+
+void MaybeDisperseHop() {
+  // Guardas: dispersión activa, robot OCIOSO (sin nav ni instrucciones), con
+  // vecinos. Un robot ocupado espera al siguiente tick para reevaluar.
+  if (!disperse.IsActive() || nav.isActive || nav.pendingInit ||
+      !instructionList.empty() || disperse.nCount == 0) {
+    return;
+  }
+  float x = robotPose.x, y = robotPose.y;
+
+  // Vecino más cercano
+  float dmin = 1e12f;
+  for (int i = 0; i < disperse.nCount; i++) {
+    float d = CalculateDistance(x, y, disperse.nX[i], disperse.nY[i]);
+    if (d < dmin) dmin = d;
+  }
+  float dminS = disperse.SmoothDmin(dmin);
+
+  // Histéresis de 80mm (~2σ del jitter ArUco): un robot satisfecho no se
+  // des-satisface por ruido de medición.
+  float settleAt = disperse.target - (disperse.settled ? 80.0f : 0.0f);
+  if (dminS >= settleAt) {
+    if (!disperse.settled) {
+      disperse.settled = true;
+      MessageDebugf("DEBUG: -1, ID: %s, dispersión lograda — vecino más cercano a %.0fmm",
+                    robotID.c_str(), dminS);
+    }
+    return;
+  }
+  disperse.settled = false;
+
+  // Turno secuencial: solo salta el de MENOR id entre los que están demasiado
+  // cerca; el resto espera quieto (evita la tormenta de evasiones IR mutuas).
+  // Margen de 100mm: un vecino en la banda de jitter no bloquea. Si igual
+  // quedamos bloqueados ~10 rondas, saltar de todos modos (anti-deadlock).
+  int  myId = robotID.toInt();
+  bool blockedByLower = false;
+  for (int i = 0; i < disperse.nCount; i++) {
+    float d = CalculateDistance(x, y, disperse.nX[i], disperse.nY[i]);
+    if (d < disperse.target - 100.0f && disperse.nId[i].toInt() < myId) {
+      blockedByLower = true;
+    }
+  }
+  if (blockedByLower) {
+    disperse.blocked++;
+    if (disperse.blocked < 10) return;
+  }
+  disperse.blocked = 0;
+
+  // Suma de repulsión 1/d²
+  float vx = 0, vy = 0;
+  for (int i = 0; i < disperse.nCount; i++) {
+    float d = CalculateDistance(x, y, disperse.nX[i], disperse.nY[i]);
+    if (d < 1.0f) d = 1.0f;
+    vx += (x - disperse.nX[i]) / (d * d);
+    vy += (y - disperse.nY[i]) / (d * d);
+  }
+  float norm = sqrt(vx * vx + vy * vy);
+  if (norm < 1e-9f) {                    // sobre el vecino: dirección aleatoria
+    float ang = random(0, 62832) / 10000.0f;   // ~[0, 2π)
+    vx = cos(ang); vy = sin(ang); norm = 1.0f;
+  }
+
+  // Candidatos: repulsión directa y sus dos rotaciones ±90° (escape de esquina).
+  // Score = separación del vecino más cercano + bono de holgura a la pared: un
+  // objetivo en la esquina maximiza la separación pero deja al robot raspando
+  // dos muros (348 evasiones IR en sim → 2 con el bono).
+  float cand[3][2] = { { vx, vy }, { -vy, vx }, { vy, -vx } };
+  float bestX = 0, bestY = 0, bestScore = -1e12f;
+  bool  haveBest = false;
+  for (int c = 0; c < 3; c++) {
+    float gx = constrain(x + cand[c][0] / norm * 450.0f,
+                         DISP_ARENA_XMIN, DISP_ARENA_XMAX);
+    float gy = constrain(y + cand[c][1] / norm * 450.0f,
+                         DISP_ARENA_YMIN, DISP_ARENA_YMAX);
+    if (CalculateDistance(x, y, gx, gy) < 100.0f) continue;
+    float nd = 1e12f;
+    for (int i = 0; i < disperse.nCount; i++) {
+      float d = CalculateDistance(gx, gy, disperse.nX[i], disperse.nY[i]);
+      if (d < nd) nd = d;
+    }
+    float wcx = min(gx - DISP_ARENA_XMIN, DISP_ARENA_XMAX - gx);
+    float wcy = min(gy - DISP_ARENA_YMIN, DISP_ARENA_YMAX - gy);
+    float wallClear = min(wcx, wcy);
+    float score = nd + 0.5f * min(wallClear, 300.0f);
+    if (score > bestScore) {
+      bestScore = score;  bestX = gx;  bestY = gy;  haveBest = true;
+    }
+  }
+  if (!haveBest) return;
+
+  // Salto: iniciar navegación reactiva al mejor candidato (como GT/CONGREGATION)
+  nav.goalX       = bestX;
+  nav.goalY       = bestY;
+  nav.pendingInit = true;
+  fsmInstruction[0] = REQUEST_POSITION;
+  fsmInstruction[1] = 0;
+  instructionList.push_back(fsmInstruction);
+  MessageDebugf("DEBUG: -1, ID: %s, dispersión: hop → (%.0f,%.0f) (vecino a %.0fmm)",
+                robotID.c_str(), bestX, bestY, dmin);
 }
 
 bool IsRobotObstacle(float x2, float y2, float angle, int sensors, String id) {
@@ -1809,7 +1923,7 @@ void ReadUdpPackets() {
                     udp.remoteIP().toString().c_str(), receivedPacket);
 
   String command(receivedPacket);
-  std::array<String, 5> arguments = SeparateCommand(command, '|');
+  std::array<String, 6> arguments = SeparateCommand(command, '|');
   command = arguments[0];
 
   // CONFIG
@@ -2074,6 +2188,40 @@ void ReadUdpPackets() {
     instructionList.push_back(fsmInstruction);
   }
 
+  // FORMATION — congregación con forma: linea/cuna/circulo (+ eje opcional)
+  // FORMATION|<forma>|<líderID>|<idx>|<n>|[axis°]. Mismo flujo que CONGREGATION;
+  // solo cambia la fórmula del slot (ver LEADER_POSITION). circulo == congregación.
+  else if (command == "FORMATION") {
+    congregation.formationShape = arguments[1];
+    congregation.leaderID = arguments[2];
+    congregation.isLeader = (congregation.leaderID == robotID);
+    congregation.positionReceived = false;
+    congregation.hasGlobalTarget = false;
+    congregation.stagingDone = false;
+    congregation.slotAngleSet = false;
+    congregation.followerIndex  = arguments[3].toInt();
+    congregation.totalFollowers = (arguments[4] != "") ? arguments[4].toInt() : 1;
+    congregation.formationAxis  = (arguments[5] != "") ? arguments[5].toFloat() : 0.0f;
+    disperse.Reset();  // no dispersar y formar a la vez
+
+    nav.Reset();
+    instructionList.clear();
+
+    MessageDebugf("DEBUG: -1, ID: %s, Formación %s. Líder: %s, slot: %d/%d, axis %.0f",
+                  robotID.c_str(), congregation.formationShape.c_str(),
+                  congregation.leaderID.c_str(), congregation.followerIndex,
+                  congregation.totalFollowers, congregation.formationAxis);
+
+    int delay = robotID.toInt() * 200;
+    fsmInstruction[0] = WAIT;
+    fsmInstruction[1] = delay;
+    instructionList.push_back(fsmInstruction);
+
+    fsmInstruction[0] = REQUEST_POSITION;
+    fsmInstruction[1] = 0;
+    instructionList.push_back(fsmInstruction);
+  }
+
   // GT / GOTO / POSITIONGT / BUG2 — Navegación reactiva al objetivo
   // ("BUG2" se acepta por compatibilidad; el algoritmo es ReactiveNav)
   // Uso: GT|x|y          — navega al objetivo
@@ -2172,30 +2320,60 @@ void ReadUdpPackets() {
       float leaderX = arguments[2].toFloat();
       float leaderY = arguments[3].toFloat();
 
-      // Calcular punto de estacionamiento: slot en círculo alrededor del líder.
-      // Aproximación en dos etapas: primero un waypoint en el mismo rayo del
-      // slot pero STAGING_MARGIN más lejos del líder, y de ahí entrada radial
-      // — la recta al goal nunca cruza el círculo de parking (ni al líder).
+      // Calcular el slot y el waypoint de aproximación (staging → parking).
       const float STAGING_MARGIN = 150.0f;
-      int   n     = max(1, congregation.totalFollowers);
-      if (!congregation.slotAngleSet) {
-        // n==1: slot del lado por donde viene el follower — evita slots contra
-        // la pared cuando el líder está cerca del borde (visto 2026-07-03).
-        // n>1: distribución fija por índice (única entre followers, pero ciega
-        // a paredes; asignación por la Base pendiente al escalar el enjambre).
-        congregation.slotAngle =
-            (n == 1) ? atan2(robotPose.y - leaderY, robotPose.x - leaderX)
-                     : (2.0f * PI * congregation.followerIndex) / n;
-        congregation.slotAngleSet = true;
+      int    n     = max(1, congregation.totalFollowers);
+      String shape = congregation.formationShape;
+      float  parkX, parkY;
+
+      if (shape == "linea" || shape == "cuna") {
+        // Slot perpendicular al heading del líder (fila), con eje opcional de la
+        // Base (formationAxis). cuna: además desplazado k·s hacia atrás (V detrás
+        // del líder). Staging POR DETRÁS de la fila (opuesto al heading) para que
+        // cada robot entre por su propio carril y no cruce los slots vecinos.
+        float leaderAngle = arguments[4].toFloat();   // ° heading del líder
+        float s   = congregation.parkingDist;
+        float rad = leaderAngle * PI / 180.0f;
+        float hx  = cos(rad), hy = sin(rad);          // heading unitario
+        float pa  = rad + PI / 2.0f + congregation.formationAxis * PI / 180.0f;
+        float px  = cos(pa), py = sin(pa);            // eje de la fila
+        int   k    = congregation.followerIndex / 2 + 1;
+        int   side = (congregation.followerIndex % 2 == 0) ? 1 : -1;
+        float ox   = side * k * s * px;
+        float oy   = side * k * s * py;
+        if (shape == "cuna") { ox -= k * s * hx; oy -= k * s * hy; }
+        congregation.slotX = leaderX + ox;
+        congregation.slotY = leaderY + oy;
+        if (congregation.stagingDone) {
+          parkX = congregation.slotX;
+          parkY = congregation.slotY;
+        } else {
+          parkX = congregation.slotX - STAGING_MARGIN * hx;
+          parkY = congregation.slotY - STAGING_MARGIN * hy;
+        }
+      } else {
+        // circulo / congregación clásica: slot en círculo alrededor del líder,
+        // aproximación radial (waypoint STAGING_MARGIN más lejos por el mismo
+        // rayo → la recta al goal nunca cruza el círculo de parking ni al líder).
+        if (!congregation.slotAngleSet) {
+          // n==1: slot del lado por donde viene el follower — evita slots contra
+          // la pared cuando el líder está cerca del borde (visto 2026-07-03).
+          // n>1: distribución fija por índice (única entre followers, pero ciega
+          // a paredes; asignación por la Base pendiente al escalar el enjambre).
+          congregation.slotAngle =
+              (n == 1) ? atan2(robotPose.y - leaderY, robotPose.x - leaderX)
+                       : (2.0f * PI * congregation.followerIndex) / n;
+          congregation.slotAngleSet = true;
+        }
+        float angle = congregation.slotAngle;
+        congregation.slotX = leaderX + congregation.parkingDist * cos(angle);
+        congregation.slotY = leaderY + congregation.parkingDist * sin(angle);
+        float goalDist = congregation.stagingDone
+                             ? congregation.parkingDist
+                             : congregation.parkingDist + STAGING_MARGIN;
+        parkX = leaderX + goalDist * cos(angle);
+        parkY = leaderY + goalDist * sin(angle);
       }
-      float angle = congregation.slotAngle;
-      congregation.slotX = leaderX + congregation.parkingDist * cos(angle);
-      congregation.slotY = leaderY + congregation.parkingDist * sin(angle);
-      float goalDist = congregation.stagingDone
-                           ? congregation.parkingDist
-                           : congregation.parkingDist + STAGING_MARGIN;
-      float parkX = leaderX + goalDist * cos(angle);
-      float parkY = leaderY + goalDist * sin(angle);
 
       if (nav.isActive) {
         nav.goalX = parkX;
@@ -2209,21 +2387,68 @@ void ReadUdpPackets() {
           fsmInstruction[1] = 0;
           instructionList.push_back(fsmInstruction);
         }
-        MessageDebugf("DEBUG: -1, ID: %s, CONGREGATION: slot %d/%d → %s (%.1f,%.1f)",
-                      robotID.c_str(), congregation.followerIndex, n,
+        MessageDebugf("DEBUG: -1, ID: %s, %s: slot %d/%d → %s (%.1f,%.1f)",
+                      robotID.c_str(),
+                      shape.length() ? shape.c_str() : "CONGREGATION",
+                      congregation.followerIndex, n,
                       congregation.stagingDone ? "parking" : "staging",
                       parkX, parkY);
       }
     }
   }
 
-  // CANCEL_CONGREGATION
+  // CANCEL_CONGREGATION — también termina la dispersión (mismo "alto enjambre")
   else if (command == "CANCEL_CONGREGATION") {
     congregation.Reset();
+    disperse.Reset();
     nav.Reset();
     instructionList.clear();
     state = STOP;
     MessageDebugf("DEBUG: -1, ID: %s, Congregación cancelada", robotID.c_str());
+  }
+
+  // DISPERSE — dispersión de enjambre: repeler vecinos hasta separación >= mm
+  // DISPERSE|<mm>. Los vecinos llegan por NEIGHBOR_POSITIONS (1 Hz de la Base).
+  else if (command == "DISPERSE") {
+    congregation.Reset();               // no formar y dispersar a la vez
+    disperse.Reset();
+    disperse.target = (arguments[1] != "") ? arguments[1].toFloat() : 600.0f;
+    nav.Reset();
+    instructionList.clear();
+    MessageDebugf("DEBUG: -1, ID: %s, dispersión: separación objetivo %.0fmm",
+                  robotID.c_str(), disperse.target);
+    // Refrescar la pose antes del primer NEIGHBOR (así el settle/hop se decide
+    // sobre robotPose fresco, no sobre la última posición de otra conducta).
+    fsmInstruction[0] = REQUEST_POSITION;
+    fsmInstruction[1] = 0;
+    instructionList.push_back(fsmInstruction);
+  }
+
+  // NEIGHBOR_POSITIONS — posiciones de los demás robots (para dispersión)
+  // NEIGHBOR_POSITIONS|id,x,y;id,x,y;...  (la Base excluye o no al propio robot;
+  // aquí se filtra por id). Al llegar, se evalúa un salto de dispersión.
+  else if (command == "NEIGHBOR_POSITIONS") {
+    disperse.nCount = 0;
+    String list = arguments[1];
+    int start = 0;
+    while (start < (int)list.length() && disperse.nCount < DisperseState::MAX_NEIGHBORS) {
+      int semi = list.indexOf(';', start);
+      String item = (semi == -1) ? list.substring(start) : list.substring(start, semi);
+      int c1 = item.indexOf(',');
+      int c2 = item.indexOf(',', c1 + 1);
+      if (c1 > 0 && c2 > c1) {
+        String nid = item.substring(0, c1);
+        if (nid != robotID) {
+          int i = disperse.nCount++;
+          disperse.nId[i] = nid;
+          disperse.nX[i]  = item.substring(c1 + 1, c2).toFloat();
+          disperse.nY[i]  = item.substring(c2 + 1).toFloat();
+        }
+      }
+      if (semi == -1) break;
+      start = semi + 1;
+    }
+    MaybeDisperseHop();
   }
 
   // CLEAR_EVASION

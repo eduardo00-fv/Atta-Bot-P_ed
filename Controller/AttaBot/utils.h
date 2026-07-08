@@ -305,6 +305,12 @@ struct CongregationState {
     bool stagingDone = false;    // true al alcanzar el waypoint de aproximación
     float slotAngle = 0;         // rad, latcheado al primer LEADER_POSITION
     bool slotAngleSet = false;   // evita que el slot salte de lado en camino
+    // Formación (FORMATION): "" = congregación clásica (círculo). "linea"/"cuna"
+    // usan slot perpendicular al heading del líder; "circulo" = igual que la
+    // congregación. formationAxis rota el eje de la fila (fallback de la Base
+    // cuando la fila no cabe en la arena).
+    String formationShape = "";
+    float  formationAxis  = 0;
 
     void Reset() {
         leaderID = "-1";
@@ -322,8 +328,10 @@ struct CongregationState {
         stagingDone = false;
         slotAngle = 0;
         slotAngleSet = false;
+        formationShape = "";
+        formationAxis  = 0;
     }
-    
+
     bool IsActive() {
         return leaderID != "-1";
     }
@@ -340,6 +348,64 @@ struct CongregationState {
     void CompleteRequest() {
         waitingForResponse = false;
         lastRequestTime = 0;
+    }
+};
+
+
+/***************************************************************************************
+ * Estructura: DisperseState
+ * -------------------------------------------------------------------------------------
+ * Dispersión de enjambre (comando DISPERSE|mm): cada robot se repele de sus
+ * vecinos (recibidos por NEIGHBOR_POSITIONS, 1 Hz desde la Base) hasta tener al
+ * más cercano a >= target. Port 1:1 del controller de sim validado en Webots.
+ *   - target = 0  → inactivo.
+ *   - Turno secuencial por id (solo salta el menor id entre los muy-cercanos) +
+ *     histéresis 80mm + timeout anti-deadlock: evita la tormenta de evasiones IR
+ *     y el deadlock por jitter en la frontera vistos en los E2E de sim.
+ *   - dminHist: mediana de 3 lecturas para que el jitter no dispare/cancele la
+ *     confirmación de settle.
+ * ⚠ Constantes de arena (ARENA_*) = FOV útil del lab (2.4 x 1.55 m). Ajustar si
+ *   cambia el montaje de la cámara.
+ ***************************************************************************************/
+struct DisperseState {
+    static const int MAX_NEIGHBORS = 8;
+    float target  = 0;           // mm de separación objetivo (0 = inactivo)
+    bool  settled = false;
+    int   blocked = 0;           // rondas esperando a un id menor (anti-deadlock)
+    float dminHist[3] = {0, 0, 0};
+    int   dminIdx = 0;           // posición de escritura (ring buffer)
+    int   dminCount = 0;         // lecturas válidas (tope 3)
+    // Vecinos del último NEIGHBOR_POSITIONS (excluye al propio robot)
+    String nId[MAX_NEIGHBORS];
+    float  nX[MAX_NEIGHBORS];
+    float  nY[MAX_NEIGHBORS];
+    int    nCount = 0;
+
+    bool IsActive() { return target > 0; }
+
+    void Reset() {
+        target = 0;
+        settled = false;
+        blocked = 0;
+        dminIdx = 0;
+        dminCount = 0;
+        nCount = 0;
+    }
+
+    // Mediana móvil de las últimas 3 dmin — espejo de sorted(hist)[len//2] del
+    // sim (len 1→valor, 2→el mayor, 3→la mediana). Filtra outliers de medición.
+    float SmoothDmin(float dmin) {
+        dminHist[dminIdx] = dmin;
+        dminIdx = (dminIdx + 1) % 3;
+        if (dminCount < 3) dminCount++;
+        float v[3] = { dminHist[0], dminHist[1], dminHist[2] };
+        for (int i = 1; i < dminCount; i++) {   // insertion sort de los válidos
+            float key = v[i];
+            int j = i - 1;
+            while (j >= 0 && v[j] > key) { v[j + 1] = v[j]; j--; }
+            v[j + 1] = key;
+        }
+        return v[dminCount / 2];
     }
 };
 
