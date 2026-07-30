@@ -1002,6 +1002,103 @@ def print_ir(tag, events, obstacles):
     print(f'\n  nota: {note}')
 
 
+def load_ekf_pairs(path, max_age_ms=600.0):
+    """
+    {robot_id: [(t, cam_x, cam_y, cam_ang, ekf_x, ekf_y, ekf_ang)]}
+
+    Solo filas donde el PositionLog trae las columnas ekf_* (logs viejos no las
+    tienen) y donde la muestra del EKF es fresca: llega a 2Hz mientras el log se
+    escribe por frame, así que una muestra vieja compararía el EKF de hace un
+    segundo contra la cámara de ahora e inflaría el error sin que sea deriva.
+    """
+    pairs = {}
+    with open(path, newline='') as f:
+        for row in csv.DictReader(f):
+            if not row.get('ekf_x'):
+                continue
+            try:
+                age = float(row['ekf_age_ms'])
+                if age > max_age_ms:
+                    continue
+                pairs.setdefault(row['idrobot'], []).append(
+                    (float(row['time']),
+                     float(row['x']), float(row['y']), float(row['angle']),
+                     float(row['ekf_x']), float(row['ekf_y']),
+                     float(row['ekf_angle'])))
+            except (ValueError, KeyError, TypeError):
+                continue
+    return pairs
+
+
+def print_ekf(tag, pairs):
+    """
+    Error del EKF contra el ArUco: cuánto se le puede confiar la navegación.
+
+    El EKF corre como observador pasivo (EKF_NAV apagado), así que esto mide sin
+    arriesgar nada. Lo que importa para decidir es el p95, no el promedio: la
+    navegación falla en el peor caso, no en el típico.
+    """
+    print(f'\n=== EKF vs ArUco — {tag} ===')
+    print('El EKF es pasivo (EKF_NAV apagado): esto mide su deriva sin que controle.')
+    hdr = (f'{"robot":>6} {"n":>5} {"med mm":>8} {"p95 mm":>8} {"máx mm":>8} '
+           f'{"p95 áng":>8}')
+    print(hdr)
+    print('-' * len(hdr))
+
+    todos = []
+    for rid in sorted(pairs, key=lambda r: (len(r), r)):
+        rows = pairs[rid]
+        errs, aerrs = [], []
+        for _t, cx, cy, ca, ex, ey, ea in rows:
+            errs.append(math.hypot(ex - cx, ey - cy))
+            d = abs((ea - ca + 180.0) % 360.0 - 180.0)
+            aerrs.append(d)
+        if not errs:
+            continue
+        errs.sort(); aerrs.sort()
+        p95 = errs[min(len(errs) - 1, int(len(errs) * 0.95))]
+        a95 = aerrs[min(len(aerrs) - 1, int(len(aerrs) * 0.95))]
+        todos += errs
+        print(f'{rid:>6} {len(errs):>5} {_median(errs):>8.0f} {p95:>8.0f} '
+              f'{errs[-1]:>8.0f} {a95:>7.1f}°')
+
+    if not todos:
+        print('\nSin filas comparables. ¿La corrida es anterior al logueo del EKF, '
+              'o los robots nunca llegaron a inicializarlo (necesita ArUco al menos '
+              'una vez)?')
+        return
+
+    todos.sort()
+    p95 = todos[min(len(todos) - 1, int(len(todos) * 0.95))]
+    print(f'\nGlobal: mediana {_median(todos):.0f}mm · p95 {p95:.0f}mm · '
+          f'máx {todos[-1]:.0f}mm  (n={len(todos)})')
+    # El umbral de decisión es el criterio de llegada de la nav: si el EKF se
+    # equivoca más que eso, navegar con él haría fallar la llegada.
+    print('Criterio: el p95 tiene que quedar bajo arrivalThreshold (50mm) para '
+          'confiarle la navegación;')
+    print('          hasta ~150mm sirve solo para puentear oclusiones cortas.')
+    if p95 <= 50:
+        print(f'→ p95 {p95:.0f}mm: apto para EKF_NAV|1.')
+    elif p95 <= 150:
+        print(f'→ p95 {p95:.0f}mm: sirve de respaldo ante oclusión, no para navegar todo el tiempo.')
+    else:
+        print(f'→ p95 {p95:.0f}mm: NO confiarle la navegación todavía — revisar '
+              'calibración de PPR/yaw_scale antes que el EKF.')
+
+
+def run_ekf(sessions, a):
+    visto = False
+    for tag, pos, _con in sessions:
+        pairs = load_ekf_pairs(pos)
+        if not pairs:
+            continue
+        visto = True
+        print_ekf(tag, pairs)
+    if not visto:
+        print('Ningún PositionLog trae columnas ekf_*. Se agregaron el 2026-07-29: '
+              'las corridas anteriores no las tienen.')
+
+
 def run_ir(sessions, a):
     obstacles = []
     for spec in (a.obstacle or []):
@@ -1051,6 +1148,9 @@ def main():
     ap.add_argument('--ir', action='store_true',
                     help='calibración/prueba de IR: distancia de detección por canal '
                          '(IZQ/CEN/DER) y fantasmas, desde CHECK_OBSTACLE')
+    ap.add_argument('--ekf', action='store_true',
+                    help='error del EKF del firmware contra el ArUco (pasivo, no '
+                         'necesita EKF_NAV activo): mediana/p95/máx por robot')
     ap.add_argument('--obstacle', nargs='*', metavar='X,Y',
                     help='posición(es) del obstáculo colocado (mm cámara) para el '
                          'modo --ir; sin esto, arena vacía ⇒ todo disparo = fantasma')
@@ -1074,6 +1174,10 @@ def main():
             return
     elif not a.all:
         sessions = sessions[-1:]   # la más reciente
+
+    if a.ekf:
+        run_ekf(sessions, a)
+        return
 
     if a.ir:
         run_ir(sessions, a)

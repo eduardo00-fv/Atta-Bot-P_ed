@@ -329,6 +329,15 @@ LedController ledCtrl;
 unsigned long lastImuRead = 0;
 const unsigned long imuReadInterval = 20;  // ms — 50Hz, por debajo del ODR del DMP (~112Hz)
 
+// Reporte pasivo del EKF a la base, para VALIDARLO sin que controle nada.
+// El EKF corre siempre como observador (EKF_NAV arranca apagado), así que
+// mandando su pose se puede medir cuánto deriva contra el ArUco durante las
+// corridas normales: la base lo escribe en la misma fila del PositionLog que la
+// pose de cámara, y el error queda como una resta de columnas. Sin esto la única
+// forma de verlo era polear GET_STATUS a mano.
+unsigned long lastEkfReport = 0;
+const unsigned long ekfReportInterval = 500;  // ms — 2Hz alcanza para medir deriva
+
 // Variables de control de movimiento
 unsigned long currentMillis = millis();
 unsigned long previousMillisRW = 0;
@@ -806,6 +815,19 @@ void loop() {
     lastImuRead = millis();
     LeerYaw();
     EkfTick();
+  }
+
+  // Telemetría del EKF (2Hz). Es solo salida: no toca el control, corra o no
+  // EKF_NAV. Sirve para responder con datos "¿cuánto deriva el EKF?" durante las
+  // corridas que ya se hacen, en vez de tener que confiar en él sin medirlo.
+  if (ekf.initialized && millis() - lastEkfReport >= ekfReportInterval &&
+      robots.find("Base") != robots.end() &&
+      robots["Base"] != IPAddress(0, 0, 0, 0)) {
+    lastEkfReport = millis();
+    char ekfBuf[64];
+    snprintf(ekfBuf, sizeof(ekfBuf), "EKF_POSE|%.1f|%.1f|%.1f", ekf.x, ekf.y,
+             ekf.AngleDeg());
+    SendMessage(robots["Base"], ekfBuf);
   }
 
 #ifdef DebugSerial

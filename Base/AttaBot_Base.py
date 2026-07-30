@@ -119,6 +119,12 @@ class Robot(object):
         self.name = ''
         self.IP = ''
         self.previousPose = (-1, -1, -1)
+        # Última pose del EKF del firmware (EKF_POSE, 2Hz) y su timestamp. Es
+        # telemetría pasiva: el EKF no controla nada mientras EKF_NAV esté
+        # apagado. Se registra junto a la pose de ArUco para poder medir su
+        # deriva antes de decidir si se le confía la navegación.
+        self.ekfPose = None               # (x, y, angle) o None si nunca llegó
+        self.ekfStamp = 0.0               # time.time() de la última recepción
         self.initRobot(configRobot)
 
 
@@ -1511,7 +1517,7 @@ class Base(object):
                 self.sendInstruction(robot.IP, [instruction], False)
 
                 self.addPositionLog(timeLog, robot.id, robot.name,
-                                    robot.previousPose, displacement)
+                                    robot.previousPose, displacement, robot)
         self._drawLegend(resultsFrame)
 
         # NEIGHBOR_POSITIONS a 1 Hz: cada robot conoce dónde están los demás
@@ -1691,15 +1697,32 @@ class Base(object):
         currentTime = datetime.now().strftime(r'%d-%m_%H-%M')
         logName = f'Position_Log_{self.logTag}{currentTime}_Robots_{self.numRobots}.csv'
         self.pathPositionLogs = os.path.join(self.pathPositionLogs, logName)
+        # Las columnas ekf_* van al final para no mover las que ya existen:
+        # analyze_logs.py lee con DictReader, así que agregar al final es
+        # compatible con los logs viejos (que simplemente no las traen).
         header = ['time', 'idrobot', 'robot', 'x', 'y', 'angle',
-                  'linearDisplacement', 'angularDisplacement']
+                  'linearDisplacement', 'angularDisplacement',
+                  'ekf_x', 'ekf_y', 'ekf_angle', 'ekf_age_ms']
         with open(self.pathPositionLogs, 'w', newline='') as f:
             csv.writer(f).writerow(header)
 
 
-    def addPositionLog(self, timeLog, id, name, position, displacement):
-        """Agrega una entrada al registro de posiciones de los robots."""
+    def addPositionLog(self, timeLog, id, name, position, displacement, robot=None):
+        """
+        Agrega una entrada al registro de posiciones de los robots.
+
+        Si se pasa `robot`, se anexa su última pose de EKF (telemetría pasiva) y
+        la antigüedad de esa muestra en ms. Con la pose de cámara y la del EKF en
+        la misma fila, el error del EKF es una resta de columnas. `ekf_age_ms`
+        importa para no comparar contra una muestra vieja: el EKF llega a 2Hz y
+        el log se escribe por frame, así que valores de ~0-500ms son normales.
+        """
         row = [timeLog, id, name, *position, *displacement]
+        if robot is not None and robot.ekfPose is not None:
+            ageMs = (time.time() - robot.ekfStamp) * 1000.0
+            row += [*(f'{v:.1f}' for v in robot.ekfPose), f'{ageMs:.0f}']
+        else:
+            row += ['', '', '', '']
         with open(self.pathPositionLogs, 'a', newline='') as f:
             csv.writer(f).writerow(row)
 
@@ -1860,6 +1883,21 @@ class Base(object):
                             for robot in self.robots.values():
                                 if robot.id != leaderID and robot.IP:
                                     self.sendInstruction(robot.IP, [message], False)
+
+                elif command == 'EKF_POSE':
+                    # Telemetría pasiva del EKF del firmware (2Hz). No se
+                    # reenvía ni se actúa sobre ella: se guarda para que
+                    # addPositionLog la escriba junto a la pose de ArUco del
+                    # mismo instante. Así una corrida normal deja los datos para
+                    # medir la deriva del EKF sin dejarlo controlar nada.
+                    if robotFound and len(parts) >= 4:
+                        try:
+                            self.robots[id].ekfPose = (float(parts[1]),
+                                                       float(parts[2]),
+                                                       float(parts[3]))
+                            self.robots[id].ekfStamp = time.time()
+                        except ValueError:
+                            pass
 
                 elif command == 'COLOR_QUERY' and self.simMode:
                     # APDS virtual: el supervisor de Webots conoce los colores
