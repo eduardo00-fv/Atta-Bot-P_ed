@@ -1,13 +1,36 @@
-import subprocess
-import threading
+"""
+Sube el firmware por OTA a los AttaBot en paralelo.
+
+Uso:
+    python3 OTA.py                 # a todas las IPs de la lista
+    python3 OTA.py 101 104         # solo a .101 y .104 (atajo por último octeto)
+    python3 OTA.py 192.168.1.101   # IP completa también vale
+
+Antes de subir verifica que el .bin sea más nuevo que el código fuente. Esa
+guarda existe porque el 2026-07-29 el .bin del build tenía SEIS SEMANAS: subirlo
+habría flasheado firmware de junio sin ninguno de los arreglos, y el robot habría
+arrancado perfecto — con los bugs viejos adentro. Un OTA que sube un binario
+viejo es indistinguible de uno que funciona hasta que se prueba el robot.
+"""
+
+import glob
 import os
+import subprocess
+import sys
+import threading
+import time
 
-# Configuración
-BIN = "/home/thrain/Documents/Atta-Bot-P_ed/Controller/AttaBot/build/esp32.esp32.esp32/AttaBot.ino.bin"
-PORT = 3232            # puerto OTA (ArduinoOTA usa 3232 por defecto)
-PASS = "attabot1234"              # password si usaste ArduinoOTA.setPassword()
+HERE = os.path.dirname(os.path.abspath(__file__))
 
-# Lista de IPs de tus ESP32
+# El .bin lo produce el IDE de Arduino en el build path del sketch. Ruta relativa
+# al script: la absoluta hardcodeada rompía el repo en cualquier otra máquina.
+BIN = os.path.join(HERE, 'build', 'esp32.esp32.esp32', 'AttaBot.ino.bin')
+# Fuentes que tienen que ser MÁS VIEJAS que el .bin para que subir tenga sentido.
+SOURCES = [os.path.join(HERE, 'AttaBot.ino'), os.path.join(HERE, 'utils.h')]
+
+PORT = 3232          # puerto OTA (ArduinoOTA usa 3232 por defecto)
+PASS = "attabot1234"  # password de ArduinoOTA.setPassword()
+
 IPS = [
     "192.168.1.101",
     "192.168.1.102",
@@ -19,27 +42,100 @@ IPS = [
     "192.168.1.108",
 ]
 
-# Ruta a espota.py (ajústala si tu instalación es diferente)
-ESPOTA = os.path.expanduser("/home/thrain/.arduino15/packages/esp32/hardware/esp32/3.3.8/tools/espota.py")
 
-def upload(ip):
+def find_espota():
+    """
+    Ubica espota.py del core ESP32 instalado, tomando la versión más nueva.
+
+    Antes estaba hardcodeado a 3.3.8 y al actualizar el core a 3.3.11 ese
+    directorio desapareció, así que OTA.py fallaba entero. Se resuelve por glob
+    para que sobreviva a la próxima actualización.
+    """
+    pattern = os.path.expanduser(
+        '~/.arduino15/packages/esp32/hardware/esp32/*/tools/espota.py')
+    found = sorted(glob.glob(pattern))
+    if not found:
+        sys.exit(f'✗ No se encontró espota.py.\n  Buscado en: {pattern}\n'
+                 '  ¿Está instalado el core ESP32 en el IDE de Arduino?')
+    return found[-1]
+
+
+def check_binary_fresh():
+    """Aborta si el .bin no existe o es más viejo que el código fuente."""
+    if not os.path.isfile(BIN):
+        sys.exit(f'✗ No existe el binario:\n  {BIN}\n'
+                 '  Compilá el sketch en el IDE de Arduino antes de subir.')
+
+    bin_time = os.path.getmtime(BIN)
+    stale = [(s, os.path.getmtime(s)) for s in SOURCES
+             if os.path.isfile(s) and os.path.getmtime(s) > bin_time]
+    if stale:
+        edad_h = (time.time() - bin_time) / 3600.0
+        print(f'✗ El binario es más VIEJO que el código fuente.')
+        print(f'  bin: {time.strftime("%Y-%m-%d %H:%M", time.localtime(bin_time))}'
+              f'  ({edad_h:.1f}h de antigüedad)')
+        for s, t in stale:
+            print(f'  más nuevo: {os.path.basename(s)} '
+                  f'{time.strftime("%Y-%m-%d %H:%M", time.localtime(t))}')
+        print('\n  Recompilá en el IDE de Arduino. Si subís así, el robot va a '
+              'arrancar bien\n  pero con el firmware viejo adentro.')
+        sys.exit(1)
+
+    print(f'✓ Binario: {time.strftime("%Y-%m-%d %H:%M", time.localtime(bin_time))} '
+          f'({os.path.getsize(BIN) / 1024:.0f} KB)')
+
+
+def resolve_targets(args):
+    """Convierte argumentos en IPs. Acepta el último octeto como atajo."""
+    if not args:
+        return IPS
+    out = []
+    for a in args:
+        out.append(a if '.' in a else f'192.168.1.{a}')
+    return out
+
+
+def upload(ip, espota, results):
     print(f"🚀 Subiendo firmware a {ip} ...")
     try:
         subprocess.run(
-            ["python3", ESPOTA, "-i", ip, "-p", str(PORT), "--auth", PASS, "--file", BIN],
-            check=True
-        )
+            ["python3", espota, "-i", ip, "-p", str(PORT), "--auth", PASS,
+             "--file", BIN],
+            check=True, capture_output=True, text=True)
         print(f"✅ {ip}: actualizado correctamente")
-    except subprocess.CalledProcessError:
-        print(f"❌ {ip}: error en la actualización")
+        results[ip] = True
+    except subprocess.CalledProcessError as e:
+        # Sin esto el error de espota se perdía y todos los fallos se veían igual
+        detalle = (e.stderr or e.stdout or '').strip().splitlines()
+        pista = detalle[-1] if detalle else 'sin detalle'
+        print(f"❌ {ip}: error en la actualización — {pista}")
+        results[ip] = False
 
-threads = []
-for ip in IPS:
-    t = threading.Thread(target=upload, args=(ip,))
-    t.start()
-    threads.append(t)
 
-for t in threads:
-    t.join()
+def main():
+    espota = find_espota()
+    print(f'espota: {espota}')
+    check_binary_fresh()
 
-print("🎉 Todos los ESP32 procesados")
+    targets = resolve_targets(sys.argv[1:])
+    print(f'Objetivos: {", ".join(targets)}\n')
+
+    results = {}
+    threads = [threading.Thread(target=upload, args=(ip, espota, results))
+               for ip in targets]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    ok = sum(1 for v in results.values() if v)
+    print(f"\n🎉 {ok}/{len(targets)} actualizados")
+    if ok < len(targets):
+        fallidos = [ip for ip, v in results.items() if not v]
+        print(f'   Sin actualizar: {", ".join(fallidos)}')
+        print('   Un robot apagado o en otra red no responde al OTA.')
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
