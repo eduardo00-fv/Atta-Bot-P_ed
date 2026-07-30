@@ -10,15 +10,35 @@
                 "marker_size_mm": 100,
                 "origin_x_mm": -1257.7,
                 "origin_y_mm": -341.6,
-                "reference_marker_id": "0"
+                "reference_marker_id": "0",
+                "camera_controls": {
+                        "focus": 0,
+                        "exposure": 250
+                }
+        },
+        "scenario": {
+                "_comment": "Arena util (mm). 'presets' selecciona por cantidad de robots (--robots N); si no hay preset se usa arena_mm.",
+                "arena_mm": [
+                        2400,
+                        1750
+                ],
+                "presets": {
+                        "4": [
+                                2400,
+                                1750
+                        ],
+                        "10": [
+                                3800,
+                                2800
+                        ]
+                }
         },
         "simulation": {
                 "robot_host": "127.0.0.1",
                 "robot_port_base": 6060,
                 "vision_port": 6055,
                 "control_port": 6059,
-                "mm_per_px": 2.0,
-                "arena_mm": [2400, 1550]
+                "mm_per_px": 2.0
         },
         "udp_communication": {
                 "base_ip": "192.168.1.100",
@@ -35,19 +55,47 @@
         "robots": {
                 "0": {
                         "name": "Atta_0"
+                        
                 },
                 "1": {
-                        "name": "Atta_1"
+                        "name": "Atta_1",
+                        "ip": "192.168.1.101"
+                        
                 },
                 "2": {
-                        "name": "Atta_2"
+                        "name": "Atta_2",
+                        "ip": "192.168.1.102"
                         
                 },
                 "3": {
-                        "name": "Atta_3"
+                        "name": "Atta_3",
+                        "ip": "192.168.1.103"
+                        
+                        
                 },
                 "4": {
-                        "name": "Atta_4"
+                        "name": "Atta_4",
+                        "ip": "192.168.1.106"
+                },
+                "5": {
+                        "name": "Atta_5",
+                        "ip": "192.168.1.105"
+                },
+                "6": {
+                        "name": "Atta_6",
+                        "ip": "192.168.1.104"
+                },
+                "7": {
+                        "name": "Atta_7"
+                },
+                "8": {
+                        "name": "Atta_8"
+                },
+                "9": {
+                        "name": "Atta_9"
+                },
+                "10": {
+                        "name": "Atta_10"
                 }
         }
 }

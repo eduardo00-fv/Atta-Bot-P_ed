@@ -247,6 +247,15 @@ class Robot(object):
         instructions = [f'CONFIG|{self.id}']
         if self.wheelDistance is not None:
             instructions.append(f'NAV_CONFIG|WHEEL_DIST|{self.wheelDistance}')
+        # Arena del escenario en curso. Sin esto el firmware usa su default
+        # hardcodeado (2400x1750) para decidir el slot seguro del anillo, el lado
+        # del escape de deadlock y si un destino de GT es válido, así que en otro
+        # montaje esos límites son mentira.
+        # Va la arena FÍSICA, no el recorte de la cámara: antes se mandaba el FOV
+        # y el firmware rechazaba destinos alcanzables que la cámara no alcanza a
+        # ver (2200|850 con FOV de 2170mm). Ver Base.arenaMm().
+        arenaW, arenaH = base.arenaMm()
+        instructions.append(f'NAV_CONFIG|ARENA|{arenaW:.0f}|{arenaH:.0f}')
         base.sendInstruction(ip, instructions, False)
 
 
@@ -395,9 +404,68 @@ class Base(object):
         self.simMode = False
         self.simVision = None             # instancia de SimVision
         self.simConfig = {}               # sección 'simulation' del JSON
+        self.scenarioConfig = {}          # sección 'scenario' del JSON (arena física)
         self.logTag = ''                  # 'SIM_' en los nombres de log de sim
         # --- Enjambre: broadcast periódico de posiciones (dispersión/flocking) ---
         self._lastNeighborCast = 0.0
+
+
+    def arenaMm(self):
+        """
+        Arena FÍSICA del escenario en curso, en mm: (ancho, alto).
+
+        Es dónde el robot PUEDE ESTAR, y no debe confundirse con el recorte que
+        ve la cámara (cameraFovMm), que es dónde la base puede MEDIRLO. El FOV
+        suele ser más chico: con la C920 a 1280px y 39/23 mm/px son 2170x1221mm
+        contra una arena de 2400x1750. Mientras la arena la definía el FOV, un
+        destino perfectamente alcanzable como 2200|850 lo rechazaba el firmware
+        con 'GT objetivo fuera de la arena' (2026-07-29).
+
+        Sale de la sección 'scenario': 'presets' por cantidad de robots si hay
+        uno para este N, si no 'arena_mm'.
+        """
+        sc = self.scenarioConfig
+        presets = sc.get('presets', {})
+        preset = presets.get(str(self.numRobots))
+        arena = preset if preset else sc.get('arena_mm', [2400, 1750])
+        return float(arena[0]), float(arena[1])
+
+
+    def cameraFovMm(self):
+        """Recorte observable por la cámara, en mm: (ancho, alto). Ver arenaMm()."""
+        return (self.cameraResolution[1] * self.mmPixel,
+                self.cameraResolution[0] * self.mmPixel)
+
+
+    def warnIfOutsideFov(self, instruction):
+        """
+        Avisa si una instrucción con destino apunta fuera de lo que ve la cámara.
+
+        El destino es LEGAL mientras caiga en la arena física (ver arenaMm), pero
+        si además cae fuera del FOV el robot llega a ciegas: la cámara deja de
+        publicar su pose y se queda quieto esperando coordenadas. Con EKF_NAV|1
+        sigue por odometría, sin eso se congela. Esto no bloquea nada — solo
+        evita el diagnóstico equivocado de 'el robot se colgó'.
+        """
+        parts = instruction.split('|')
+        if parts[0] not in ('GT', 'GOTO', 'POSITIONGT', 'MEET') or len(parts) < 3:
+            return
+        try:
+            x, y = float(parts[1]), float(parts[2])
+        except ValueError:
+            return
+
+        fovW, fovH = self.cameraFovMm()
+        arenaW, arenaH = self.arenaMm()
+        if not (0 <= x <= fovW and 0 <= y <= fovH):
+            dentro = (0 <= x <= arenaW and 0 <= y <= arenaH)
+            self.log(f'⚠ Destino ({x:.0f},{y:.0f}) fuera del FOV de la cámara '
+                     f'({fovW:.0f}x{fovH:.0f}mm)'
+                     + (f' pero dentro de la arena ({arenaW:.0f}x{arenaH:.0f}mm): '
+                        'el robot va a perder la pose al llegar. Activá EKF_NAV|1.'
+                        if dentro else
+                        f'. Además está fuera de la arena ({arenaW:.0f}x{arenaH:.0f}mm): '
+                        'el firmware lo va a rechazar.'))
 
 
     def log(self, msg: str):
@@ -411,6 +479,28 @@ class Base(object):
     # =========================================================================
     # DETECCIÓN ARUCO
     # =========================================================================
+
+    def _medianGate(self, mid, x, y, ang):
+        """Mediana de las últimas 3 lecturas del marker (ventana 0.5s).
+
+        Un misread de UN frame (identidad confundida, esquina mal refinada)
+        queda en minoría y no sale de acá; un cambio real sostenido gana la
+        mediana al segundo frame. El ángulo se decide por distancia circular
+        para no romperse en el wrap 359°↔1°. Costo: ~1 frame de retardo, y la
+        navegación muestrea con el robot quieto, así que no le pesa.
+        """
+        import time as _t
+        now = _t.time()
+        hist = [h for h in self._poseHist.get(mid, []) if now - h[0] <= 0.5]
+        hist.append((now, x, y, ang))
+        self._poseHist[mid] = hist[-3:]
+        if len(self._poseHist[mid]) < 3:
+            return (x, y, ang)
+        xs, ys, angs = zip(*[(h[1], h[2], h[3]) for h in self._poseHist[mid]])
+        angMed = min(angs, key=lambda a: sum(
+            abs((a - b + 180.0) % 360.0 - 180.0) for b in angs))
+        return (sorted(xs)[1], sorted(ys)[1], angMed)
+
 
     def detectArucoMarkers(self, frame):
         """
@@ -455,6 +545,10 @@ class Base(object):
         rawPositions = {}  # {str(id): (raw_x_mm, raw_y_mm, angle_deg)}
         for i, marker_id in enumerate(ids.flatten()):
             imagePoints = corners[i][0].astype(np.float32)
+            side = sum(float(np.linalg.norm(imagePoints[j] - imagePoints[(j + 1) % 4]))
+                       for j in range(4)) / 4.0
+            if side < getattr(self, 'minMarkerSidePx', 0.0):
+                continue      # blob demasiado chico para ser un marker real
             success, rvec, tvec = cv2.solvePnP(
                 objectPoints, imagePoints,
                 self.cameraMatriz, self.distance,
@@ -464,10 +558,21 @@ class Base(object):
                 continue
             raw_x = float(tvec[0][0]) * 1000.0
             raw_y = float(tvec[1][0]) * 1000.0
-            rotMatrix, _ = cv2.Rodrigues(rvec)
-            angle_rad = np.arctan2(rotMatrix[1][0], rotMatrix[0][0])
-            angle_deg = round(float(np.degrees(angle_rad) % 360), 1)
-            rawPositions[str(marker_id)] = (raw_x, raw_y, angle_deg)
+            if getattr(self, 'angleFromCorners', False):
+                # Dirección +x del marker medida sobre sus dos aristas
+                # horizontales (TL→TR y BL→BR), en coordenadas sin distorsión.
+                # No usa el rvec → inmune al flip de IPPE.
+                und = cv2.undistortPoints(imagePoints.reshape(-1, 1, 2),
+                                          self.cameraMatriz,
+                                          self.distance).reshape(4, 2)
+                ex, ey = (und[1] - und[0] + und[2] - und[3]) / 2.0
+                angle_deg = round(float(np.degrees(np.arctan2(ey, ex))) % 360, 1)
+            else:
+                rotMatrix, _ = cv2.Rodrigues(rvec)
+                angle_rad = np.arctan2(rotMatrix[1][0], rotMatrix[0][0])
+                angle_deg = round(float(np.degrees(angle_rad) % 360), 1)
+            rawPositions[str(marker_id)] = self._medianGate(
+                str(marker_id), raw_x, raw_y, angle_deg)
 
         # Paso 2: si hay marker de referencia visible, anclar origen a él
         if self.referenceMarkerId and self.referenceMarkerId in rawPositions:
@@ -657,7 +762,18 @@ class Base(object):
                 continue
 
             pose = robot.getPose()
-            refAngle = getattr(self, '_setupAngleSnapshot', {}).get(robot.id)
+            snapshot = getattr(self, '_setupAngleSnapshot', {})
+            refAngle = snapshot.get(robot.id)
+
+            # Inicialización tardía: si el robot no era visible cuando se tomó el
+            # snapshot, se quedaba con ref=None PARA SIEMPRE en este intento y el
+            # desplazamiento nunca podía calcularse (visto 2026-07-27: el robot
+            # giró 87° y el giro se descartó por esto). Al primer frame en que
+            # aparezca, se ancla la referencia.
+            if refAngle is None and pose != (-1, -1, -1):
+                snapshot[robot.id] = pose[2]
+                self._setupAngleSnapshot = snapshot
+                continue
 
             now = time.time()
             if now - getattr(self, '_setupDbgTime', 0) >= 1.0:
@@ -678,6 +794,51 @@ class Base(object):
                 break
 
         return None
+
+
+    def assignConfiguredAddresses(self, foundRobots, configuredRobots):
+        """
+        Asocia marker → IP desde el JSON, saltándose el giro de identificación.
+
+        El giro de identificación existe para descubrir qué IP corresponde a qué
+        marker, pero en el banco eso lo sabe el operador: es él quien pega el
+        marker en el robot. Declarándolo en configSystem.json (robots.<id>.ip) la
+        asociación es determinista, instantánea y —sobre todo— no depende de que
+        el robot gire bien: un robot con el giro comprometido no se asociaba
+        nunca, o peor, le robaba la IP al marker vecino.
+
+        Solo se aplica si TODOS los markers detectados tienen 'ip' declarada; si
+        falta alguna se cae al giro de identificación de siempre.
+
+        Parámetros:
+        - foundRobots (set/list): IDs de marker detectados por la cámara.
+        - configuredRobots (set): Conjunto de IDs ya configurados (se llena aquí).
+
+        Returns:
+        - bool: True si asignó todas las direcciones (se puede omitir el giro).
+        """
+        ips = {}
+        for rid in foundRobots:
+            ip = self.robotsConfig.get(str(rid), {}).get('ip')
+            if not ip:
+                return False
+            ips[str(rid)] = ip
+
+        if len(set(ips.values())) != len(ips):
+            print(f'[Setup] ⚠ IPs repetidas en configSystem.json: {ips} — '
+                  f'se usa el giro de identificación')
+            return False
+
+        for robot in self.robots.values():
+            if robot.id in ips:
+                robot.setupIP(ips[robot.id])
+                configuredRobots.add(robot.id)
+        # No se usa printRobots(): ese manda TURN|-90 a cada robot, justamente
+        # el giro que este camino busca evitar.
+        print('[Setup] Identidad tomada de configSystem.json (sin giro):')
+        for robot in self.robots.values():
+            print(f'\t{robot.id}. {robot.name}, con IP: {robot.IP}')
+        return True
 
 
     def assignSimAddresses(self, configuredRobots):
@@ -751,6 +912,7 @@ class Base(object):
             configuration = json.load(file)
 
         self.simConfig = configuration.get('simulation', {})
+        self.scenarioConfig = configuration.get('scenario', {})
         if self.simMode:
             self.logTag = 'SIM_'
 
@@ -875,6 +1037,18 @@ class Base(object):
 
         self.cameraMatriz = np.loadtxt(configuration['path_cameraMatrix'], dtype=float)
         self.distance = np.loadtxt(configuration['path_distance'], dtype=float)
+
+        # Ángulo desde las ARISTAS del marker en vez del rvec de solvePnP.
+        # IPPE_SQUARE tiene dos soluciones casi empatadas con cámara cenital y
+        # marker plano (ambigüedad de flip); el desempate parpadea y eso explica
+        # la σ=3.8° medida el 2026-07-27 con el robot QUIETO (el jitter de
+        # esquinas solo daría ~0.5°). La dirección de la arista superior es el
+        # mismo ángulo, sin pasar por PnP. Apagable por config para A/B en lab.
+        self.angleFromCorners = bool(configuration.get('angle_from_corners', True))
+        # Mediana-de-3 por marker: mata misreads de UN frame (saltos de ~500mm
+        # vistos hoy) antes de que lleguen a robots y logs. Con cambio real
+        # sostenido converge sola en 2 frames — sin contadores ni resync.
+        self._poseHist = {}   # id → [(t, x, y, ang), ...] máx 3, ventana 0.5s
         h, w = self.cameraResolution
 
         # La calibración se hizo a 1920x1080. Escalar la matriz si la resolución cambió.
@@ -927,8 +1101,19 @@ class Base(object):
         arucoParams.maxMarkerPerimeterRate = 4.0
         arucoParams.polygonalApproxAccuracyRate = 0.05
         arucoParams.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        # 1.0 = usar TODA la capacidad de corrección del diccionario. Con los
+        # markers de 90mm los robots miden ~40px (10% menos que con los de
+        # 100mm) y a ese tamaño 0.9 los descartaba: medido 2026-07-28, con 0.9
+        # solo aparecía el marker fijo del piso; con 1.0 aparecen los tres.
+        # Ablación: es el ÚNICO parámetro que los recupera (winSizeMax=53 trae
+        # uno solo; pixelPerCell=4 rompe la detección entera).
         arucoParams.errorCorrectionRate = 0.9
         arucoParams.perspectiveRemovePixelPerCell = 8
+        # Guarda contra falsos positivos: al relajar la detección aparecieron
+        # blobs de ~3px con ID válido. Un fantasma con el ID de un robot sería
+        # catastrófico (poses inventadas), así que se descarta por tamaño
+        # aparente — los markers reales miden 35-40px a esta altura.
+        self.minMarkerSidePx = 15.0
 
         self.arucoDetector = cv2.aruco.ArucoDetector(arucoDict, arucoParams)
         print(f'✓ Detector ArUco inicializado — DICT_4X4_50, marker: {self.markerSizeMm}mm')
@@ -952,9 +1137,13 @@ class Base(object):
         ref = configuration.get('reference_marker_id', '')
         self.referenceMarkerId = str(ref) if ref != '' else None
 
-        # Escala del frame sintético: mm por píxel sobre el área de la arena
+        # Escala del frame sintético: mm por píxel sobre el área de la arena.
+        # La arena sale de 'scenario' (con presets por cantidad de robots), no de
+        # 'simulation': acá se leía sc.get('arena_mm'), que no existe en esa
+        # sección, así que caía siempre al default y los presets se ignoraban.
+        # En sim el FOV sí cubre la arena entera — el frame se sintetiza de ella.
         self.mmPixel = float(sc.get('mm_per_px', 2.0))
-        arenaW, arenaH = sc.get('arena_mm', [2400, 1550])
+        arenaW, arenaH = self.arenaMm()
         self.cameraResolution = (int(arenaH / self.mmPixel), int(arenaW / self.mmPixel))
         self.bigCircleRadius = max(6, int((self.markerSizeMm / self.mmPixel) * 0.5))
 
@@ -1013,9 +1202,32 @@ class Base(object):
         self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.camera.set(cv2.CAP_PROP_FPS, 30)
-        # Fijar exposición para evitar parpadeo ("tweaking") bajo luz de laboratorio
+        # Óptica FIJA. Los tres automáticos de la C920 sabotean el ArUco y
+        # ninguno sobrevive a desconectar el USB, así que se fijan en cada
+        # arranque (medido 2026-07-28 con markers de bajo contraste):
+        #  - autofocus: cazaba y desenfocaba → nitidez 88 (borroso). Con foco
+        #    fijo al infinito da 100; a partir de focus=30 se derrumba a 48 y
+        #    en 40 ya no detecta nada. Es el ajuste que más pesa.
+        #  - exposición: en 77 el blanco marcaba 151/255 y el umbral adaptativo
+        #    quedaba sin margen; en 250 el blanco llega a 205 sin saturar.
+        #    Subirla más es un espejismo: en 600 el 89% de la imagen revienta.
+        #  - balance de blancos: si deriva, cambia el punto de corte del umbral.
+        cam = configuration.get('camera_controls', {})
+        self.camera.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+        self.camera.set(cv2.CAP_PROP_FOCUS, float(cam.get('focus', 0)))
         self.camera.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)   # 1 = manual en V4L2
-        self.camera.set(cv2.CAP_PROP_EXPOSURE, 200)
+        self.camera.set(cv2.CAP_PROP_EXPOSURE, float(cam.get('exposure', 250)))
+        self.camera.set(cv2.CAP_PROP_AUTO_WB, 0)
+
+        # Verificar que pegaron: V4L2 acepta el set() y lo ignora en silencio si
+        # el driver no soporta el control, y un foco que no pegó se paga en
+        # detecciones perdidas, no en un error.
+        af = self.camera.get(cv2.CAP_PROP_AUTOFOCUS)
+        if af not in (0, 0.0, -1):
+            print(f'⚠ el autofocus NO quedó apagado (={af}) — si ves markers '
+                  f'intermitentes, apagalo a mano:\n'
+                  f'  v4l2-ctl -d /dev/video{camera_index} '
+                  f'-c focus_automatic_continuous=0 -c focus_absolute=0')
 
         actual_fps = self.camera.get(cv2.CAP_PROP_FPS)
         actual_w   = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -1027,6 +1239,25 @@ class Base(object):
         for _ in range(30):
             self.camera.read()
         print(' listo')
+
+        # RE-APLICAR la exposición: al arrancar el streaming el driver la pisa
+        # (medido 2026-07-28: se fijaba en 250 y tras 30 frames quedaba en 38,
+        # con el blanco del papel en 106/255). Todas las sesiones anteriores
+        # corrieron subexpuestas por esto, y como el contraste bajo también baja
+        # la varianza del Laplaciano, parecía además un problema de foco.
+        # Re-aplicarla acá deja el blanco en ~200 y la nitidez en ~194.
+        self.camera.set(cv2.CAP_PROP_EXPOSURE, float(cam.get('exposure', 250)))
+        for _ in range(10):
+            self.camera.read()
+        ok, chk = self.camera.read()
+        if ok:
+            gray = cv2.cvtColor(chk, cv2.COLOR_BGR2GRAY)
+            white = float(np.percentile(gray, 95))
+            print(f'  Exposición: blanco={white:.0f}/255 '
+                  f'nitidez={cv2.Laplacian(gray, cv2.CV_64F).var():.0f}')
+            if white < 150:
+                print('  ⚠ imagen SUBEXPUESTA — el umbral adaptativo de ArUco '
+                      'pierde margen; subí camera_controls.exposure en el JSON')
 
         if not self.camera.isOpened():
             print(f'Error: No se pudo abrir la cámara {camera_index}.')
@@ -1161,7 +1392,11 @@ class Base(object):
         lastStatusTime = time.time()
         executed = False
         setupRetries = 0
-        MAX_SETUP_RETRIES = 15
+        # Frames de gracia para ver el giro de identificación. A ~15-20 FPS los
+        # 15 de antes daban ~1s, y un TURN|90 tarda ~2s en ejecutarse y asentarse
+        # → la base declaraba timeout y reenviaba el giro antes de que el robot
+        # terminara el anterior, desincronizándose.
+        MAX_SETUP_RETRIES = 60
 
         failCount = 0
 
@@ -1216,6 +1451,12 @@ class Base(object):
                     else:
                         robotsIPs = self.searchRobotsUdp()
                         self.processFoundRobots(foundRobots)
+                        # Si el JSON declara la IP de cada marker, la identidad ya
+                        # está dada y el giro de identificación sobra. Además de
+                        # ahorrar tiempo, evita que un robot que gira mal quede
+                        # asociado al marker equivocado (o no se asocie nunca).
+                        if self.assignConfiguredAddresses(foundRobots, configuredRobots):
+                            robotsIPs = []
 
             elif len(robotsIPs) != 0:
                 robotIP, isValidFrame = self.setupRobots(robotIP, robotsIPs, configuredRobots)
@@ -1601,7 +1842,14 @@ class Base(object):
                         leaderID = parts[1]
                         leaderX, leaderY, leaderAngle = float(parts[2]), float(parts[3]), float(parts[4])
                         self.updateRobotPosition(leaderID, leaderX, leaderY, leaderAngle)
-                        self.log(f'Posición de líder {leaderID}: ({leaderX},{leaderY}) {leaderAngle}°')
+                        # El líder difunde a ~4Hz (×2) → loguear cada frame inunda
+                        # la terminal. Throttle a 1/3s (la pose igual queda en el
+                        # PositionLog completo).
+                        now = time.time()
+                        if now - getattr(self, '_lastLeaderLogTime', 0) >= 3.0:
+                            self._lastLeaderLogTime = now
+                            self.log(f'Líder {leaderID} @ ({leaderX:.0f},{leaderY:.0f}) '
+                                     f'{leaderAngle:.0f}° [log 1/3s]')
                         if self.simMode:
                             # En el lab esto viaja por broadcast WiFi robot→robots;
                             # en localhost la base lo retransmite a los seguidores
@@ -1650,33 +1898,88 @@ class Base(object):
     # CONGREGACIÓN Y NAVEGACIÓN GLOBAL
     # =========================================================================
 
-    def startCongregation(self, leaderID):
+    def startCongregation(self, leaderID, spacing=300.0):
         """
-        Inicia congregación con un líder designado.
-        Asigna un slot de estacionamiento único a cada seguidor (opción B: parking spot).
+        Inicia congregación con un líder designado (anillo de estacionamiento).
+
+        Endurecida (2026-07): la Base asigna los slots del anillo (2π·idx/n, el
+        mismo fan que calcula el firmware) con la misma lógica wall-safe +
+        anti-cruce que startFormation circulo, en vez del orden por ID ciego a
+        paredes:
+          - valida que TODOS los slots caen dentro del área visible (inset), y
+            aborta pidiendo centrar el líder si el anillo no cabe;
+          - asigna el slot por bearing del follower alrededor del líder, así el
+            robot que ya está a la derecha recibe el slot derecho (mínimo cruce).
+        Cambio solo en la Base: el firmware sigue calculando 2π·idx/n para cada
+        idx, no requiere reflasheo.
         """
         if leaderID not in self.robots:
             print(f"Error: Robot líder {leaderID} no encontrado")
             return
+        lx, ly, _lang = self.robots[leaderID].getPose()
+        if lx == -1:
+            print(f"Líder {leaderID} no visible por la cámara")
+            return
+
+        followers = sorted([rid for rid in self.robots if rid != leaderID])
+        n = len(followers)
+
+        # Escalar el anillo con N para que los robots no se solapen: cada slot
+        # necesita ~MIN_ARC de arco (huella del robot + margen). Para pocos
+        # seguidores (≤7) domina el 300mm por defecto; recién con enjambres
+        # grandes (10 robots → r≈358mm) el anillo crece. Genérico lab+sim.
+        MIN_ARC = 200.0
+        if n > 1:
+            spacing = max(spacing, n * MIN_ARC / (2 * math.pi))
+
+        # Slot del anillo idx → posición absoluta (mismo 2π·idx/n del firmware)
+        def slotPos(idx):
+            ang = 2 * math.pi * idx / max(1, n)
+            return lx + spacing * math.cos(ang), ly + spacing * math.sin(ang)
+
+        # Validar que el anillo cabe en el área visible (frame: px × mm/px)
+        maxX = self.cameraResolution[1] * self.mmPixel
+        maxY = self.cameraResolution[0] * self.mmPixel
+        inset = 250.0
+        # AVISO, no veto: quien decide el slot es cada robot, que conoce la arena
+        # por NAV_CONFIG|ARENA y corrige el ángulo si le queda contra una pared.
+        # Además, para n==1 el firmware usa el bearing líder→robot y no este
+        # abanico, así que abortar con esta fórmula cancelaba congregaciones
+        # perfectamente viables (visto 2026-07-27).
+        if not all(inset <= sx <= maxX - inset and inset <= sy <= maxY - inset
+                   for sx, sy in (slotPos(i) for i in range(n))):
+            print(f'⚠ El anillo nominal (r={spacing:.0f}mm) roza los bordes con el '
+                  f'líder en ({lx:.0f},{ly:.0f}); cada robot ajustará su slot. '
+                  f'Para menos rodeos, acercá el líder al centro.')
+
+        # Asignación anti-cruce POR POSICIÓN: cada follower al slot LIBRE cuya
+        # posición absoluta esté más cerca (mínima distancia de viaje). Se empareja
+        # sobre las posiciones de slot (el mismo 2π·idx/n que ejecuta el firmware),
+        # no sobre bearings: comparar ángulos cruzaba si la convención de marco de
+        # la cámara difería del atan2 del firmware (visto 2026-07-23).
+        slotXY = {idx: slotPos(idx) for idx in range(n)}
+        pairs = sorted(
+            (math.dist(self.robots[rid].getPose()[:2], slotXY[idx]), rid, idx)
+            for rid in followers for idx in range(n))
+        assign, takenSlots = {}, set()
+        for _d, rid, idx in pairs:
+            if rid not in assign and idx not in takenSlots:
+                assign[rid] = idx
+                takenSlots.add(idx)
 
         self.congregationActive = True
         self.leaderID = leaderID
+        self.sendInstruction(self.robots[leaderID].IP,
+                             [f'CONGREGATION|{leaderID}|0|{n}'], False)
+        for rid in followers:
+            idx = assign[rid]
+            self.sendInstruction(self.robots[rid].IP,
+                                 [f'NAV_CONFIG|PARKING_DIST|{spacing:.0f}',
+                                  f'CONGREGATION|{leaderID}|{idx}|{n}'], False)
+            print(f"  {self.robots[rid].name}: slot {idx}/{n} (anti-cruce por posición)")
 
-        # Seguidores ordenados por ID para asignación determinista de slots
-        followers = sorted([rid for rid in self.robots if rid != leaderID])
-        total = len(followers)
-
-        # Enviar al líder (sin índice de follower — solo necesita saber que es líder)
-        leader_cmd = f'CONGREGATION|{leaderID}|0|{total}'
-        self.sendInstruction(self.robots[leaderID].IP, [leader_cmd], False)
-
-        # Enviar a cada seguidor su slot individual
-        for idx, rid in enumerate(followers):
-            cmd = f'CONGREGATION|{leaderID}|{idx}|{total}'
-            self.sendInstruction(self.robots[rid].IP, [cmd], False)
-            print(f"  Seguidor {self.robots[rid].name}: slot {idx}/{total}")
-
-        print(f"Congregación iniciada. Líder: {self.robots[leaderID].name}, {total} seguidor(es)")
+        print(f"Congregación iniciada. Líder: {self.robots[leaderID].name}, "
+              f"{n} seguidor(es)")
 
 
     def startFormation(self, args):
@@ -2002,6 +2305,17 @@ class Base(object):
 
         robotIP = self.robots[robotID].IP
         nominalPPR = 574.0
+        # Rango aceptado del PPR calculado: el MISMO que valida el firmware en
+        # SETPPR (100-5000). Antes era [400,800] y rechazaba robots legítimos —
+        # hay unidades cuya relación de engranes calibra por encima de 800.
+        minPPR, maxPPR = 100.0, 5000.0
+        # Avance mínimo para dar la maniobra por buena. Solo sirve para detectar
+        # "no se movió" / marker perdido, y NO debe acotar el PPR: durante la
+        # fase 2 el robot corre con el PPR nominal, así que uno cuyo PPR real sea
+        # alto avanza poco a propósito (mide 500·nominal/real ≈ 250mm si el real
+        # es ~1150). Con el mínimo viejo de 250mm esos robots se rechazaban por
+        # la razón equivocada, culpando al avance en vez del rango.
+        minCalibDistance = 100.0
         self._calib = {'robotID': robotID, 'imuReals': [], 'completions': 0,
                        'aborted': False, 'lastEvent': time.time()}
         try:
@@ -2050,8 +2364,9 @@ class Base(object):
                     return
                 _, x0, y0, x1, y1 = result
                 dist = math.hypot(x1 - x0, y1 - y0)
-                if dist < 250:
-                    print(f'[Calib] Avance midió {dist:.0f}mm (esperado ~500) — abortando')
+                if dist < minCalibDistance:
+                    print(f'[Calib] Avance midió {dist:.0f}mm (mínimo {minCalibDistance:.0f}) '
+                          f'— el robot no se movió o se perdió el marker; abortando')
                     return
                 distances.append(dist)
                 print(f'[Calib] Avance {n+1}/3: cámara={dist:.1f}mm')
@@ -2062,8 +2377,9 @@ class Base(object):
 
             measured = sum(distances) / len(distances)
             newPPR = nominalPPR * 500.0 / measured
-            if not 400 <= newPPR <= 800:
-                print(f'[Calib] PPR={newPPR:.1f} fuera de rango [400,800] — abortando')
+            if not minPPR <= newPPR <= maxPPR:
+                print(f'[Calib] PPR={newPPR:.1f} fuera de rango '
+                      f'[{minPPR:.0f},{maxPPR:.0f}] — abortando')
                 return
             self.sendInstruction(robotIP, [f'SETPPR|{newPPR:.1f}|SAVE'], False)
             print(f'[Calib] ✓ PPR={newPPR:.1f} guardado en flash (medido {measured:.1f}mm/500mm)')
@@ -2084,6 +2400,7 @@ class Base(object):
 
         Formato: 'robotId.instrucción' o comandos especiales:
             BROADCAST.instrucción
+            BROADCAST.MEET|x|y  (congregación sobre un punto, sin líder)
             CONGREGATION.leaderID
             GOTO.robotID x y
             STATUS.(cualquier cosa)
@@ -2102,6 +2419,8 @@ class Base(object):
             except ValueError:
                 print("Formato inválido. Use 'robotId.instrucción'")
                 continue
+
+            self.warnIfOutsideFov(instruction)
 
             if robotId == 'BROADCAST':
                 self.sendInstructionBroadcast([instruction])

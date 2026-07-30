@@ -11,7 +11,7 @@ import re
 from collections import defaultdict, Counter
 
 BASE = '/home/thrain/Documents/Atta-Bot-P_ed/Base'
-KNOWN_IDS = {'0', '1', '2', '3'}   # 0=origen; 1-3 robots
+KNOWN_IDS = {'0', '1', '2', '3', '4'}   # 0=origen; 1-4 robots (enjambre de 4)
 
 # ── ConsoleLogs ──────────────────────────────────────────────────────────────
 con_events = defaultdict(Counter)      # fecha → contador de eventos

@@ -25,11 +25,22 @@ Uso:
     python analyze_logs.py --session 03-07_10-04
     python analyze_logs.py --all              # resumen de todas las sesiones
     python analyze_logs.py --all --csv runs.csv
+
+Modo congregación (experimento del paper: N robots se congregan bajo distintas
+topologías de obstáculos). Reutiliza el mismo binning anti-jitter y saca del
+PositionLog el centroide, el radio del grupo (spread), la distancia mínima
+inter-robot, el tiempo de convergencia (radio R) y el recorrido por robot:
+    python analyze_logs.py --congregation --session SIM_07-07_23-09
+    python analyze_logs.py --congregation --session <run> --layout 3_cajas --plot
+    python analyze_logs.py --congregation --all --csv congregacion.csv
+    python analyze_logs.py --congregation --radius 400 --hold 3   # ajustar R
 """
 
 import argparse
 import csv
 import glob
+import itertools
+import json
 import math
 import os
 import re
@@ -41,6 +52,24 @@ CON_DIR = os.path.join(BASE_DIR, 'ConsoleLogs')
 RE_GT_START = re.compile(r'GT iniciado: goal=\((-?[\d.]+),(-?[\d.]+)\)')
 RE_ARRIVED = re.compile(r'NAV: llegó a \((-?[\d.]+),(-?[\d.]+)\)')
 IDLE_GAP_S = 8.0     # sin REQUEST_POSITION por este tiempo = run nuevo (fallback)
+
+# Calibración IR: bitmap del firmware = 4·IZQ + 2·CEN + 1·DER (IZQ/DER = IR de
+# pin33/pin27; CEN = proximidad APDS9960). Máscara: SENSOR_MASK|L|C|R|0/1.
+IR_BITS = ((4, 'IZQ'), (2, 'CEN'), (1, 'DER'))
+IR_MASK = {'IZQ': 'L', 'CEN': 'C', 'DER': 'R'}
+IR_GHOST_DIST = 350.0   # mm — disparo a más de esto de todo obstáculo = fantasma
+
+# Diámetro del AttaBot: unidad de normalización de las métricas del experimento
+# de topología (el radio del cuerpo que dibuja la Base es 75mm). Todas las
+# distancias del paper se reportan en múltiplos de d para que los resultados
+# sean comparables entre arenas y entre lab/simulación.
+ATTA_DIAMETER_MM = 105.0
+
+
+def _median(vals):
+    vals = sorted(vals)
+    n = len(vals)
+    return vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
 
 
 def session_tag(path):
@@ -153,12 +182,7 @@ def binned_path(window, bin_s=1.0):
     for t, x, y, *_ in window:
         bins.setdefault(int(t / bin_s), []).append((x, y))
 
-    def median(vals):
-        vals = sorted(vals)
-        n = len(vals)
-        return vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
-
-    centers = [(median([p[0] for p in pts]), median([p[1] for p in pts]))
+    centers = [(_median([p[0] for p in pts]), _median([p[1] for p in pts]))
                for _, pts in sorted(bins.items())]
     path = sum(math.dist(centers[i], centers[i + 1])
                for i in range(len(centers) - 1))
@@ -186,6 +210,613 @@ def run_metrics(run, track):
     }
     metrics.update(run)
     return metrics
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# MÉTRICAS DE CONGREGACIÓN GRUPAL
+# El experimento del paper: N robots se congregan bajo distintas topologías de
+# obstáculos. Estas métricas salen de los mismos PositionLogs/ConsoleLogs y
+# reutilizan el binning de 1s anti-jitter de binned_path().
+# ─────────────────────────────────────────────────────────────────────────
+
+def real_tracks(tracks):
+    """Descarta el marcador de origen (id 0) y no-reconocidos (id -1); deja los
+    robots (id ≥ 1) como {rid: track}."""
+    out = {}
+    for rid, track in tracks.items():
+        try:
+            if int(rid) >= 1:
+                out[rid] = track
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
+def binned_track(track, bin_s=1.0):
+    """{k: (x_med, y_med)} — mediana de posición por bin de bin_s s (anti-jitter,
+    misma idea que binned_path pero conservando el índice de bin para alinear
+    robots entre sí)."""
+    bins = {}
+    for t, x, y, *_ in track:
+        bins.setdefault(int(t / bin_s), []).append((x, y))
+    return {k: (_median([p[0] for p in pts]), _median([p[1] for p in pts]))
+            for k, pts in bins.items()}
+
+
+def detect_leader(events):
+    """Devuelve el idrobot del líder si algún mensaje declara 'soy líder'."""
+    for _t, rid, msg in events:
+        low = msg.lower()
+        if 'soy líder' in low or 'soy lider' in low:
+            return rid
+    return None
+
+
+def group_series(tracks, bin_s=1.0):
+    """Serie temporal grupal sobre los bins comunes a TODOS los robots.
+
+    Retorna [{'t', 'centroid', 'pos', 'spread', 'min_pair', 'compaction',
+              'compaction_d', 'rms_d'}].
+      - centroid  : media de las posiciones (centroide del enjambre)
+      - spread    : max_i ‖p_i − centroid‖ (radio del grupo)
+      - min_pair  : distancia mínima entre pares (proximidad de colisión)
+      - compaction: √(Σ_i ‖p_i − centroide‖²) — la compactación del enjambre
+        definida para el paper. Es una medida GRUPAL: penaliza a cualquier robot
+        rezagado, a diferencia de 'spread' que solo mira al peor.
+      - compaction_d : la anterior en diámetros de Atta (comparable entre arenas)
+      - rms_d     : √(Σd²/N) en diámetros — la versión por-robot, que sí es
+        comparable entre corridas con DISTINTO número de robots (compaction
+        crece con √N aunque el enjambre esté igual de apretado).
+    """
+    binned = {rid: binned_track(t, bin_s) for rid, t in tracks.items()}
+    binned = {rid: b for rid, b in binned.items() if b}
+    if len(binned) < 2:
+        return []
+    common = sorted(set.intersection(*[set(b) for b in binned.values()]))
+    series = []
+    for k in common:
+        pos = {rid: binned[rid][k] for rid in binned}
+        pts = list(pos.values())
+        cx = sum(p[0] for p in pts) / len(pts)
+        cy = sum(p[1] for p in pts) / len(pts)
+        dists = [math.dist(p, (cx, cy)) for p in pts]
+        spread = max(dists)
+        sum_sq = sum(d * d for d in dists)
+        compaction = math.sqrt(sum_sq)
+        pairs = [math.dist(a, b) for a, b in itertools.combinations(pts, 2)]
+        series.append({'t': k * bin_s, 'centroid': (cx, cy), 'pos': pos,
+                       'spread': spread, 'min_pair': min(pairs),
+                       'compaction': compaction,
+                       'compaction_d': compaction / ATTA_DIAMETER_MM,
+                       'rms_d': math.sqrt(sum_sq / len(pts)) / ATTA_DIAMETER_MM})
+    return series
+
+
+def convergence_time(series, radius, hold_s=3.0, t0=None):
+    """Primer instante ≥ t0 con spread ≤ radius sostenido ≥ hold_s (o hasta el
+    final del log). Retorna (t_abs, t_rel_a_t0, converged).
+
+    Solo cuenta la convergencia que ocurre DESPUÉS del inicio del episodio (t0 =
+    comando de congregación): si los robots ya arrancan agrupados, eso no es
+    'haber convergido'."""
+    if not series:
+        return None, None, False
+    if t0 is None:
+        t0 = series[0]['t']
+    after = [s for s in series if s['t'] >= t0]
+    for i, s in enumerate(after):
+        if s['spread'] > radius:
+            continue
+        # se mantiene ≤ radius durante los próximos hold_s segundos
+        if all(o['spread'] <= radius for o in after[i:]
+               if o['t'] <= s['t'] + hold_s):
+            return s['t'], round(s['t'] - t0, 1), True
+    return None, None, False
+
+
+def convergence_time_frac(series, radius, frac=0.9, hold_s=3.0, t0=None):
+    """Primer instante ≥ t0 con al menos `frac` de los robots dentro de `radius`
+    del centroide, sostenido ≥ hold_s. Retorna (t_abs, t_rel, converged).
+
+    Criterio del paper para enjambres grandes. `convergence_time` exige que
+    TODOS entren (spread ≤ R), así que un único rezagado define el tiempo de la
+    corrida entera — con 10 robots eso mide al peor, no al enjambre. Ojo: con 4
+    robots 90% ≡ ⌈3.6⌉ ≡ 4, o sea idéntico al criterio estricto; los dos recién
+    se separan a partir de ~10 robots.
+
+    El centroide es instantáneo (definición de JC). Tiene el efecto de que un
+    rezagado corre la referencia hacia sí mismo; es conservador, porque acerca
+    el centroide al que falta y aleja a los que ya llegaron.
+    """
+    if not series:
+        return None, None, False
+    if t0 is None:
+        t0 = series[0]['t']
+    after = [s for s in series if s['t'] >= t0]
+
+    def enough(s):
+        pts = list(s['pos'].values())
+        need = math.ceil(frac * len(pts))
+        inside = sum(1 for p in pts if math.dist(p, s['centroid']) <= radius)
+        return inside >= need
+
+    # Si el criterio YA se cumple al inicio del episodio, no hubo congregación
+    # que medir: el enjambre arrancó agrupado. Devolverlo como 0.0s metería
+    # ceros en los boxplots del paper. Pasa sistemáticamente con N=2, donde el
+    # centroide es el punto medio y "dentro del radio" ≡ estar a media distancia
+    # del otro robot.
+    if after and enough(after[0]):
+        return None, None, False
+
+    for i, s in enumerate(after):
+        if not enough(s):
+            continue
+        if all(enough(o) for o in after[i:] if o['t'] <= s['t'] + hold_s):
+            return s['t'], round(s['t'] - t0, 1), True
+    return None, None, False
+
+
+def per_robot_congregation(tracks, events, bin_s=1.0, t0=None):
+    """Por robot: recorrido, ratio de ruta, pose final y evasiones.
+
+    `t0` acota la medición al EPISODIO de congregación. Sin él, un GT previo en
+    la misma sesión se sumaba al recorrido y al conteo de evasiones, inflando el
+    ratio de ruta del run (medido 2026-07-27: 8.64 sobre el log completo contra
+    7.9 sobre el episodio). Para la campaña del paper esto no es cosmético.
+    """
+    out = {}
+    for rid, track in tracks.items():
+        if t0 is not None:
+            track = [s for s in track if s[0] >= t0]
+            if len(track) < 2:
+                continue
+        path, centers = binned_path(track, bin_s)
+        if not centers:
+            continue
+        straight = math.dist(centers[0], centers[-1]) if len(centers) >= 2 else 0.0
+        # eventos de evasión IR: disparos de evasión ('MOVE interrumpido por IR —
+        # evasión ...', 'Evasión ...'), excluyendo el 'Cooldown ... completado'
+        # (el fin de la maniobra). Es la medida de cuánto forzó evadir el campo.
+        evas = sum(1 for _t, r, m in events
+                   if r == rid and 'evasi' in m.lower()
+                   and 'cooldown' not in m.lower()
+                   and (t0 is None or _t >= t0))
+        out[rid] = {
+            'path_mm': round(path),
+            'straight_mm': round(straight),
+            'efficiency': round(straight / path, 2) if path > 0 else 0.0,
+            # Métrica de ruta del paper: recorrido ÷ distancia euclidiana directa.
+            # 1.0 = fue en línea recta; 3.0 = dio tres veces la vuelta necesaria.
+            # Es la inversa de 'efficiency', que se mantiene por compatibilidad.
+            # None si el robot casi no se desplazó (típicamente el LÍDER, que se
+            # queda quieto): ahí el cociente diverge —se midió 56.2 con 17mm de
+            # recta— y ensuciaría los boxplots. El umbral es un diámetro de Atta.
+            'route_ratio': (round(path / straight, 2)
+                            if straight >= ATTA_DIAMETER_MM else None),
+            'path_d': round(path / ATTA_DIAMETER_MM, 1),
+            'final': (round(centers[-1][0], 1), round(centers[-1][1], 1)),
+            'evasions': evas,
+        }
+    return out
+
+
+def congregation_metrics(tag, pos_path, con_path, radius=450.0, hold_s=3.0,
+                         t0=None, frac=0.9):
+    """Agrega todas las métricas grupales de una sesión en un dict, o None si no
+    hay ≥2 robots con trayectoria."""
+    tracks = real_tracks(load_positions(pos_path))
+    if len(tracks) < 2:
+        return None
+    events = load_console(con_path) if con_path else []
+    series = group_series(tracks)
+    if not series:
+        return None
+    # inicio del episodio: primer 'soy líder'/FORMATION/CONGREGATION, si existe
+    if t0 is None:
+        for _t, _rid, msg in events:
+            low = msg.lower()
+            if 'soy líder' in low or 'formación' in low or 'congregation' in low:
+                t0 = _t
+                break
+    t_abs, t_rel, conv = convergence_time(series, radius, hold_s, t0)
+    tf_abs, tf_rel, conv_f = convergence_time_frac(series, radius, frac, hold_s, t0)
+    final = series[-1]
+    return {
+        'session': tag,
+        'n_robots': len(tracks),
+        'leader': detect_leader(events),
+        'radius_mm': radius,
+        'converged': conv,
+        't_conv_abs_s': round(t_abs, 1) if t_abs is not None else None,
+        't_conv_s': t_rel,
+        # Criterio del paper: 'frac' de los robots dentro del radio
+        'frac': frac,
+        'converged_frac': conv_f,
+        't_conv_frac_s': tf_rel,
+        'final_compaction_d': round(final['compaction_d'], 2),
+        'final_rms_d': round(final['rms_d'], 2),
+        'min_compaction_d': round(min(s['compaction_d'] for s in series), 2),
+        'final_spread_mm': round(final['spread']),
+        'final_min_pair_mm': round(final['min_pair']),
+        'min_pair_ever_mm': round(min(s['min_pair'] for s in series)),
+        'final_centroid': (round(final['centroid'][0], 1),
+                           round(final['centroid'][1], 1)),
+        'per_robot': per_robot_congregation(tracks, events, t0=t0),
+        'series': series,
+    }
+
+
+def print_congregation(m, layout=None):
+    """Imprime el reporte grupal de una sesión."""
+    print(f"\n=== CONGREGACIÓN {m['session']}"
+          f"{'  [topología: ' + layout + ']' if layout else ''} ===")
+    lead = f" (líder Atta_{m['leader']})" if m['leader'] else ''
+    print(f"robots: {m['n_robots']}{lead}   radio de convergencia R={m['radius_mm']:.0f}mm")
+    if m['converged']:
+        print(f"CONVERGIÓ en {m['t_conv_s']:.1f} s "
+              f"(t absoluto {m['t_conv_abs_s']:.1f} s)")
+    else:
+        print(f"NO convergió a R={m['radius_mm']:.0f}mm "
+              f"(spread final {m['final_spread_mm']} mm)")
+    pct = int(m['frac'] * 100)
+    if m['converged_frac']:
+        print(f"{pct}% dentro de R en          : {m['t_conv_frac_s']:.1f} s")
+    else:
+        print(f"NO llegó a tener {pct}% dentro de R")
+    print(f"spread final (radio del grupo) : {m['final_spread_mm']} mm")
+    print(f"compactación final             : {m['final_compaction_d']:.2f} d "
+          f"(√Σd² al centroide; mejor de la corrida {m['min_compaction_d']:.2f} d)")
+    print(f"  ídem por robot (RMS)         : {m['final_rms_d']:.2f} d")
+    print(f"centroide final                : {m['final_centroid']} mm")
+    print(f"dist. mín. inter-robot (final) : {m['final_min_pair_mm']} mm"
+          f"   (mínimo histórico {m['min_pair_ever_mm']} mm)")
+    print(f"{'robot':>7} {'recorrido':>10} {'recta':>7} {'ratio':>6} "
+          f"{'evas':>4}  pose_final")
+    for rid in sorted(m['per_robot'], key=lambda r: int(r)):
+        p = m['per_robot'][rid]
+        ratio = f"{p['route_ratio']:.2f}" if p['route_ratio'] is not None else '  —'
+        print(f"  Atta_{rid:<2} {p['path_mm']:>9.0f} {p['straight_mm']:>7.0f} "
+              f"{ratio:>6} {p['evasions']:>4}  {p['final']}")
+
+
+# ── Estadística de la campaña ────────────────────────────────────────────────
+# ANOVA de una vía sin scipy (no está instalado). La beta incompleta regularizada
+# da el p-valor de F; es el algoritmo clásico de fracción continua (Lentz), y con
+# la simetría I_x(a,b) = 1 − I_{1−x}(b,a) converge en pocas iteraciones.
+
+def _betacf(a, b, x, itmax=200, eps=3e-7):
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c, d = 1.0, 1.0 - qab * x / qap
+    if abs(d) < 1e-30:
+        d = 1e-30
+    d = 1.0 / d
+    h = d
+    for m in range(1, itmax + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        c = 1.0 + aa / c
+        if abs(d) < 1e-30:
+            d = 1e-30
+        if abs(c) < 1e-30:
+            c = 1e-30
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        c = 1.0 + aa / c
+        if abs(d) < 1e-30:
+            d = 1e-30
+        if abs(c) < 1e-30:
+            c = 1e-30
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < eps:
+            break
+    return h
+
+
+def _betai(a, b, x):
+    """Beta incompleta regularizada I_x(a,b)."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    lbeta = (math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+             + a * math.log(x) + b * math.log(1.0 - x))
+    front = math.exp(lbeta)
+    if x < (a + 1.0) / (a + b + 2.0):
+        return front * _betacf(a, b, x) / a
+    return 1.0 - front * _betacf(b, a, 1.0 - x) / b
+
+
+def one_way_anova(groups):
+    """ANOVA de una vía sobre {etiqueta: [valores]}. Retorna dict con F, gl y p.
+
+    Compara la varianza ENTRE escenarios contra la varianza DENTRO de cada uno:
+    si los escenarios no influyeran, ambas estimarían lo mismo y F≈1.
+    """
+    gs = [v for v in groups.values() if len(v) >= 2]
+    if len(gs) < 2:
+        return None
+    n = sum(len(v) for v in gs)
+    k = len(gs)
+    grand = sum(sum(v) for v in gs) / n
+    ss_between = sum(len(v) * (sum(v) / len(v) - grand) ** 2 for v in gs)
+    ss_within = sum((x - sum(v) / len(v)) ** 2 for v in gs for x in v)
+    df1, df2 = k - 1, n - k
+    if df2 <= 0 or ss_within <= 0:
+        return None
+    F = (ss_between / df1) / (ss_within / df2)
+    p = _betai(df2 / 2.0, df1 / 2.0, df2 / (df2 + df1 * F))
+    return {'F': F, 'df1': df1, 'df2': df2, 'p': p, 'n': n, 'k': k}
+
+
+def load_manifest(path):
+    """Manifiesto de campaña: CSV con columnas session,scenario[,scenario_json].
+
+    Es explícito a propósito. Inferir el escenario del nombre del log haría que
+    un renombre silencioso reasignara corridas a otra condición experimental.
+    """
+    rows = []
+    with open(path) as f:
+        for r in csv.DictReader(f):
+            if not r.get('session') or not r.get('scenario'):
+                continue
+            rows.append({'session': r['session'].strip(),
+                         'scenario': r['scenario'].strip(),
+                         'scenario_json': (r.get('scenario_json') or '').strip()})
+    return rows
+
+
+def run_campaign(a):
+    """Consolida las corridas de la campaña y produce las figuras del paper.
+
+    Una fila por corrida (tiempo de congregación, compactación) y una por robot
+    por corrida (ratio de ruta), más el ANOVA de una vía sobre el escenario.
+    """
+    manifest = load_manifest(a.campaign)
+    if not manifest:
+        print(f'✗ Manifiesto vacío o ilegible: {a.campaign}')
+        return
+    available = {tag: (pos, con) for tag, pos, con in find_sessions()}
+
+    runs, robots, missing = [], [], []
+    scen_meta, series_by_scen = {}, {}
+    for entry in manifest:
+        match = [t for t in available if entry['session'] in t]
+        if not match:
+            missing.append(entry['session'])
+            continue
+        tag = match[-1]
+        pos, con = available[tag]
+        m = congregation_metrics(tag, pos, con, radius=a.radius, hold_s=a.hold,
+                                 frac=a.frac)
+        if m is None:
+            missing.append(entry['session'])
+            continue
+        sc = entry['scenario']
+
+        # métricas del escenario, si el sidecar de gen_world está disponible
+        if entry['scenario_json'] and sc not in scen_meta:
+            try:
+                with open(entry['scenario_json']) as f:
+                    scen_meta[sc] = json.load(f)
+            except (OSError, ValueError):
+                pass
+        meta = scen_meta.get(sc, {})
+
+        runs.append({
+            'session': tag, 'scenario': sc, 'n_robots': m['n_robots'],
+            't_conv_frac_s': m['t_conv_frac_s'],
+            't_conv_all_s': m['t_conv_s'],
+            'converged_frac': int(bool(m['converged_frac'])),
+            'final_compaction_d': m['final_compaction_d'],
+            'final_rms_d': m['final_rms_d'],
+            'occupancy_pct': meta.get('occupancy_pct'),
+            'obstacle_area_d': (meta.get('obstacle_area_d') or [None])[0],
+            'passage_d': meta.get('passage_d'),
+        })
+        for rid, p in m['per_robot'].items():
+            if p['route_ratio'] is None:
+                continue      # líder / robot que no se desplazó
+            robots.append({'session': tag, 'scenario': sc, 'robot': rid,
+                           'path_mm': p['path_mm'], 'straight_mm': p['straight_mm'],
+                           'route_ratio': p['route_ratio'],
+                           'evasions': p['evasions']})
+        series_by_scen.setdefault(sc, []).append(m['series'])
+
+    if missing:
+        print(f'⚠ {len(missing)} corrida(s) del manifiesto sin log utilizable: '
+              f'{", ".join(missing[:5])}{" …" if len(missing) > 5 else ""}')
+    if not runs:
+        print('✗ Ninguna corrida utilizable.')
+        return
+
+    order = sorted({r['scenario'] for r in runs})
+    print(f'\n=== CAMPAÑA: {len(runs)} corridas, {len(order)} escenarios ===')
+    print(f'{"escenario":<22}{"n":>3}{"t_90%(s)":>10}{"compact(d)":>12}'
+          f'{"ruta":>8}{"ocup%":>7}{"pasaje(d)":>10}')
+    for sc in order:
+        rr = [r for r in runs if r['scenario'] == sc]
+        ts = [r['t_conv_frac_s'] for r in rr if r['t_conv_frac_s'] is not None]
+        cs = [r['final_compaction_d'] for r in rr]
+        rt = [x['route_ratio'] for x in robots if x['scenario'] == sc]
+        meta = scen_meta.get(sc, {})
+        print(f'{sc:<22}{len(rr):>3}'
+              f'{(_median(ts) if ts else float("nan")):>10.1f}'
+              f'{_median(cs):>12.2f}{(_median(rt) if rt else float("nan")):>8.2f}'
+              f'{(meta.get("occupancy_pct") or float("nan")):>7.2f}'
+              f'{(meta.get("passage_d") or float("nan")):>10.2f}')
+        if len(ts) < len(rr):
+            print(f'{"":22}   ({len(rr) - len(ts)} sin converger — excluidas '
+                  f'de la mediana de tiempo)')
+
+    for label, groups in (
+            ('tiempo de congregación (90%)',
+             {sc: [r['t_conv_frac_s'] for r in runs
+                   if r['scenario'] == sc and r['t_conv_frac_s'] is not None]
+              for sc in order}),
+            ('ratio de ruta',
+             {sc: [x['route_ratio'] for x in robots if x['scenario'] == sc]
+              for sc in order})):
+        res = one_way_anova(groups)
+        if res is None:
+            print(f'\nANOVA {label}: insuficientes datos')
+            continue
+        sig = '***' if res['p'] < 0.001 else '**' if res['p'] < 0.01 else \
+              '*' if res['p'] < 0.05 else 'n.s.'
+        print(f'\nANOVA {label}: F({res["df1"]},{res["df2"]})={res["F"]:.2f}  '
+              f'p={res["p"]:.4g}  {sig}   (n={res["n"]}, k={res["k"]})')
+
+    stem = a.campaign_out or 'campana'
+    with open(f'{stem}_runs.csv', 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=list(runs[0].keys()))
+        w.writeheader()
+        w.writerows(runs)
+    with open(f'{stem}_robots.csv', 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=list(robots[0].keys()))
+        w.writeheader()
+        w.writerows(robots)
+    print(f'\nDatos: {stem}_runs.csv · {stem}_robots.csv')
+
+    if a.plot:
+        try:
+            plot_campaign(runs, robots, series_by_scen, order, stem)
+            print(f'Figuras: {stem}_boxplots.png · {stem}_compactacion.png · '
+                  f'{stem}_heatmaps.png')
+        except ImportError:
+            print('  (matplotlib no disponible — omito las figuras)')
+
+
+def plot_campaign(runs, robots, series_by_scen, order, stem):
+    """Las cuatro figuras del paper: boxplots de tiempo y de ruta, dispersión de
+    compactación en t, y heatmaps de ocupación por escenario."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    # 1) boxplots de tiempo y de ruta
+    fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+    tdata = [[r['t_conv_frac_s'] for r in runs
+              if r['scenario'] == sc and r['t_conv_frac_s'] is not None]
+             for sc in order]
+    rdata = [[x['route_ratio'] for x in robots if x['scenario'] == sc]
+             for sc in order]
+    for axi, data, title, ylab in (
+            (ax[0], tdata, 'Tiempo de congregación (90% en el radio)', 's'),
+            (ax[1], rdata, 'Ratio de ruta por robot', 'recorrido ÷ recta')):
+        # set_xticklabels en vez del kwarg labels/tick_labels: el nombre cambió
+        # entre versiones de matplotlib (3.11 ya no acepta 'labels')
+        axi.boxplot([d if d else [float('nan')] for d in data])
+        axi.set_xticks(range(1, len(order) + 1))
+        axi.set_xticklabels(order)
+        axi.set_title(title)
+        axi.set_ylabel(ylab)
+        axi.grid(alpha=0.3)
+        axi.tick_params(axis='x', rotation=20)
+    ax[1].axhline(1.0, color='g', ls='--', lw=1, label='trayecto directo')
+    ax[1].legend()
+    fig.tight_layout()
+    fig.savefig(f'{stem}_boxplots.png', dpi=130)
+    plt.close(fig)
+
+    # 2) compactación en t: una curva por corrida, coloreada por escenario
+    fig, axc = plt.subplots(figsize=(9, 5))
+    colors = plt.cm.tab10(np.linspace(0, 1, max(len(order), 2)))
+    for i, sc in enumerate(order):
+        for j, series in enumerate(series_by_scen.get(sc, [])):
+            if not series:
+                continue
+            t0 = series[0]['t']
+            axc.plot([s['t'] - t0 for s in series],
+                     [s['compaction_d'] for s in series],
+                     color=colors[i], alpha=0.55, lw=1.2,
+                     label=sc if j == 0 else None)
+    axc.set_xlabel('t desde el inicio del episodio (s)')
+    axc.set_ylabel('compactación  √Σd²  (diámetros de Atta)')
+    axc.set_title('Compactación del enjambre en el tiempo')
+    axc.grid(alpha=0.3)
+    axc.legend()
+    fig.tight_layout()
+    fig.savefig(f'{stem}_compactacion.png', dpi=130)
+    plt.close(fig)
+
+    # 3) heatmaps de ocupación por escenario (todas las poses de todas las corridas)
+    n = len(order)
+    fig, axh = plt.subplots(1, n, figsize=(4.2 * n, 3.6), squeeze=False)
+    for i, sc in enumerate(order):
+        xs, ys = [], []
+        for series in series_by_scen.get(sc, []):
+            for s in series:
+                for (px, py) in s['pos'].values():
+                    xs.append(px)
+                    ys.append(py)
+        axi = axh[0][i]
+        if xs:
+            axi.hexbin(xs, ys, gridsize=28, cmap='inferno', mincnt=1)
+            axi.invert_yaxis()      # marco de cámara: y hacia abajo
+        axi.set_title(sc, fontsize=10)
+        axi.set_aspect('equal')
+    fig.suptitle('Ocupación espacial por escenario')
+    fig.tight_layout()
+    fig.savefig(f'{stem}_heatmaps.png', dpi=130)
+    plt.close(fig)
+
+
+def plot_congregation(m, out_path, layout=None, obstacles=None):
+    """Figura de 3 paneles: trayectorias, spread vs t (con R y T_conv), y
+    dist. mínima inter-robot vs t. Requiere matplotlib."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    series = m['series']
+    ts = [s['t'] for s in series]
+    fig, ax = plt.subplots(1, 3, figsize=(16, 4.5))
+
+    # (1) trayectorias
+    rids = sorted(m['per_robot'], key=lambda r: int(r))
+    for rid in rids:
+        xs = [s['pos'][rid][0] for s in series if rid in s['pos']]
+        ys = [s['pos'][rid][1] for s in series if rid in s['pos']]
+        ax[0].plot(xs, ys, '-', lw=1.2, label=f'Atta_{rid}')
+        if xs:
+            ax[0].plot(xs[0], ys[0], 'o', ms=6)
+            ax[0].plot(xs[-1], ys[-1], 's', ms=7)
+    for ox, oy, *rest in (obstacles or []):
+        w = rest[0] if rest else 150
+        ax[0].add_patch(plt.Rectangle((ox - w / 2, oy - w / 2), w, w,
+                                      color='0.5', alpha=0.6))
+    cx, cy = m['final_centroid']
+    ax[0].plot(cx, cy, 'k*', ms=12, label='centroide')
+    ax[0].set_title(f"Trayectorias{'  ['+layout+']' if layout else ''}")
+    ax[0].set_xlabel('x (mm)'); ax[0].set_ylabel('y (mm)')
+    ax[0].set_aspect('equal', 'box'); ax[0].legend(fontsize=8); ax[0].grid(alpha=0.3)
+
+    # (2) spread (radio del grupo) vs t
+    ax[1].plot(ts, [s['spread'] for s in series], '-', color='C3')
+    ax[1].axhline(m['radius_mm'], ls='--', color='0.4', label=f"R={m['radius_mm']:.0f}mm")
+    if m['converged']:
+        ax[1].axvline(m['t_conv_abs_s'], ls=':', color='C2',
+                      label=f"T_conv={m['t_conv_s']:.1f}s")
+    ax[1].set_title('Radio del grupo (max dist. al centroide)')
+    ax[1].set_xlabel('t (s)'); ax[1].set_ylabel('spread (mm)')
+    ax[1].legend(fontsize=8); ax[1].grid(alpha=0.3)
+
+    # (3) distancia mínima inter-robot vs t
+    ax[2].plot(ts, [s['min_pair'] for s in series], '-', color='C0')
+    ax[2].set_title('Distancia mínima inter-robot')
+    ax[2].set_xlabel('t (s)'); ax[2].set_ylabel('min pairwise (mm)')
+    ax[2].grid(alpha=0.3)
+
+    fig.suptitle(f"Congregación — {m['session']}", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=110)
+    plt.close(fig)
+    return out_path
 
 
 def analyze_session(tag, pos_path, con_path, verbose=True):
@@ -234,30 +865,206 @@ def summarize(runs):
     if not ok:
         return
 
-    def median(vals):
-        vals = sorted(vals)
-        n = len(vals)
-        return vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
-
-    print(f"convergencia mediana : {median([r['duration_s'] for r in ok]):.1f} s")
-    print(f"pasos medianos       : {median([r['steps'] for r in ok]):.0f}")
-    print(f"eficiencia mediana   : {median([r['efficiency'] for r in ok]):.2f}")
+    print(f"convergencia mediana : {_median([r['duration_s'] for r in ok]):.1f} s")
+    print(f"pasos medianos       : {_median([r['steps'] for r in ok]):.0f}")
+    print(f"eficiencia mediana   : {_median([r['efficiency'] for r in ok]):.2f}")
     errs = [r['final_error_mm'] for r in ok if r['final_error_mm'] is not None]
     if errs:
-        print(f"error final mediano  : {median(errs):.0f} mm (n={len(errs)})")
+        print(f"error final mediano  : {_median(errs):.0f} mm (n={len(errs)})")
     print(f"evasiones totales    : {sum(r['evasions'] for r in runs)}")
+
+
+def run_congregation(sessions, a):
+    """Modo grupal: métricas de congregación por sesión (tiempo de convergencia,
+    centroide, dist. inter-robot, y recorrido por robot)."""
+    rows = []       # una fila por robot por sesión (para el CSV del paper)
+    for tag, pos, con in sessions:
+        m = congregation_metrics(tag, pos, con, radius=a.radius, hold_s=a.hold,
+                                 frac=a.frac)
+        if m is None:
+            if not a.all:
+                print(f'{tag}: sin ≥2 robots con trayectoria — no aplica congregación')
+            continue
+        if not a.all:
+            print_congregation(m, layout=a.layout)
+        if a.plot:
+            try:
+                out = os.path.join(BASE_DIR, f'congreg_{tag}.png')
+                plot_congregation(m, out, layout=a.layout)
+                print(f'  figura → {out}')
+            except ImportError:
+                print('  (matplotlib no disponible — omito la figura)')
+        for rid, p in m['per_robot'].items():
+            rows.append({
+                'session': tag, 'layout': a.layout or '',
+                'robot': rid, 'is_leader': int(rid == m['leader']),
+                'n_robots': m['n_robots'], 'radius_mm': m['radius_mm'],
+                'converged': int(m['converged']), 't_conv_s': m['t_conv_s'],
+                'robot_path_mm': p['path_mm'], 'robot_efficiency': p['efficiency'],
+                'robot_final_x': p['final'][0], 'robot_final_y': p['final'][1],
+                'robot_evasions': p['evasions'],
+                'final_spread_mm': m['final_spread_mm'],
+                'final_min_pair_mm': m['final_min_pair_mm'],
+                'min_pair_ever_mm': m['min_pair_ever_mm'],
+            })
+        if a.all:
+            conv = f"{m['t_conv_s']:.1f}s" if m['converged'] else 'NO'
+            print(f"{tag:<34} {m['n_robots']} rob  conv={conv:<7} "
+                  f"spread_fin={m['final_spread_mm']:>5}mm  "
+                  f"min_pair={m['min_pair_ever_mm']:>5}mm")
+
+    if a.csv and rows:
+        cols = ['session', 'layout', 'robot', 'is_leader', 'n_robots',
+                'radius_mm', 'converged', 't_conv_s', 'robot_path_mm',
+                'robot_efficiency', 'robot_final_x', 'robot_final_y',
+                'robot_evasions', 'final_spread_mm', 'final_min_pair_mm',
+                'min_pair_ever_mm']
+        with open(a.csv, 'w', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
+            w.writeheader()
+            w.writerows(rows)
+        print(f'\nMétricas de congregación exportadas a {a.csv}')
+
+
+# ── Calibración / prueba de IR (Fase 1) ──────────────────────────────────────
+# El log de CHECK_OBSTACLE ya trae la pose del robot al disparar:
+#   CHECK_OBSTACLE|<bitmap>|<x>|<y>|<angle>
+# → cada disparo dice QUÉ canales se activaron y DÓNDE estaba el robot, así que
+# la distancia de detección y los fantasmas salen del propio log (sin cámara).
+def ir_channels(bitmap):
+    """bitmap (4·IZQ+2·CEN+1·DER) → lista de canales activos."""
+    return [name for bit, name in IR_BITS if bitmap & bit]
+
+
+def load_check_obstacle(path):
+    """[(t, robot_id, bitmap, x, y, ang)] del ConsoleLog. Tolera el formato
+    viejo sin pose (x=y=ang=None)."""
+    out = []
+    for t, rid, msg in load_console(path):
+        if not msg.startswith('CHECK_OBSTACLE'):
+            continue
+        parts = msg.split('|')
+        try:
+            bm = int(float(parts[1]))
+        except (IndexError, ValueError):
+            continue
+        x = y = ang = None
+        if len(parts) >= 5:
+            try:
+                x, y, ang = float(parts[2]), float(parts[3]), float(parts[4])
+            except ValueError:
+                x = y = ang = None
+        out.append((t, rid, bm, x, y, ang))
+    return out
+
+
+def print_ir(tag, events, obstacles):
+    print(f'\n=== CALIBRACIÓN IR  {tag} ===')
+    if obstacles:
+        print('obstáculo(s) (mm): ' +
+              '  '.join(f'({x:.0f},{y:.0f})' for x, y in obstacles))
+        print(f'distancia = centro del robot → obstáculo más cercano; '
+              f'fantasma = disparo a >{IR_GHOST_DIST:.0f}mm de todo obstáculo')
+    else:
+        print('modo LIBRE (sin --obstacle): se asume arena vacía ⇒ TODO disparo '
+              'IR es un fantasma')
+    robots = sorted({e[1] for e in events},
+                    key=lambda r: int(r) if r.isdigit() else 1e9)
+    print(f'\n{"robot":<8}{"canal":<6}{"disparos":>9}{"cen→obst med/min":>18}'
+          f'{"fantasmas":>11}  recomendación')
+    for rid in robots:
+        rev = [e for e in events if e[1] == rid]
+        for ch in ('IZQ', 'CEN', 'DER'):
+            fires = [e for e in rev if ch in ir_channels(e[2])]
+            if not fires:
+                continue
+            dists, ghosts, nopose = [], 0, 0
+            for (_t, _r, _bm, x, y, _ang) in fires:
+                if x is None:
+                    nopose += 1
+                    continue
+                if obstacles:
+                    d = min(math.dist((x, y), o) for o in obstacles)
+                    (dists.append(d) if d <= IR_GHOST_DIST else None)
+                    ghosts += d > IR_GHOST_DIST
+                else:
+                    ghosts += 1
+            det = f'{_median(dists):.0f}/{min(dists):.0f}' if dists else '—'
+            rec = ''
+            if ghosts >= 5 and ghosts >= 0.6 * (len(fires) - nopose or 1):
+                rec = f'SENSOR_MASK|{IR_MASK[ch]}|1  (fantasma {ghosts}/{len(fires)})'
+            elif not dists and obstacles and ch in ('IZQ', 'DER'):
+                rec = '¿sensor muerto? nunca cerca del obstáculo'
+            print(f'{"Atta_" + rid:<8}{ch:<6}{len(fires):>9}{det:>18}'
+                  f'{ghosts:>11}  {rec}')
+    note = ('CEN = proximidad APDS9960 (no IR). Un fantasma persistente en IZQ/DER '
+            'se enmascara con la recomendación; re-enviar tras CALIBRATE.')
+    print(f'\n  nota: {note}')
+
+
+def run_ir(sessions, a):
+    obstacles = []
+    for spec in (a.obstacle or []):
+        xs = spec.split(',')
+        try:
+            obstacles.append((float(xs[0]), float(xs[1])))
+        except (IndexError, ValueError):
+            print(f'--obstacle inválido: "{spec}" (esperado x,y en mm)')
+            return
+    any_ev = False
+    for tag, _pos, con in sessions:
+        if con is None:
+            continue
+        events = load_check_obstacle(con)
+        if not events:
+            continue
+        any_ev = True
+        print_ir(tag, events, obstacles)
+    if not any_ev:
+        print('Sin eventos CHECK_OBSTACLE en la(s) sesión(es). ¿El robot navegó '
+              'hacia el obstáculo con el debug de obstáculos activo?')
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     ap.add_argument('--session', help='tag parcial, ej. 03-07_10-04 o SIM')
     ap.add_argument('--all', action='store_true', help='todas las sesiones')
-    ap.add_argument('--csv', help='exportar los runs a un CSV')
+    ap.add_argument('--csv', help='exportar a un CSV')
+    ap.add_argument('--congregation', action='store_true',
+                    help='métricas de congregación grupal (centroide, convergencia,'
+                         ' dist. inter-robot, recorrido por robot)')
+    ap.add_argument('--radius', type=float, default=450.0,
+                    help='radio de convergencia R en mm (spread ≤ R = congregados)')
+    ap.add_argument('--hold', type=float, default=3.0,
+                    help='segundos que el spread debe mantenerse ≤ R')
+    ap.add_argument('--layout', help='etiqueta de topología de obstáculos del run')
+    ap.add_argument('--campaign', metavar='MANIFIESTO',
+                    help='modo campaña: CSV con session,scenario[,scenario_json] '
+                         '— consolida los runs, saca boxplots/heatmaps y el ANOVA')
+    ap.add_argument('--campaign-out', metavar='PREFIJO',
+                    help='prefijo de los archivos de salida de la campaña')
+    ap.add_argument('--frac', type=float, default=0.9,
+                    help='fracción de robots dentro de R para dar la congregación '
+                         'por lograda (default 0.9 = criterio del paper)')
+    ap.add_argument('--plot', action='store_true',
+                    help='guardar figura congreg_<sesión>.png (requiere matplotlib)')
+    ap.add_argument('--ir', action='store_true',
+                    help='calibración/prueba de IR: distancia de detección por canal '
+                         '(IZQ/CEN/DER) y fantasmas, desde CHECK_OBSTACLE')
+    ap.add_argument('--obstacle', nargs='*', metavar='X,Y',
+                    help='posición(es) del obstáculo colocado (mm cámara) para el '
+                         'modo --ir; sin esto, arena vacía ⇒ todo disparo = fantasma')
     a = ap.parse_args()
 
     sessions = find_sessions()
     if not sessions:
         print('No hay PositionLogs')
+        return
+
+    # La campaña resuelve sus propias sesiones desde el manifiesto, no desde
+    # --session/--all: cada corrida viene emparejada con su escenario.
+    if a.campaign:
+        run_campaign(a)
         return
 
     if a.session:
@@ -267,6 +1074,14 @@ def main():
             return
     elif not a.all:
         sessions = sessions[-1:]   # la más reciente
+
+    if a.ir:
+        run_ir(sessions, a)
+        return
+
+    if a.congregation:
+        run_congregation(sessions, a)
+        return
 
     runs = []
     for tag, pos, con in sessions:
