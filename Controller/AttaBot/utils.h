@@ -304,7 +304,15 @@ struct CongregationState {
     float slotX = 0, slotY = 0;  // slot final (etapa 2 de la aproximación)
     bool stagingDone = false;    // true al alcanzar el waypoint de aproximación
     float slotAngle = 0;         // rad, latcheado al primer LEADER_POSITION
+    float slotRadius = 300;      // mm — el anillo puede CRECER si el líder quedó
+                                 // contra una pared (SafeRingSlotAngle)
     bool slotAngleSet = false;   // evita que el slot salte de lado en camino
+    // El slot de n==1 se deriva de la pose PROPIA (bearing líder→robot), así que
+    // no puede latcharse hasta tener una pose fresca de cámara. El 2026-07-27 se
+    // latcheaba con el primer LEADER_POSITION, 0.4s ANTES del primer
+    // POSITION_RESPONSE: quedaba anclado a una lectura vieja y el robot salía
+    // hacia el lado opuesto, sin recalcular nunca.
+    bool poseFresh = false;      // hay pose de cámara posterior al CONGREGATION
     // Formación (FORMATION): "" = congregación clásica (círculo). "linea"/"cuna"
     // usan slot perpendicular al heading del líder; "circulo" = igual que la
     // congregación. formationAxis rota el eje de la fila (fallback de la Base
@@ -327,7 +335,9 @@ struct CongregationState {
         slotY = 0;
         stagingDone = false;
         slotAngle = 0;
+        slotRadius = 300;
         slotAngleSet = false;
+        poseFresh = false;
         formationShape = "";
         formationAxis  = 0;
     }
@@ -380,6 +390,13 @@ struct DisperseState {
     float  nX[MAX_NEIGHBORS];
     float  nY[MAX_NEIGHBORS];
     int    nCount = 0;
+    // Pose PROPIA tal como venía en ese mismo mensaje. La manda la Base junto a
+    // las demás; se guarda aparte porque MEET reparte los slots con el greedy de
+    // cercanía y todos los robots tienen que correrlo sobre EL MISMO barrido: si
+    // cada uno usara su robotPose para sí mismo (más fresca) y la del mensaje
+    // para los demás, dos podrían elegir el mismo slot.
+    float  selfX = 0, selfY = 0;
+    bool   selfSeen = false;
 
     bool IsActive() { return target > 0; }
 
@@ -390,6 +407,7 @@ struct DisperseState {
         dminIdx = 0;
         dminCount = 0;
         nCount = 0;
+        selfSeen = false;
     }
 
     // Mediana móvil de las últimas 3 dmin — espejo de sorted(hist)[len//2] del
@@ -598,6 +616,16 @@ struct ReactiveNav {
     float avoidSegment      = 120;   // mm por segmento cuando hay obstáculo
     float avoidFrontAngle   = 90.0f; // grados a girar si obstáculo frontal
     float avoidSideAngle    = 35.0f; // grados de bias si obstáculo lateral
+    // Re-apuntar solo si el rumbo se desvía MÁS que esto. Tiene que quedar por
+    // ENCIMA del ruido angular de la fuente de pose: el ángulo crudo de ArUco
+    // mide σ≈3.8° (medido 2026-07-27 sobre un robot quieto), así que con el
+    // valor viejo de 5° uno de cada cuatro ciclos giraba por puro ruido —y el
+    // giro se calculaba con esa misma lectura ruidosa, metiendo error real.
+    float realignThreshold  = 12.0f; // grados
+    // Histéresis del goal: ignorar reubicaciones menores a esto. CONGREGATION
+    // reescribe el goal a ~3Hz con la pose cruda del líder; sin banda muerta,
+    // su jitter (rango 80mm) se traduce en re-apuntados constantes.
+    float goalDeadband      = 40.0f; // mm
 
     unsigned long startTime = 0;
     const unsigned long maxNavTime = 180000; // 3 min timeout
@@ -672,6 +700,15 @@ struct EKFState {
         while (a >  PI) a -= 2.0f * PI;
         while (a < -PI) a += 2.0f * PI;
         return a;
+    }
+
+    // Des-ancla el filtro: la próxima corrección ArUco lo re-inicializa desde
+    // cero. Necesario porque Predict() sigue integrando odometría aunque no
+    // haya correcciones (entre comandos, durante evasiones, con la nav parada),
+    // y esa deriva se acumulaba de sesión en sesión: el 2026-07-27 se midió un
+    // estado a 78m de la realidad, con y=-4289mm fuera de la arena.
+    void Reset() {
+        initialized = false;
     }
 
     void Init(float px, float py, float angleDeg) {
