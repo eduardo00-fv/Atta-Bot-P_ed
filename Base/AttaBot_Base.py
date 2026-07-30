@@ -405,6 +405,10 @@ class Base(object):
         self.simVision = None             # instancia de SimVision
         self.simConfig = {}               # sección 'simulation' del JSON
         self.scenarioConfig = {}          # sección 'scenario' del JSON (arena física)
+        # Cuánto esperar una detección ArUco buena antes de dejar sin responder un
+        # REQUEST_POSITION. El ArUco titila por posición y el timeout del firmware
+        # es de 5s, así que rendirse en el primer frame malo sale carísimo.
+        self.poseWaitTimeout = 0.5        # s
         self.logTag = ''                  # 'SIM_' en los nombres de log de sim
         # --- Enjambre: broadcast periódico de posiciones (dispersión/flocking) ---
         self._lastNeighborCast = 0.0
@@ -1884,14 +1888,40 @@ class Base(object):
             return
 
         robot = self.robots[robotID]
+
+        # Reintento corto en vez de rendirse en el primer frame malo.
+        #
+        # getPose() mira SOLO la detección del frame actual, y el ArUco titila
+        # según la posición en la arena (reflejo especular del acrílico, zonas de
+        # sombra). Antes, un único frame sin detección justo cuando llegaba el
+        # pedido hacía que la base no contestara nada, y el robot se comía el
+        # timeout completo del firmware (5s) + 500ms de espera antes de reintentar.
+        # O sea que un titileo de 30ms costaba 5.5s de inmovilidad: es la causa de
+        # los robots que "quedan estáticos" en ciertas zonas (2026-07-29).
+        # Acá se espera a la próxima detección buena, que suele llegar en 1-3
+        # frames, y se responde con una pose REAL — no interpolada.
+        deadline = time.time() + self.poseWaitTimeout
+        started = time.time()
         x, y, angle = robot.getPose()
-        if x == -1 and y == -1 and angle == -1:
-            print(f"Posición no disponible para robot {robotID} (no visible en ArUco)")
+        while x == -1 and time.time() < deadline:
+            time.sleep(0.02)
+            x, y, angle = robot.getPose()
+
+        waited = time.time() - started
+        if x == -1:
+            self.log(f'⚠ {robot.name}: sin detección ArUco tras '
+                     f'{waited * 1000:.0f}ms — sin responder, el robot va a '
+                     f'reintentar')
             return
 
         message = f'POSITION_RESPONSE|{x}|{y}|{angle}'
         self.sendInstruction(robotIP, [message], False)
-        self.log(f'Posición enviada a {robot.name}: x={x}, y={y}, angle={angle}')
+        # El titileo recuperado se loguea para poder medirlo después: si esto
+        # aparece seguido, el problema de iluminación/reflejo es real y vale
+        # atacarlo en el montaje, no solo tolerarlo acá.
+        recovered = f' (recuperada tras {waited * 1000:.0f}ms de titileo)' if waited > 0.03 else ''
+        self.log(f'Posición enviada a {robot.name}: x={x}, y={y}, '
+                 f'angle={angle}{recovered}')
 
 
     # =========================================================================

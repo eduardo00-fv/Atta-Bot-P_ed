@@ -297,7 +297,13 @@ struct CongregationState {
     float globalTargetY = 0;
     unsigned long lastRequestTime = 0;
     bool waitingForResponse = false;
-    const unsigned long requestTimeout = 5000;
+    // La respuesta de la base llega en ~30ms o no llega: es un UDP en LAN contra
+    // una detección del frame actual. Los 5000ms que había acá castigaban con 5s
+    // de inmovilidad cada titileo del ArUco (la base no respondía si el marcador
+    // estaba apagado en ese frame). Con el reintento corto del lado de la base
+    // este timeout ya casi no se alcanza; queda en 1500ms para que, cuando se
+    // alcance de verdad, el robot reintente rápido en vez de quedarse plantado.
+    const unsigned long requestTimeout = 1500;
     int followerIndex = 0;    // slot asignado por la Base (0-based)
     int totalFollowers = 1;   // total de seguidores en la congregación
     float parkingDist = 300;  // mm del líder al slot — NAV_CONFIG|PARKING_DIST
