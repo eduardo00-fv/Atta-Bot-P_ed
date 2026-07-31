@@ -2670,12 +2670,28 @@ void ReadUdpPackets() {
     congregation.globalTargetX = arguments[1].toFloat();
     congregation.globalTargetY = arguments[2].toFloat();
 
-    // n sale de los vecinos que este robot conoce; el anillo, de la misma
-    // fórmula que usaba la Base (250mm de arco por robot) para que con muchos
-    // robots no queden los slots pegados.
+    // n sale de los vecinos que este robot conoce; el anillo, de la SEPARACIÓN
+    // que se quiere entre slots vecinos: R = sep / (2·sin(π/n)) es el radio con
+    // el que la cuerda entre dos slots contiguos mide exactamente MEET_SEP.
+    //
+    // Antes era max(300, n·250/2π): arco por robot (no cuerda) y un piso de
+    // 300mm que con pocos robots abría el grupo de gordo — con 4 robots pedía
+    // 159mm y el piso lo subía a 300, dejándolos a 424mm entre sí. Con muchos
+    // robots ambas fórmulas coinciden (n=10: 398 vs 405mm), así que esto solo
+    // aprieta la congregación chica, que es donde sobraba radio.
+    //
+    // MEET|x|y|R fuerza el radio (mismo rango que NAV_CONFIG|PARKING_DIST) para
+    // tantear en vivo sin reflashear; sin el 3er argumento manda la fórmula.
+    const float MEET_SEP  = 250.0f;   // mm centro a centro entre slots vecinos
+    const float MEET_RMIN = 200.0f;   // piso: cuerpo 150mm + error de pose
     int n = disperse.nCount + 1;
     if (n > DisperseState::MAX_NEIGHBORS + 1) n = DisperseState::MAX_NEIGHBORS + 1;
-    float ring = max(300.0f, n * 250.0f / (2.0f * PI));
+    float ring = (n >= 2) ? MEET_SEP / (2.0f * sinf(PI / n)) : MEET_RMIN;
+    if (ring < MEET_RMIN) ring = MEET_RMIN;
+    if (arguments[3] != "") {
+      float forced = arguments[3].toFloat();
+      if (forced >= 150.0f && forced <= 600.0f) ring = forced;
+    }
     congregation.parkingDist    = ring;
     congregation.totalFollowers = n;
     congregation.followerIndex  = MeetSlotIndex(congregation.globalTargetX,
@@ -2689,10 +2705,10 @@ void ReadUdpPackets() {
     ekf.Reset();
     instructionList.clear();
 
-    MessageDebugf("DEBUG: -1, ID: %s, MEET en (%.0f,%.0f), slot %d/%d",
+    MessageDebugf("DEBUG: -1, ID: %s, MEET en (%.0f,%.0f), slot %d/%d, anillo %.0fmm",
                   robotID.c_str(), congregation.globalTargetX,
                   congregation.globalTargetY, congregation.followerIndex,
-                  congregation.totalFollowers);
+                  congregation.totalFollowers, ring);
 
     fsmInstruction[0] = WAIT;
     fsmInstruction[1] = robotID.toInt() * 200;   // arranque escalonado
