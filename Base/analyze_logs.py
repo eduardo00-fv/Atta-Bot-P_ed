@@ -263,6 +263,157 @@ def binned_track(track, bin_s=1.0):
             for k, pts in bins.items()}
 
 
+def moving_bins(tracks, bin_s=1.0, move_mm=40.0):
+    """{rid: {k: bool}} — si el robot se desplazó entre el bin k−1 y el k.
+
+    Se mide sobre la mediana por bin, no sobre linearDisplacement crudo: con
+    σ≈30mm de ruido ArUco un robot QUIETO reporta desplazamientos de ≥4mm a
+    20Hz, así que ninguna fase tendría borde. La mediana de ~20 muestras baja
+    el ruido a ~8mm y deja el umbral de 40mm holgado contra los ~180mm/s reales.
+    """
+    out = {}
+    for rid, track in tracks.items():
+        b = binned_track(track, bin_s)
+        flags = {}
+        for k in sorted(b):
+            prev = b.get(k - 1)
+            flags[k] = prev is not None and math.dist(b[k], prev) >= move_mm
+        out[rid] = flags
+    return out
+
+
+def _blocks(active, bins, gap_s=8.0, bin_s=1.0):
+    """[(t_ini, t_fin)] — bloques de actividad contiguos tolerando pausas de
+    hasta `gap_s`.
+
+    La tolerancia hace falta porque un robot en random walk alterna avance y
+    GIRO EN EL MISMO SITIO, y el giro no desplaza el centro: sin ella cada giro
+    partiría la fase en dos. Y separar por bloques (en vez de tomar el primer o
+    el último bin con movimiento) evita que un blip suelto —el operador
+    acomodando un robot antes de arrancar— defina el borde de una fase.
+    """
+    out = []
+    for k in bins:
+        if not active.get(k):
+            continue
+        if out and (k - out[-1][1]) * bin_s <= gap_s:
+            out[-1][1] = k
+        else:
+            out.append([k, k])
+    return [(a * bin_s, b * bin_s) for a, b in out]
+
+
+def detect_phases(tracks, events, bin_s=1.0, move_mm=40.0, gap_s=8.0,
+                  min_block_s=10.0):
+    """Separa la corrida en RANDOM WALK → tiempo muerto → MEET (congregación).
+
+    El protocolo del lab es: la base manda RANDOMW, los robots caminan, se
+    quedan quietos, y el operador manda el MEET A MANO. La base no loguea los
+    comandos que envía, así que las tres fases se infieren:
+
+      - `meet_start`: primer REQUEST_POSITION de cualquier robot. Durante el
+        random walk el robot nunca pide su pose y durante el MEET la pide
+        continuamente, así que el borde es limpio (verificado en las 15 corridas
+        del 30-07). Sin ConsoleLog se cae al valle de quietud más largo, que es
+        el mismo instante pero con ±1 bin de incertidumbre.
+      - `rw_end`: último bin con movimiento ANTES de meet_start.
+      - `dead_s`: rw_end → meet_start. Es el tiempo del OPERADOR, no del
+        experimento: incluirlo en la duración de la corrida (que es lo que da
+        el largo del log o del video) la infla 20-60s.
+      - `rw_start`: primer bin con movimiento. No es 0: la base ya está
+        grabando cuando se manda el RANDOMW.
+
+    Retorna None si no se puede ubicar el arranque del MEET.
+    """
+    flags = moving_bins(tracks, bin_s, move_mm)
+    if not flags:
+        return None
+    all_bins = sorted({k for f in flags.values() for k in f})
+    if not all_bins:
+        return None
+    active = {k: any(f.get(k) for f in flags.values()) for k in all_bins}
+
+    meet_start, source = None, None
+    for t, _rid, msg in events:
+        if msg.strip() == 'REQUEST_POSITION':
+            meet_start, source = t, 'REQUEST_POSITION'
+            break
+    if meet_start is None:
+        # Fallback sin consola: el hueco de quietud más largo que no sea el
+        # arranque ni el final del log.
+        best, gap0 = 0, None
+        run0 = None
+        for k in all_bins:
+            if not active[k]:
+                run0 = k if run0 is None else run0
+            elif run0 is not None:
+                if k - run0 > best and run0 > all_bins[0]:
+                    best, gap0 = k - run0, k
+                run0 = None
+        if gap0 is None:
+            return None
+        meet_start, source = gap0 * bin_s, 'valle de quietud'
+
+    blocks = _blocks(active, all_bins, gap_s, bin_s)
+    if not blocks:
+        return None
+    # El random walk es el último bloque LARGO anterior al MEET. Exigir
+    # `min_block_s` descarta los blips de manipulación: sin eso, un solo bin de
+    # movimiento a 30s del comando se tomaba como toda la caminata (rw_s=0.0).
+    # Un bloque que CRUZA el comando es la congregación, no la caminata: se
+    # recorta en el comando y así solo compite por ser RW con su parte previa,
+    # que en las corridas del 30-07 son décimas de segundo.
+    prev = [(a, min(b, meet_start)) for a, b in blocks if a < meet_start]
+    long_prev = [b for b in prev if b[1] - b[0] >= min_block_s]
+    rw_start, rw_end = (long_prev or prev or [(meet_start, meet_start)])[-1]
+    # La congregación llega hasta que el enjambre deja de moverse. Se toma el
+    # ÚLTIMO bloque largo posterior al comando, no el primero: una congregación
+    # puede pausarse (robot esperando pose, evasión) y retomar, y quedarse con
+    # el primer bloque decía '32s' en corridas donde los robots seguían dando
+    # vueltas a los 290s. Los bloques cortos del final sí se ignoran: son jitter
+    # de marcador, no movimiento.
+    post = [b for b in blocks if b[1] >= meet_start]
+    long_post = [b for b in post if b[1] - b[0] >= min_block_s]
+    last_move = (long_post or post or [(meet_start, meet_start)])[-1][1]
+
+    return {
+        'source': source,
+        'rw_start_s': round(rw_start, 1),
+        'rw_end_s': round(rw_end, 1),
+        'rw_s': round(rw_end - rw_start, 1),
+        'meet_start_s': round(meet_start, 1),
+        'dead_s': round(meet_start - rw_end, 1),
+        'last_move_s': round(last_move, 1),
+        # Duración del MEET medida hasta que se detiene el último robot. Es el
+        # techo: el criterio del 90% (t_conv_frac) suele cortar antes.
+        'meet_s': round(last_move - meet_start, 1),
+        'log_s': round(all_bins[-1] * bin_s, 1),
+    }
+
+
+def per_robot_phases(tracks, phases, bin_s=1.0, move_mm=40.0):
+    """Por robot: cuánto tiempo estuvo EN MOVIMIENTO en cada fase y cuándo se
+    detuvo definitivamente durante el MEET.
+
+    `t_stop_s` es el tiempo de congregación de ESE robot (relativo al comando
+    MEET): el instante de su último desplazamiento. Un robot que ya nace en su
+    slot da 0.0 y uno que nunca se asienta da la duración completa.
+    """
+    flags = moving_bins(tracks, bin_s, move_mm)
+    m0 = phases['meet_start_s']
+    out = {}
+    for rid, f in flags.items():
+        rw = [k for k, mv in f.items()
+              if mv and phases['rw_start_s'] <= k * bin_s < m0]
+        mt = [k for k, mv in f.items() if mv and k * bin_s >= m0]
+        out[rid] = {
+            'rw_active_s': round(len(rw) * bin_s, 1),
+            'meet_active_s': round(len(mt) * bin_s, 1),
+            't_stop_s': round(max(mt) * bin_s - m0, 1) if mt else 0.0,
+        }
+    return out
+
+
 def detect_leader(events):
     """Devuelve el idrobot del líder si algún mensaje declara 'soy líder'."""
     for _t, rid, msg in events:
@@ -438,6 +589,12 @@ def congregation_metrics(tag, pos_path, con_path, radius=450.0, hold_s=3.0,
             if 'soy líder' in low or 'formación' in low or 'congregation' in low:
                 t0 = _t
                 break
+    # Sin esos mensajes (debug del seguidor apagado, que es el caso de todo el
+    # dataset del 30-07) el episodio arrancaría en 0 y el random walk entero
+    # entraría en el tiempo de congregación y en el recorrido de cada robot.
+    phases = detect_phases(tracks, events)
+    if t0 is None and phases:
+        t0 = phases['meet_start_s']
     t_abs, t_rel, conv = convergence_time(series, radius, hold_s, t0)
     tf_abs, tf_rel, conv_f = convergence_time_frac(series, radius, frac, hold_s, t0)
     final = series[-1]
@@ -461,6 +618,9 @@ def congregation_metrics(tag, pos_path, con_path, radius=450.0, hold_s=3.0,
         'min_pair_ever_mm': round(min(s['min_pair'] for s in series)),
         'final_centroid': (round(final['centroid'][0], 1),
                            round(final['centroid'][1], 1)),
+        't0_s': round(t0, 1) if t0 is not None else None,
+        'phases': phases,
+        'robot_phases': per_robot_phases(tracks, phases) if phases else {},
         'per_robot': per_robot_congregation(tracks, events, t0=t0),
         'series': series,
     }
@@ -472,6 +632,16 @@ def print_congregation(m, layout=None):
           f"{'  [topología: ' + layout + ']' if layout else ''} ===")
     lead = f" (líder Atta_{m['leader']})" if m['leader'] else ''
     print(f"robots: {m['n_robots']}{lead}   radio de convergencia R={m['radius_mm']:.0f}mm")
+    ph = m.get('phases')
+    if ph:
+        print(f"FASES (inicio del MEET por {ph['source']}):")
+        print(f"  random walk   {ph['rw_start_s']:>6.1f} → {ph['rw_end_s']:>6.1f} s"
+              f"   ({ph['rw_s']:.1f} s)")
+        print(f"  tiempo muerto {ph['rw_end_s']:>6.1f} → {ph['meet_start_s']:>6.1f} s"
+              f"   ({ph['dead_s']:.1f} s — operador, no cuenta)")
+        print(f"  congregación  {ph['meet_start_s']:>6.1f} → {ph['last_move_s']:>6.1f} s"
+              f"   ({ph['meet_s']:.1f} s hasta que se detiene el último)")
+        print(f"  log completo  {ph['log_s']:.1f} s")
     if m['converged']:
         print(f"CONVERGIÓ en {m['t_conv_s']:.1f} s "
               f"(t absoluto {m['t_conv_abs_s']:.1f} s)")
@@ -491,12 +661,16 @@ def print_congregation(m, layout=None):
     print(f"dist. mín. inter-robot (final) : {m['final_min_pair_mm']} mm"
           f"   (mínimo histórico {m['min_pair_ever_mm']} mm)")
     print(f"{'robot':>7} {'recorrido':>10} {'recta':>7} {'ratio':>6} "
-          f"{'evas':>4}  pose_final")
+          f"{'evas':>4} {'RW act':>7} {'MEET act':>9} {'se detuvo':>10}  pose_final")
+    rp = m.get('robot_phases', {})
     for rid in sorted(m['per_robot'], key=lambda r: int(r)):
         p = m['per_robot'][rid]
+        f = rp.get(rid, {})
         ratio = f"{p['route_ratio']:.2f}" if p['route_ratio'] is not None else '  —'
         print(f"  Atta_{rid:<2} {p['path_mm']:>9.0f} {p['straight_mm']:>7.0f} "
-              f"{ratio:>6} {p['evasions']:>4}  {p['final']}")
+              f"{ratio:>6} {p['evasions']:>4} "
+              f"{f.get('rw_active_s', 0):>6.0f}s {f.get('meet_active_s', 0):>8.0f}s "
+              f"{f.get('t_stop_s', 0):>9.0f}s  {p['final']}")
 
 
 # ── Estadística de la campaña ────────────────────────────────────────────────
@@ -574,10 +748,17 @@ def one_way_anova(groups):
 
 
 def load_manifest(path):
-    """Manifiesto de campaña: CSV con columnas session,scenario[,scenario_json].
+    """Manifiesto de campaña: CSV con columnas
+    session,scenario[,arranque][,scenario_json].
 
     Es explícito a propósito. Inferir el escenario del nombre del log haría que
     un renombre silencioso reasignara corridas a otra condición experimental.
+
+    `arranque` es el segundo factor del diseño del lab (ASop/APar/ALin): la
+    aleatorización de poses iniciales que pide el protocolo. Se arrastra para
+    poder verificar que NO explica la varianza — si la explicara, las tres
+    corridas de un escenario no serían repeticiones intercambiables y el ANOVA
+    por escenario estaría mal planteado.
     """
     rows = []
     with open(path) as f:
@@ -586,6 +767,7 @@ def load_manifest(path):
                 continue
             rows.append({'session': r['session'].strip(),
                          'scenario': r['scenario'].strip(),
+                         'arranque': (r.get('arranque') or '').strip(),
                          'scenario_json': (r.get('scenario_json') or '').strip()})
     return rows
 
@@ -627,24 +809,38 @@ def run_campaign(a):
                 pass
         meta = scen_meta.get(sc, {})
 
+        ph = m.get('phases') or {}
         runs.append({
-            'session': tag, 'scenario': sc, 'n_robots': m['n_robots'],
+            'session': tag, 'scenario': sc, 'arranque': entry['arranque'],
+            'n_robots': m['n_robots'],
             't_conv_frac_s': m['t_conv_frac_s'],
             't_conv_all_s': m['t_conv_s'],
             'converged_frac': int(bool(m['converged_frac'])),
             'final_compaction_d': m['final_compaction_d'],
             'final_rms_d': m['final_rms_d'],
+            # Fases: sin esto la única duración disponible es el largo del log,
+            # que mezcla la caminata aleatoria y el tiempo del operador.
+            'rw_s': ph.get('rw_s'),
+            'dead_s': ph.get('dead_s'),
+            'meet_s': ph.get('meet_s'),
+            'log_s': ph.get('log_s'),
             'occupancy_pct': meta.get('occupancy_pct'),
             'obstacle_area_d': (meta.get('obstacle_area_d') or [None])[0],
             'passage_d': meta.get('passage_d'),
         })
+        rp = m.get('robot_phases', {})
         for rid, p in m['per_robot'].items():
             if p['route_ratio'] is None:
                 continue      # líder / robot que no se desplazó
-            robots.append({'session': tag, 'scenario': sc, 'robot': rid,
+            f = rp.get(rid, {})
+            robots.append({'session': tag, 'scenario': sc,
+                           'arranque': entry['arranque'], 'robot': rid,
                            'path_mm': p['path_mm'], 'straight_mm': p['straight_mm'],
                            'route_ratio': p['route_ratio'],
-                           'evasions': p['evasions']})
+                           'evasions': p['evasions'],
+                           'rw_active_s': f.get('rw_active_s'),
+                           'meet_active_s': f.get('meet_active_s'),
+                           't_stop_s': f.get('t_stop_s')})
         series_by_scen.setdefault(sc, []).append(m['series'])
 
     if missing:
@@ -656,21 +852,28 @@ def run_campaign(a):
 
     order = sorted({r['scenario'] for r in runs})
     print(f'\n=== CAMPAÑA: {len(runs)} corridas, {len(order)} escenarios ===')
-    print(f'{"escenario":<22}{"n":>3}{"t_90%(s)":>10}{"compact(d)":>12}'
-          f'{"ruta":>8}{"ocup%":>7}{"pasaje(d)":>10}')
+    print(f'{"escenario":<16}{"n":>3}{"RW(s)":>8}{"muerto":>8}{"MEET(s)":>9}'
+          f'{"t_90%(s)":>10}{"compact(d)":>12}{"ruta":>8}{"ocup%":>7}'
+          f'{"pasaje(d)":>10}')
     for sc in order:
         rr = [r for r in runs if r['scenario'] == sc]
         ts = [r['t_conv_frac_s'] for r in rr if r['t_conv_frac_s'] is not None]
         cs = [r['final_compaction_d'] for r in rr]
         rt = [x['route_ratio'] for x in robots if x['scenario'] == sc]
         meta = scen_meta.get(sc, {})
-        print(f'{sc:<22}{len(rr):>3}'
+
+        def med(key):
+            v = [r[key] for r in rr if r.get(key) is not None]
+            return _median(v) if v else float('nan')
+
+        print(f'{sc:<16}{len(rr):>3}'
+              f'{med("rw_s"):>8.1f}{med("dead_s"):>8.1f}{med("meet_s"):>9.1f}'
               f'{(_median(ts) if ts else float("nan")):>10.1f}'
               f'{_median(cs):>12.2f}{(_median(rt) if rt else float("nan")):>8.2f}'
               f'{(meta.get("occupancy_pct") or float("nan")):>7.2f}'
               f'{(meta.get("passage_d") or float("nan")):>10.2f}')
         if len(ts) < len(rr):
-            print(f'{"":22}   ({len(rr) - len(ts)} sin converger — excluidas '
+            print(f'{"":16}   ({len(rr) - len(ts)} sin converger — excluidas '
                   f'de la mediana de tiempo)')
 
     for label, groups in (
@@ -689,6 +892,20 @@ def run_campaign(a):
               '*' if res['p'] < 0.05 else 'n.s.'
         print(f'\nANOVA {label}: F({res["df1"]},{res["df2"]})={res["F"]:.2f}  '
               f'p={res["p"]:.4g}  {sig}   (n={res["n"]}, k={res["k"]})')
+
+    # Control del segundo factor. Si el arranque saliera significativo, las
+    # corridas de un mismo escenario no serían repeticiones intercambiables.
+    arr = sorted({r['arranque'] for r in runs if r['arranque']})
+    if len(arr) > 1:
+        res = one_way_anova({x: [r['t_conv_frac_s'] for r in runs
+                                 if r['arranque'] == x
+                                 and r['t_conv_frac_s'] is not None]
+                             for x in arr})
+        if res is not None:
+            sig = 'SIGNIFICATIVO ⚠' if res['p'] < 0.05 else 'n.s. (bien: es ruido)'
+            print(f'\nANOVA control por arranque (tiempo 90%): '
+                  f'F({res["df1"]},{res["df2"]})={res["F"]:.2f}  '
+                  f'p={res["p"]:.4g}  {sig}')
 
     stem = a.campaign_out or 'campana'
     with open(f'{stem}_runs.csv', 'w', newline='') as f:

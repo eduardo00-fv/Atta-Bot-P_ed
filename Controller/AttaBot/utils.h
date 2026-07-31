@@ -384,7 +384,12 @@ struct CongregationState {
  *   cambia el montaje de la cámara.
  ***************************************************************************************/
 struct DisperseState {
-    static const int MAX_NEIGHBORS = 8;
+    // 11 = enjambre de hasta 12 robots. Con el valor viejo (8) MEET topaba en 9
+    // y el experimento de 10 robots se rompía en silencio: cada robot conservaba
+    // los 8 vecinos que llegaron primero, o sea un insumo DISTINTO por robot, y
+    // el reparto de slots dejaba de coincidir entre ellos (que es justo lo que
+    // lo hace funcionar sin negociar). Cuesta 3 String + 6 float de RAM.
+    static const int MAX_NEIGHBORS = 11;
     float target  = 0;           // mm de separación objetivo (0 = inactivo)
     bool  settled = false;
     int   blocked = 0;           // rondas esperando a un id menor (anti-deadlock)
