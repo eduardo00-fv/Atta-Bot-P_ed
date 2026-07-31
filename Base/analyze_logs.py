@@ -80,12 +80,32 @@ def session_tag(path):
 
 
 def find_sessions():
-    """Retorna [(tag, position_csv, console_csv|None)] ordenado por mtime."""
-    positions = sorted(glob.glob(os.path.join(POS_DIR, 'Position_Log_*.csv')),
+    """Retorna [(tag, position_csv, console_csv|None)] ordenado por mtime.
+
+    Acepta CUALQUIER csv en PositionLogs, no solo 'Position_Log_*': en el lab las
+    corridas se renombran al escenario (SinObs_ALin.csv) apenas terminan, y con
+    el glob viejo esas quedaban invisibles para todas las herramientas.
+
+    El emparejamiento con la consola es por nombre y, si falla, por mtime (±90s):
+    al renombrar a mano es fácil renombrar el PositionLog y olvidar el Console_Log,
+    y ambos archivos se cierran juntos al final de la corrida.
+    """
+    positions = sorted(glob.glob(os.path.join(POS_DIR, '*.csv')),
                        key=os.path.getmtime)
-    consoles = {session_tag(p): p
-                for p in glob.glob(os.path.join(CON_DIR, 'Console_Log_*.csv'))}
-    return [(session_tag(p), p, consoles.get(session_tag(p))) for p in positions]
+    consoles = glob.glob(os.path.join(CON_DIR, '*.csv'))
+    by_tag = {session_tag(p): p for p in consoles}
+
+    out = []
+    for p in positions:
+        tag = session_tag(p)
+        con = by_tag.get(tag)
+        if con is None and consoles:
+            near = min(consoles, key=lambda c: abs(os.path.getmtime(c)
+                                                   - os.path.getmtime(p)))
+            if abs(os.path.getmtime(near) - os.path.getmtime(p)) <= 90:
+                con = near
+        out.append((tag, p, con))
+    return out
 
 
 def load_console(path):
@@ -1122,6 +1142,61 @@ def run_ir(sessions, a):
               'hacia el obstáculo con el debug de obstáculos activo?')
 
 
+def visibility(pos_path):
+    """{rid: {'vis_pct', 'gap_max_s', 'gaps'}} — cuánto tiempo se vio cada marker.
+
+    El PositionLog solo escribe fila cuando el robot se movió ≥4mm/4°, así que un
+    hueco NO prueba pérdida de marker. Se cuenta como pérdida solo si el robot
+    reaparece en otro lado (>60mm): quieto no deja filas, pero tampoco se mueve.
+    """
+    tracks = real_tracks(load_positions(pos_path))
+    if not tracks:
+        return {}
+    tmax = max(p[0] for t in tracks.values() for p in t)
+    out = {}
+    for rid, track in tracks.items():
+        track = sorted(track)
+        seen = {int(p[0]) for p in track}
+        gaps = []
+        for a, b in zip(track, track[1:]):
+            dt = b[0] - a[0]
+            if dt >= 1.0 and math.dist((a[1], a[2]), (b[1], b[2])) > 60.0:
+                gaps.append(dt)
+        out[rid] = {'vis_pct': 100.0 * len(seen) / (int(tmax) + 1),
+                    'gap_max_s': max(gaps) if gaps else 0.0,
+                    'gaps': len(gaps)}
+    return out
+
+
+def run_vis(sessions, a):
+    """Chequeo rápido post-corrida: ¿esta corrida sirve o hay que repetirla?
+
+    Pensado para correrlo en el lab entre experimento y experimento, cuando lo
+    único que importa es la decisión repetir/seguir — no las métricas finales.
+    """
+    for tag, pos, con in sessions:
+        vis = visibility(pos)
+        if not vis:
+            print(f'\n{tag}: sin datos de posición')
+            continue
+        ekf = load_ekf_pairs(pos) if con else {}
+        peor = min(v['vis_pct'] for v in vis.values())
+        veredicto = ('OK' if peor >= 85 else
+                     'ACEPTABLE' if peor >= 75 else
+                     'REPETIR (marker perdido demasiado tiempo)')
+        print(f'\n=== {tag} ===   peor visibilidad {peor:.0f}%  →  {veredicto}')
+        print(f'{"robot":>7}{"visible":>9}{"huecos":>8}{"peor hueco":>12}'
+              f'{"err EKF":>10}')
+        for rid in sorted(vis, key=lambda r: int(r)):
+            v = vis[rid]
+            errs = [math.dist((cx, cy), (ex, ey))
+                    for _t, cx, cy, _ca, ex, ey, _ea in ekf.get(rid, [])]
+            err = f'{_median(errs):.0f}mm' if len(errs) >= 20 else '—'
+            marca = '  ⚠' if v['vis_pct'] < 85 else ''
+            print(f'  Atta_{rid:<2}{v["vis_pct"]:>8.0f}%{v["gaps"]:>8}'
+                  f'{v["gap_max_s"]:>11.1f}s{err:>10}{marca}')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     ap.add_argument('--session', help='tag parcial, ej. 03-07_10-04 o SIM')
@@ -1148,6 +1223,9 @@ def main():
     ap.add_argument('--ir', action='store_true',
                     help='calibración/prueba de IR: distancia de detección por canal '
                          '(IZQ/CEN/DER) y fantasmas, desde CHECK_OBSTACLE')
+    ap.add_argument('--vis', action='store_true',
+                    help='chequeo rápido post-corrida: visibilidad del marker por '
+                         'robot y veredicto repetir/seguir')
     ap.add_argument('--ekf', action='store_true',
                     help='error del EKF del firmware contra el ArUco (pasivo, no '
                          'necesita EKF_NAV activo): mediana/p95/máx por robot')
@@ -1174,6 +1252,10 @@ def main():
             return
     elif not a.all:
         sessions = sessions[-1:]   # la más reciente
+
+    if a.vis:
+        run_vis(sessions, a)
+        return
 
     if a.ekf:
         run_ekf(sessions, a)
