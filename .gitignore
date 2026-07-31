@@ -25,3 +25,10 @@ Base/Logs/
 # Figuras de salida de la simulación (se regeneran al correr la sim)
 sim_output_*.png
 Base/markers_svg/
+
+# Videos de la campana de simulacion: 1.8GB, no van al repo
+Base/simulacion_31-07/Videos/
+
+# Copia del dataset que armo el usuario para compartir (incluye videos)
+Base/analisis_30-07/data/
+Base/analisis_30-07.zip
