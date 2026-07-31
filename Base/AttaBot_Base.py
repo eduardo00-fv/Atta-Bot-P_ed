@@ -1415,6 +1415,11 @@ class Base(object):
                 ret, frame = self.simVision.read()
             else:
                 ret, frame = self.camera.read()
+            # Sello de tiempo del FRAME, no del final del procesamiento: la
+            # detección ArUco tarda distinto en cada frame (según cuántos
+            # markers vea), así que timestampear después metía esa varianza
+            # dentro del Δt entre filas del log.
+            frameTime = time.time()
 
             if not ret or frame is None:
                 failCount += 1
@@ -1486,7 +1491,13 @@ class Base(object):
                         # initializeVideoAndLogging falló — reintentar en el próximo frame
                         continue
 
-                timeLog = round((time.time() - self.startTime), 1)
+                # 3 decimales (ms). Con 1 decimal el redondeo era más grueso que
+                # el período de frame (~33-66ms): varias filas caían en el mismo
+                # instante y otras saltaban 0.1s, así que cualquier Δt derivado
+                # del log (velocidad, tiempo entre eventos) salía escalonado o
+                # dividía por cero. Los consumidores (analyze_logs, scan_logs,
+                # turn_check) leen con float(), así que aceptan ambos formatos.
+                timeLog = round(frameTime - self.startTime, 3)
                 processingStart = time.time()
                 if time.time() - lastStatusTime >= 2.0:
                     lastStatusTime = time.time()
@@ -1661,7 +1672,9 @@ class Base(object):
         - resultsFrame (ndarray): Frame de resultados.
         - timeLog (float): Tiempo transcurrido en segundos.
         """
-        cv2.putText(frame, f'Time: {timeLog} s', (2, 26),
+        # 1 decimal en el overlay a propósito: el CSV lleva ms, pero en el video
+        # un número que cambia en la 3a cifra cada frame no se puede leer.
+        cv2.putText(frame, f'Time: {timeLog:.1f} s', (2, 26),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 200, 200), 1, cv2.LINE_AA)
         # Enviar a la GUI si está disponible; siempre encolar para grabación en disco
         if self.gui is not None:
@@ -1836,7 +1849,10 @@ class Base(object):
 
             if self.simMode or ip != self.baseIP:
                 message = data.decode()
-                timeLog = round(time.time() - self.startTime, 1)
+                # Misma resolución que el PositionLog: analyze_logs cruza ambos
+                # por ventana de tiempo y con 0.1s no se podía ordenar el orden
+                # real de dos mensajes del mismo décimo de segundo.
+                timeLog = round(time.time() - self.startTime, 3)
 
                 robotFound = False
                 for robot in self.robots.values():
@@ -2468,7 +2484,9 @@ class Base(object):
 
         Formato: 'robotId.instrucción' o comandos especiales:
             BROADCAST.instrucción
-            BROADCAST.MEET|x|y  (congregación sobre un punto, sin líder)
+            BROADCAST.MEET|x|y[|radio]  (congregación sobre un punto, sin líder;
+                                         radio 150-600mm, por defecto lo calcula
+                                         el firmware según cuántos robots hay)
             CONGREGATION.leaderID
             GOTO.robotID x y
             STATUS.(cualquier cosa)
