@@ -1,0 +1,16 @@
+session,scenario,scenario_json,rep,clearance_mm
+SIM_31-07_15-28_Robots_10,SinObs,/home/thrain/Documents/AttaBot-Sim/webots/worlds/camp_SinObs_r1.scenario.json,1,
+SIM_31-07_15-30_Robots_10,SinObs,/home/thrain/Documents/AttaBot-Sim/webots/worlds/camp_SinObs_r2.scenario.json,2,
+SIM_31-07_15-31_Robots_10,SinObs,/home/thrain/Documents/AttaBot-Sim/webots/worlds/camp_SinObs_r3.scenario.json,3,
+SIM_31-07_15-33_Robots_10,BosqueD_D2,/home/thrain/Documents/AttaBot-Sim/webots/worlds/camp_BosqueD_D2_r1.scenario.json,1,-1.2
+SIM_31-07_15-40_Robots_10,BosqueD_D2,/home/thrain/Documents/AttaBot-Sim/webots/worlds/camp_BosqueD_D2_r2.scenario.json,2,-1.1
+SIM_31-07_15-46_Robots_10,BosqueD_D2,/home/thrain/Documents/AttaBot-Sim/webots/worlds/camp_BosqueD_D2_r3.scenario.json,3,-1.1
+SIM_31-07_15-53_Robots_10,BosqueD_D4,/home/thrain/Documents/AttaBot-Sim/webots/worlds/camp_BosqueD_D4_r1.scenario.json,1,20.0
+SIM_31-07_15-55_Robots_10,BosqueD_D4,/home/thrain/Documents/AttaBot-Sim/webots/worlds/camp_BosqueD_D4_r2.scenario.json,2,21.2
+SIM_31-07_15-58_Robots_10,BosqueD_D4,/home/thrain/Documents/AttaBot-Sim/webots/worlds/camp_BosqueD_D4_r3.scenario.json,3,17.6
+SIM_31-07_16-01_Robots_10,BosqueG_D2,/home/thrain/Documents/AttaBot-Sim/webots/worlds/camp_BosqueG_D2_r1.scenario.json,1,-0.7
+SIM_31-07_16-07_Robots_10,BosqueG_D2,/home/thrain/Documents/AttaBot-Sim/webots/worlds/camp_BosqueG_D2_r2.scenario.json,2,-0.4
+SIM_31-07_16-14_Robots_10,BosqueG_D2,/home/thrain/Documents/AttaBot-Sim/webots/worlds/camp_BosqueG_D2_r3.scenario.json,3,-0.9
+SIM_31-07_16-20_Robots_10,BosqueG_D4,/home/thrain/Documents/AttaBot-Sim/webots/worlds/camp_BosqueG_D4_r1.scenario.json,1,23.5
+SIM_31-07_16-23_Robots_10,BosqueG_D4,/home/thrain/Documents/AttaBot-Sim/webots/worlds/camp_BosqueG_D4_r2.scenario.json,2,14.8
+SIM_31-07_16-25_Robots_10,BosqueG_D4,/home/thrain/Documents/AttaBot-Sim/webots/worlds/camp_BosqueG_D4_r3.scenario.json,3,24.2

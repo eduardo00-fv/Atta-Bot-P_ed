@@ -485,9 +485,17 @@ def convergence_time(series, radius, hold_s=3.0, t0=None):
     return None, None, False
 
 
-def convergence_time_frac(series, radius, frac=0.9, hold_s=3.0, t0=None):
+def convergence_time_frac(series, radius, frac=0.9, hold_s=3.0, t0=None,
+                          target=None):
     """Primer instante ≥ t0 con al menos `frac` de los robots dentro de `radius`
-    del centroide, sostenido ≥ hold_s. Retorna (t_abs, t_rel, converged).
+    del centroide —o de `target`, si el experimento tiene un punto fijo—,
+    sostenido ≥ hold_s. Retorna (t_abs, t_rel, converged).
+
+    **Con destino fijo hay que pasar `target`.** Medido contra el centroide, un
+    enjambre que se ATASCÓ antes de la barrera cuenta como convergido, porque
+    quedó apretado alrededor de su propio centroide: en la campaña de sim del
+    31-07 los escenarios de 2 diámetros daban 27s de "convergencia" con el
+    centroide a 865-1664mm del punto y solo 2 de 10 robots del otro lado.
 
     Criterio del paper para enjambres grandes. `convergence_time` exige que
     TODOS entren (spread ≤ R), así que un único rezagado define el tiempo de la
@@ -508,7 +516,8 @@ def convergence_time_frac(series, radius, frac=0.9, hold_s=3.0, t0=None):
     def enough(s):
         pts = list(s['pos'].values())
         need = math.ceil(frac * len(pts))
-        inside = sum(1 for p in pts if math.dist(p, s['centroid']) <= radius)
+        ref = target if target is not None else s['centroid']
+        inside = sum(1 for p in pts if math.dist(p, ref) <= radius)
         return inside >= need
 
     # Si el criterio YA se cumple al inicio del episodio, no hubo congregación
@@ -572,7 +581,7 @@ def per_robot_congregation(tracks, events, bin_s=1.0, t0=None):
 
 
 def congregation_metrics(tag, pos_path, con_path, radius=450.0, hold_s=3.0,
-                         t0=None, frac=0.9):
+                         t0=None, frac=0.9, target=None):
     """Agrega todas las métricas grupales de una sesión en un dict, o None si no
     hay ≥2 robots con trayectoria."""
     tracks = real_tracks(load_positions(pos_path))
@@ -596,8 +605,16 @@ def congregation_metrics(tag, pos_path, con_path, radius=450.0, hold_s=3.0,
     if t0 is None and phases:
         t0 = phases['meet_start_s']
     t_abs, t_rel, conv = convergence_time(series, radius, hold_s, t0)
-    tf_abs, tf_rel, conv_f = convergence_time_frac(series, radius, frac, hold_s, t0)
+    tf_abs, tf_rel, conv_f = convergence_time_frac(series, radius, frac, hold_s,
+                                                   t0, target)
     final = series[-1]
+    # Con destino fijo, "llegaron" es su propia métrica y no se deduce del
+    # spread: dice cuántos cruzaron, que es lo que compara las topologías.
+    arrived = dist_target = None
+    if target is not None:
+        arrived = sum(1 for p in final['pos'].values()
+                      if math.dist(p, target) <= radius)
+        dist_target = round(math.dist(final['centroid'], target))
     return {
         'session': tag,
         'n_robots': len(tracks),
@@ -619,6 +636,9 @@ def congregation_metrics(tag, pos_path, con_path, radius=450.0, hold_s=3.0,
         'final_centroid': (round(final['centroid'][0], 1),
                            round(final['centroid'][1], 1)),
         't0_s': round(t0, 1) if t0 is not None else None,
+        'target': target,
+        'arrived': arrived,
+        'centroid_to_target_mm': dist_target,
         'phases': phases,
         'robot_phases': per_robot_phases(tracks, phases) if phases else {},
         'per_robot': per_robot_congregation(tracks, events, t0=t0),
@@ -768,6 +788,7 @@ def load_manifest(path):
             rows.append({'session': r['session'].strip(),
                          'scenario': r['scenario'].strip(),
                          'arranque': (r.get('arranque') or '').strip(),
+                         'target': (r.get('target') or '').strip(),
                          'scenario_json': (r.get('scenario_json') or '').strip()})
     return rows
 
@@ -793,8 +814,20 @@ def run_campaign(a):
             continue
         tag = match[-1]
         pos, con = available[tag]
+        # El punto de destino sale del manifiesto (columna `target`) y --target
+        # lo pisa para toda la campaña. Sin él el criterio va contra el
+        # centroide, que en un experimento con destino fijo premia al enjambre
+        # que se atascó antes de la barrera.
+        tgt = None
+        raw = a.target or entry['target']
+        if raw:
+            try:
+                tx, ty = (float(v) for v in raw.split(','))
+                tgt = (tx, ty)
+            except ValueError:
+                pass
         m = congregation_metrics(tag, pos, con, radius=a.radius, hold_s=a.hold,
-                                 frac=a.frac)
+                                 frac=a.frac, target=tgt)
         if m is None:
             missing.append(entry['session'])
             continue
@@ -816,6 +849,8 @@ def run_campaign(a):
             't_conv_frac_s': m['t_conv_frac_s'],
             't_conv_all_s': m['t_conv_s'],
             'converged_frac': int(bool(m['converged_frac'])),
+            'arrived': m['arrived'],
+            'centroid_to_target_mm': m['centroid_to_target_mm'],
             'final_compaction_d': m['final_compaction_d'],
             'final_rms_d': m['final_rms_d'],
             # Fases: sin esto la única duración disponible es el largo del log,
@@ -826,7 +861,14 @@ def run_campaign(a):
             'log_s': ph.get('log_s'),
             'occupancy_pct': meta.get('occupancy_pct'),
             'obstacle_area_d': (meta.get('obstacle_area_d') or [None])[0],
-            'passage_d': meta.get('passage_d'),
+            # El pasaje que importa es el EFECTIVO (cuello de botella de la ruta
+            # más holgada). `passage_d` es el mínimo sobre TODOS los pares y
+            # paredes, y encuentra rincones apretados fuera de camino: en la
+            # campaña del 31-07 daba 0.57d para los escenarios de 2 diámetros y
+            # 0.29d para los de 4, o sea al revés de como están diseñados.
+            'passage_d': (round(meta['effective_passage_mm'] / ATTA_DIAMETER_MM, 2)
+                          if meta.get('effective_passage_mm') else None),
+            'passage_min_d': meta.get('passage_d'),
         })
         rp = m.get('robot_phases', {})
         for rid, p in m['per_robot'].items():
@@ -871,7 +913,7 @@ def run_campaign(a):
               f'{(_median(ts) if ts else float("nan")):>10.1f}'
               f'{_median(cs):>12.2f}{(_median(rt) if rt else float("nan")):>8.2f}'
               f'{(meta.get("occupancy_pct") or float("nan")):>7.2f}'
-              f'{(meta.get("passage_d") or float("nan")):>10.2f}')
+              f'{(_median([r["passage_d"] for r in rr if r.get("passage_d")]) if any(r.get("passage_d") for r in rr) else float("nan")):>10.2f}')
         if len(ts) < len(rr):
             print(f'{"":16}   ({len(rr) - len(ts)} sin converger — excluidas '
                   f'de la mediana de tiempo)')
@@ -1432,6 +1474,11 @@ def main():
                          '— consolida los runs, saca boxplots/heatmaps y el ANOVA')
     ap.add_argument('--campaign-out', metavar='PREFIJO',
                     help='prefijo de los archivos de salida de la campaña')
+    ap.add_argument('--target', metavar='X,Y',
+                    help='punto de destino en mm: mide la convergencia contra ÉL '
+                         'y no contra el centroide. Obligatorio en experimentos '
+                         'con destino fijo (topología): sin esto, un enjambre '
+                         'atascado antes de la barrera cuenta como convergido')
     ap.add_argument('--frac', type=float, default=0.9,
                     help='fracción de robots dentro de R para dar la congregación '
                          'por lograda (default 0.9 = criterio del paper)')
