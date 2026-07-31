@@ -1,0 +1,483 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+% The preceding line is only needed to identify funding in the first footnote. If that is unneeded, please comment it out.
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{algorithm}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+\begin{document}
+
+\title{Impact of Environment Topology on Robotic Swarm Aggregation: An Experimental Study with Atta-bots}
+
+\author{
+    \IEEEauthorblockN{
+        Eduardo Fallas Valverde \IEEEauthorrefmark{1},
+        Juan Carlos Brenes-Torres\IEEEauthorrefmark{1},
+        Cindy Calderón-Arce\IEEEauthorrefmark{2},
+        Rebeca Solís-Ortega\IEEEauthorrefmark{2}, \\
+    }
+    \IEEEauthorblockA{
+        \IEEEauthorrefmark{1}Mechatronics Engineering School, Costa Rica Institute of Technology, Cartago, Costa Rica\\
+        \IEEEauthorrefmark{2}Mathematics School, Costa Rica Institute of Technology, Cartago, Costa Rica\\
+        Email: juanbrenes@tec.ac.cr
+    }
+}
+
+
+\maketitle
+
+\begin{abstract}
+LO HACEMOS DE ULTIMO
+
+\end{abstract}
+
+\begin{IEEEkeywords}
+component, formatting, style, styling, insert
+\end{IEEEkeywords}
+
+\section{Introduction}
+CINDY
+
+Primer párrafo genérico sobre enjambres y el comportamiento de congregación.
+
+Referencias: Mencionar papers que hicieron experimentos de congregación y formation control.
+
+Mencionar que se trabaja mucho en la lógica/algortimo de como evadir obstáculos, ir en formación o congregarse, esto con la presencia de obstáculos y estos se prsentan en diferentes configuraciones. Pero se identifica un vacío en identificar como influye la cantidad de obstáculos, el tamaño y separación de estos en esos comportamientos.
+
+Aporte: Caracterización experimental del impacto de la topología del entorno en el comportamiento de congregación de enjambres robóticos.
+
+\section{Materials and methods}
+
+\subsection{Atta-bot robots}
+The Atta-bot robotic platform is a differential-drive mobile robot designed as an agent for swarm research, in tasks such as exploration, collaborative navigation, and mapping in indoor environments (Figure \ref{fig:attas}). Its name is inspired by the Atta family of leaf cutter ants, which exhibit remarkable collective behaviors.
+The first version of the robot was presented in \cite{Atta-Bot} and was successfully used for swarm experimentation in \cite{Brenes-Torres_2025, Adaptative-Brenes}.   This redesigned version, detailed in \cite{aguilera2024attabot}, substantially optimizes dimensions and mass compared to its predecessor, adopting a compact cylindrical chassis approximately 105 mm in diameter, and a rechargeable LiPo battery providing a continuous operating autonomy of more than 4 hours.
+Its electronic architecture unifies processing into a single ESP32 SoC microcontroller, which coordinates the actuators and integrated instrumentation, including wheel-coupled encoders for PID motion control, and a peripheral array of infrared proximity sensors for obstacle detection and avoidance.
+Finally, the robot communicates with the base station or other robots over a WiFi network using the UDP transport protocol, which minimizes transmission latency to allow a continuous stream of telemetry data, ensuring real-time swarm coordination.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.45\linewidth]{Atta_1_frente.jpg}
+    \includegraphics[width=0.45\linewidth]{Atta_2_atras.jpg}
+    \caption{Redesigned version of Atta-bot robot. Presents a compact design, enhanced maneuverability, WiFi communication, improved components and longer battery life.  }
+    \label{fig:attas}
+\end{figure}
+
+
+\subsection{Robot tracking system}
+EDUARDO
+
+Global localization of the swarm is provided by an external overhead vision
+system rather than by onboard absolute sensing. A monocular camera is mounted on
+the ceiling with its optical axis approximately perpendicular to the floor,
+capturing at $1280 \times 720$ pixels, which yields a scale of approximately
+$1.70$~mm per pixel at the working height. Exposure, focus and white balance are
+fixed manually so that detection conditions remain repeatable across runs. The
+camera intrinsics (camera matrix and distortion coefficients) are calibrated
+beforehand, and every frame is undistorted through precomputed remapping tables.
+
+Each robot carries a unique ArUco marker from the \texttt{DICT\_4X4\_50}
+dictionary on its upper face, so agent identity is resolved directly from the
+marker ID, without colour segmentation or nearest-neighbour association between
+consecutive frames. Marker pose is obtained with \texttt{solvePnP} using the
+\texttt{IPPE\_SQUARE} solver on the undistorted corner points. The heading,
+however, is taken from the direction of the marker's top edge rather than from
+the PnP rotation vector: for a flat marker observed almost perpendicularly,
+\texttt{IPPE\_SQUARE} returns two solutions with almost equal reprojection
+error, and the flickering tie-break between them dominated the orientation
+noise, producing a standard deviation of approximately $3.8^\circ$ with a
+stationary robot, against the $\approx 0.5^\circ$ attributable to corner jitter
+alone. Using the edge direction removes that ambiguity.
+
+A fixed marker placed on the floor defines the origin of the world frame, so all
+poses are expressed relative to it and remain consistent across sessions even if
+the camera mounting shifts slightly. A per-robot angular offset compensates
+markers that are not perfectly aligned with the chassis. Two filters protect the
+pose stream: a per-marker median of three consecutive detections, which removes
+single-frame misreads, and a minimum apparent marker side of $15$~px, which
+discards small false positives. The latter guard matters because a spurious
+detection carrying a valid robot ID would inject a fabricated pose into both the
+swarm and the recorded data.
+
+The pipeline runs at approximately $20$~Hz. Each pose is written to a log for
+offline computation of the metrics and, simultaneously, transmitted to the
+corresponding robot over UDP. Since the robots have no other source of absolute
+position, the vision system acts both as the measurement instrument and as a
+component of the control loop.
+
+\subsection{Robot behaviors}
+EDUARDO
+
+Two behaviors are combined during the experiments: a reactive obstacle avoidance
+layer and a goal-directed congregation behavior. Both run onboard; the base
+station only supplies pose and target information.
+
+\subsubsection{Goal-directed navigation}
+Motion towards a target is executed in segments. On each cycle the robot
+requests its pose, computes the bearing to the goal, and realigns with a
+rotation if the heading error exceeds $12^\circ$; it then advances a straight
+segment of at most $250$~mm and repeats. Arrival is declared when the robot is
+within $50$~mm of the goal. A $40$~mm dead band on the goal position prevents
+the target from being re-latched on measurement noise.
+
+Rotations are closed-loop on the yaw estimated by the IMU, obtained from the
+quaternion produced by the sensor's digital motion processor, instead of being
+commanded open-loop from wheel odometry. The remaining arc is re-aimed on every
+cycle, the motors are cut $3^\circ$ before the target so that inertia completes
+the rotation, and up to four iterative corrections are issued until the residual
+error falls below $3^\circ$. A per-robot gyroscope scale factor compensates the
+unit-to-unit differences measured during calibration.
+
+\subsubsection{Obstacle avoidance}
+Three infrared proximity sensors (left, centre and right) produce a three-bit
+occupancy pattern. Each pattern maps to a rotation away from the obstructed side
+followed by a clearance advance, as listed in Table~\ref{tab:avoidance}. Purely
+lateral detections produce mild corrections, whereas frontal and bilateral
+detections produce larger rotations and shorter advances. Symmetric patterns,
+which carry no directional information, resolve the turn direction randomly to
+avoid deterministic deadlocks between facing robots.
+
+\begin{table}[htbp]
+\caption{Avoidance maneuver as a function of the sensor pattern (L, C, R).}
+\label{tab:avoidance}
+\centering
+\begin{tabular}{cccl}
+\hline
+\textbf{Pattern} & \textbf{Rotation} & \textbf{Advance} & \textbf{Situation} \\
+\hline
+100 & $45^\circ$          & 120~mm & Left obstacle \\
+001 & $45^\circ$          & 120~mm & Right obstacle \\
+010 & $60^\circ$ (random) & 150~mm & Frontal obstacle \\
+110 & $90^\circ$          & 150~mm & Left and frontal \\
+011 & $90^\circ$          & 150~mm & Right and frontal \\
+111 & $135^\circ$ (random)& 100~mm & Fully blocked \\
+\hline
+\end{tabular}
+\end{table}
+
+Because the base station broadcasts the position of every agent, a detection can
+be classified as a peer rather than as a static obstacle when it falls within
+$260$~mm and within $80^\circ$ of the sensor bearing. This distinction is
+relevant in the congregation task, where agents necessarily converge and would
+otherwise treat each other as walls.
+
+Repeated evasions within a short window, typical of a corner or of a narrow
+passage, trigger a committed escape maneuver: a reverse, a rotation of
+$\varphi = 95^\circ$ and a detour of $L = 300$~mm. The turning side is not
+chosen blindly; both candidates are projected forward and the one ending farther
+from the walls is selected, as expressed in equation \ref{eq:escape}, where
+$(x,y,\theta)$ is the robot pose and $W \times H$ the arena dimensions:
+
+\begin{equation}
+s^{*} = \operatorname*{arg\,max}_{s \in \{-1,+1\}}
+\min \left( e_x,\; W - e_x,\; e_y,\; H - e_y \right)
+\label{eq:escape}
+\end{equation}
+
+\begin{equation}
+\begin{aligned}
+e_x &= x + L\cos(\theta + s\varphi) \\
+e_y &= y + L\sin(\theta + s\varphi)
+\end{aligned}
+\label{eq:escape_proj}
+\end{equation}
+
+Detections are not acted upon immediately. A candidate obstacle must persist for
+$t_{confirm} = 600$~ms before an avoidance maneuver is committed, which filters
+the spurious activations of the infrared array. During that confirmation window
+the robot broadcasts its own pose and sensor pattern, and any peer that
+determines it is the body being sensed replies accordingly. If the obstruction is
+identified as another agent, the robot yields for $t_{yield} = 200$~ms and
+re-evaluates instead of executing an avoidance maneuver, since two agents
+evading each other simultaneously tend to produce oscillation rather than
+progress. Only unclaimed detections, that is, static obstacles and walls, trigger
+the maneuvers of Table~\ref{tab:avoidance}.
+
+The escape maneuver is armed by a counter of consecutive evasions: three
+evasions within a $5$~s window indicate that the local avoidance rule is not
+making progress, which is the signature of a corner or of a passage narrower than
+the maneuvering envelope of the robot. Algorithm~\ref{alg:nav} summarizes the
+complete navigation cycle.
+
+\begin{algorithm}
+\caption{Goal-directed navigation with obstacle avoidance}
+\label{alg:nav}
+\begin{algorithmic}[1]
+\REQUIRE goal $p_g$; pose $(x,y,\theta)$ supplied by the vision system
+\STATE $k \leftarrow 0$ \COMMENT{consecutive evasion counter}
+\WHILE{$\lVert p_g - (x,y) \rVert > d_{arrival}$}
+    \STATE request current pose from the base station
+    \STATE $\alpha \leftarrow \operatorname{atan2}(y_g - y,\; x_g - x) - \theta$
+    \IF{$\lvert \alpha \rvert > \alpha_{realign}$}
+        \STATE rotate $\alpha$, closed loop on IMU yaw
+    \ENDIF
+    \STATE $d \leftarrow \min \left( d_{segment},\; \lVert p_g - (x,y) \rVert \right)$
+    \STATE advance $d$
+    \IF{proximity sensors triggered during the segment}
+        \STATE $b \leftarrow$ occupancy pattern (L,\,C,\,R)
+        \STATE broadcast own pose and $b$; wait $t_{confirm}$
+        \IF{a peer claims to be the sensed body}
+            \STATE wait $t_{yield}$ \COMMENT{yield, do not evade}
+        \ELSE
+            \STATE $(\varphi_a, d_a) \leftarrow \textsc{Lookup}(b)$
+            \STATE rotate $\varphi_a$ away from the obstructed side
+            \STATE advance $d_a$
+            \STATE $k \leftarrow k + 1$
+        \ENDIF
+        \IF{$k \geq k_{max}$}
+            \STATE reverse; rotate $s^{*}\varphi$ using (\ref{eq:escape});
+                   advance $L$
+            \STATE $k \leftarrow 0$
+        \ENDIF
+    \ENDIF
+\ENDWHILE
+\STATE stop
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Congregation}
+The congregation behavior aggregates the swarm around a target point without a
+designated leader, so that agents must cross the obstacle field to reach a
+region where no other agent is initially present. Every robot receives the same
+target and the same list of peer positions, broadcast at $1$~Hz.
+
+Driving all agents to the identical point would end in mutual evasion and
+crowding around the target, so each robot instead occupies a distinct slot on a
+ring centred on it. The ring radius grows with the swarm size in order to keep a
+constant arc length per agent, with a lower bound for small swarms, as defined in
+equation \ref{eq:ring}, where $n$ is the number of known agents,
+$s_{arc} = 250$~mm is the arc allocated per agent and $R_{min} = 300$~mm:
+
+\begin{equation}
+R = \max \left( R_{min},\; \frac{n \cdot s_{arc}}{2\pi} \right)
+\label{eq:ring}
+\end{equation}
+
+The $n$ slots are then distributed uniformly over the ring around the target
+$p_{t} = (x_t, y_t)$, following equation \ref{eq:slots}:
+
+\begin{equation}
+p_{s} = p_{t} + R \left( \cos \frac{2\pi s}{n},\; \sin \frac{2\pi s}{n} \right),
+\quad s = 0, \ldots, n-1
+\label{eq:slots}
+\end{equation}
+
+Slot assignment is decided independently by each agent and requires no
+negotiation. Every robot sorts the shared list of peers by identifier and then
+greedily matches robot--slot pairs in increasing order of distance, which
+minimizes path crossing between agents. Since all robots sort the same list and
+apply the same deterministic rule, they all derive the same assignment and no
+slot is claimed twice. The approach to the assigned slot is performed in two
+stages: the robot first navigates to a staging waypoint located $150$~mm outside
+its slot along the radial direction, and only then enters radially. Without this
+two-stage entry an agent may cut across the ring and traverse slots that are
+already occupied. Algorithm~\ref{alg:cong} details the procedure.
+
+\begin{algorithm}
+\caption{Leaderless congregation on a target point}
+\label{alg:cong}
+\begin{algorithmic}[1]
+\REQUIRE target $p_t$; peer positions $P$, broadcast at $1$~Hz
+\STATE $A \leftarrow P \cup \{\textit{self}\}$;\quad $n \leftarrow \lvert A \rvert$
+\STATE $R \leftarrow \max \left( R_{min},\; n \, s_{arc} / 2\pi \right)$
+       \COMMENT{ring radius, (\ref{eq:ring})}
+\FOR{$s = 0$ \TO $n-1$}
+    \STATE $p_s \leftarrow p_t + R \left( \cos \tfrac{2\pi s}{n},\;
+           \sin \tfrac{2\pi s}{n} \right)$
+\ENDFOR
+\STATE sort $A$ by identifier
+       \COMMENT{identical ordering on every agent}
+\STATE $U_a \leftarrow A$;\quad $U_s \leftarrow \{p_0, \ldots, p_{n-1}\}$
+\WHILE{$U_a \neq \emptyset$}
+    \STATE $(a^{*}, s^{*}) \leftarrow
+           \operatorname*{arg\,min}_{a \in U_a,\, s \in U_s}
+           \lVert \textit{pos}(a) - p_s \rVert$
+    \STATE assign $a^{*} \rightarrow s^{*}$; remove both from $U_a$, $U_s$
+\ENDWHILE
+\STATE $p_{slot} \leftarrow$ slot assigned to \textit{self}
+\STATE $\hat{u} \leftarrow (p_{slot} - p_t) / \lVert p_{slot} - p_t \rVert$
+       \COMMENT{outward radial direction}
+\STATE navigate to $p_{slot} + m \, \hat{u}$
+       \COMMENT{staging waypoint, $m = 150$~mm}
+\STATE navigate to $p_{slot}$
+       \COMMENT{radial entry}
+\STATE stop and hold position
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Swarm simulation}
+EDUARDO
+
+The physical arena bounds both the number of agents and the range of obstacle
+configurations that can be tested. To examine whether the effects of topology
+persist at a larger scale, the swarm was replicated in the Webots robotics
+simulator. % cita: Webots
+
+The simulated agent reproduces the Atta-bot physically and logically. The model
+matches the chassis diameter, mass distribution and differential-drive geometry
+of the redesigned platform, and instruments it with the same sensor set: wheel
+encoders feeding the same PID motion control, and the infrared proximity array
+with equivalent placement and detection cones. The behaviors of
+Algorithm~\ref{alg:nav} and Algorithm~\ref{alg:cong} are ported without
+modification of their logic or of their numeric constants, so segment lengths,
+confirmation windows, avoidance angles and ring geometry are identical in both
+settings.
+
+The central property of the setup is protocol identity: simulated robots exchange
+the same UDP messages as the physical ones. Consequently the same base station
+software commands both, and the overhead vision system is replaced by a
+supervisor that publishes poses in the same reference frame, units and message
+format as the ArUco pipeline. The behavior under evaluation therefore traverses
+the same code path in simulation and in the laboratory, and the metrics are
+computed by the same analysis scripts over logs of the same structure. This makes
+the two sets of results directly comparable rather than merely analogous.
+
+Two sources of realism are injected deliberately, because a noiseless simulation
+would overstate the performance of the congregation behavior. First, positional
+and angular jitter comparable to that characterized for the vision pipeline is
+added to the published poses, and marker occlusion events are reproduced, so that
+agents occasionally lose their absolute reference exactly as they do in the
+laboratory. Second, the agents are not identical to each other: per-unit
+asymmetries measured on the physical robots, such as differences in effective
+wheel scale and in infrared sensitivity, are assigned from a profile file. Both
+mechanisms matter for the phenomenon under study, since a swarm of identical
+agents with perfect localization crosses a narrow passage in a far more orderly
+manner than a real one.
+
+Worlds are generated parametrically from the topology description, so each
+obstacle configuration is instantiated with the same procedure that defines it in
+the physical experiments, and repetitions differ only in the initial placement of
+the agents. Figure~\ref{fig:webots} shows the simulated arena for the ten-agent
+scenario.
+
+The scalability scenario enlarges the arena to $3.8 \times 2.8$~m with ten
+agents, preserving the obstacle size and gap width ratios of the physical
+configurations. Increasing the number of agents changes the congregation problem
+qualitatively and not only quantitatively: the ring radius of (\ref{eq:ring})
+grows with $n$, so the target region itself becomes larger, while the passage
+width remains fixed. This separates the contribution of swarm size from the
+contribution of topology. Figure~\ref{fig:sim_congregation} shows the outcome for
+one of these runs.
+
+The simulation is not intended as a substitute for the physical experiments.
+Wheel slip, the specular behavior of the infrared sensors against different
+surface finishes, and the latency and packet loss of the wireless link are
+represented only approximately, and these are precisely the factors that dominate
+the behavior of a real swarm in a narrow passage. The simulated results are
+therefore reported as evidence of scalability of the observed trends, while the
+quantitative characterization rests on the physical platform.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.9\linewidth]{webots_arena.png}
+    \caption{Simulated arena in Webots for the ten-agent scalability scenario.
+    The obstacle field at the centre reproduces the topology configurations of
+    the physical experiments, scaled to a $3.8 \times 2.8$~m surface.}
+    \label{fig:webots}
+\end{figure}
+
+\begin{figure*}
+    \centering
+    \includegraphics[width=0.95\linewidth]{congreg_sim_10robots.png}
+    \caption{Congregation of ten simulated agents around a target point.
+    Left: trajectories, with circles marking the starting positions, squares the
+    final ones, grey patches the obstacles and the star the final centroid of the
+    swarm. Centre: group radius, taken as the maximum distance from any agent to
+    the centroid, against time, with the convergence threshold $R$ and the
+    resulting congregation time $t_{cong}$. Right: minimum inter-robot distance
+    against time, which remains above the chassis diameter throughout the run and
+    therefore indicates that aggregation is achieved without contact between
+    agents.}
+    \label{fig:sim_congregation}
+\end{figure*}
+
+\subsection{Scenario topology and congregation metrics}
+
+The environment used for experimentation consisted on a (2,40 x 1,75) m flat surface with closed walls and obtacles placed at the middle (Figure \ref{fig:escenario}). Since the article seeks to indentify key elements on the scenario topology that  affects congregation behavior, several obstacle configurations were defined by using two obstacle sizes and two gap widths between obstacles.
+Obstacles size were of approximate $0.74 \cdot a_{robot}$ (a=area), obstacle area less than the robot size, and $1.48 \cdot a_{robot}$, area larger than the robot size. The used passage gap width between obstacles were of $2 \cdot d_{robot}$ (d=diameter) and $4 \cdot d_{robot}$. The obstacles total area was approximately 1,2\% of the total scenario area, an this ratio was keep constant among the different configurations.
+
+Accordingly the validated configurations were: scenario free of obstacles, $0.74 \cdot a_{robot}$ obstacles and $2 \cdot d_{robot}$ gaps, $0.74 \cdot a_{robot}$ obstacles and $4 \cdot d_{robot}$ gaps, $1.48 \cdot a_{robot}$ obstacles and $2 \cdot d_{robot}$ gaps, and finally $1.48 \cdot a_{robot}$ obstacles and $4 \cdot d_{robot}$ gaps.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.7\linewidth]{escenario.JPG}
+    \caption{Controlled environment used for physical swarm validation. Objects were placed at the center of the area.}
+    \label{fig:escenario}
+\end{figure}
+
+In order to measure the impact of the scenario topology on the congregation of the robot swarms, several metrics were used:
+\begin{itemize}
+    \item Congregation time ($t_{cong}$): defined from the start of the experiment and finalizes when the 90\% of agents reach the congregation zone.
+    \item Robot distance ($dist_{robot})$: accumulated distance traveled by each robot. Normalized by the euclidean distance from start point to congregation point.
+    \item Swarm compaction($swarm_{comp})$: measures how disperse is the swarm during each time of the experiment. Calculated by the squared root summatory of euclidean distances from each robot position to the swarm centroid, as defined in equation \ref{eq:compaction}, \ref{eq:centroid} and \ref{eq:avg_xy}.
+
+\end{itemize}
+
+
+\begin{equation}
+    swarm_{comp} = \sqrt{\frac{1}{N} \sum_{i=1}^N \vert{} p_i(t) - p_{centroid}(t) \vert{}^2}
+    \label{eq:compaction}
+\end{equation}
+
+\begin{equation}
+    p_{centroid}(t)= (\bar{x}(t), \bar{y}(t))
+    \label{eq:centroid}
+\end{equation}
+
+\begin{equation}
+    \bar{x}(t) = \frac{1}{N}\sum_{i=1}^N x_i(t), \quad \bar{y}(t) = \frac{1}{N}\sum_{i=1}^N y_i(t)
+    \label{eq:avg_xy}
+\end{equation}
+
+
+\section{Results and analysis}
+TODOS
+
+Gráficas a poner:
+ - Boxplots de tiempo de congregación para cada escenario (hacer Anova en el análisis)
+ - Boxplots con distancias acumuludas por escenario
+ - Heatmaps de cada escenario (se ven bonitos)
+ - Gráfico de dispersion de Compactación en cada t. Se podría también ver la variabilidad en boxplot.
+
+\section{Conclusions and future work}
+JUAN CARLOS Y CINDY
+
+Mencionar los resultados obtenidos y como se comparan con otros trabajos.
+Decir que sigue luego de esto.
+
+\section*{Acknowledgment}
+
+Citar algun proyecto del TEC
+
+\section*{References}
+
+Please number citations consecutively within brackets \cite{b1}. The
+sentence punctuation follows the bracket \cite{b2}. Refer simply to the reference
+number, as in \cite{b3}---do not use ``Ref. \cite{b3}'' or ``reference \cite{b3}'' except at
+the beginning of a sentence: ``Reference \cite{b3} was the first $\ldots$''
+
+Number footnotes separately in superscripts. Place the actual footnote at
+the bottom of the column in which it was cited. Do not put footnotes in the
+abstract or reference list. Use letters for table footnotes.
+
+Unless there are six authors or more give all authors' names; do not use
+``et al.''. Papers that have not been published, even if they have been
+submitted for publication, should be cited as ``unpublished'' \cite{b4}. Papers
+that have been accepted for publication should be cited as ``in press'' \cite{b5}.
+Capitalize only the first word in a paper title, except for proper nouns and
+element symbols.
+
+For papers published in translation journals, please give the English
+citation first, followed by the original foreign-language citation \cite{b6}.
+
+
+\bibliographystyle{IEEEtran}
+
+\bibliography{referencias}
+
+
+\end{document}
