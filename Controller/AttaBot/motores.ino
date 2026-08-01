@@ -10,6 +10,8 @@
 // FUNCIONES DE CONTROL DE MOTORES
 // ============================================================================
 
+// Reinicia los dos controladores y los contadores de pulsos. Hay que llamarla
+// entre instrucciones, o el error acumulado de la anterior se arrastra.
 void ResetPID() {
   leftControl.Reset();
   rightControl.Reset();
@@ -35,13 +37,14 @@ void EkfTick() {
   if (dYaw < -180.0f) dYaw += 360.0f;
   prevYaw = yaw;
 
-  // Δ distancia solo cuando las ruedas avanzan de verdad (en TURN los
-  // contadores suben pero el desplazamiento neto es ~0)
+  // Δ distancia solo cuando las ruedas avanzan de verdad: en TURN los contadores
+  // suben pero el desplazamiento neto es ~0. Un delta negativo significa que
+  // ResetPID reinició los contadores, y ahí el acumulado vale por sí solo.
   float avg = (movement.pastLeftPulseCount + movement.pastRightPulseCount) / 2.0f;
   float d = 0.0f;
   if (state == MOVE || state == REVERSE) {
     float dAvg = avg - prevAvgPulses;
-    if (dAvg < 0) dAvg = avg;   // ResetPID reinició los contadores
+    if (dAvg < 0) dAvg = avg;
     d = dAvg * millimetersPerPulse * (state == REVERSE ? -1.0f : 1.0f);
   }
   prevAvgPulses = avg;
@@ -49,11 +52,13 @@ void EkfTick() {
   ekf.Predict(d, dYaw * yawScale);
 }
 
-// Clasifica una lectura RGBC del APDS9960 contra un color objetivo.
-// Umbrales de primera pasada — calibrar en lab con COLOR_READ.
+// Clasifica una lectura RGBC del APDS9960 contra un color objetivo. Un canal
+// claro por debajo de 10 se descarta: está muy oscuro para que la proporción
+// entre canales signifique algo. Umbrales de primera pasada, hay que
+// calibrarlos en el lab con COLOR_READ.
 bool MatchColor(const char *target, uint16_t r, uint16_t g, uint16_t b,
                 uint16_t c) {
-  if (c < 10) return false;   // muy oscuro / sin señal útil
+  if (c < 10) return false;
   if (strcmp(target, "rojo") == 0)  return r > g * 3 / 2 && r > b * 3 / 2;
   if (strcmp(target, "verde") == 0) return g > r * 3 / 2 && g > b * 3 / 2;
   if (strcmp(target, "azul") == 0)  return b > r * 3 / 2 && b > g * 3 / 2;
@@ -82,6 +87,8 @@ void SearchEvadeAndResume() {
   state = READ_INSTRUCTION;
 }
 
+// Aplica el PWM con signo a cada rueda, eligiendo el par de pines segun el
+// sentido. Con cero en ambos, frena.
 void ConfigureHBridge(int leftWheelPWM, int rightWheelPWM) {
   if (leftWheelPWM >= 0) {
     ledcWrite(leftMotorBackward, 0);
@@ -100,6 +107,9 @@ void ConfigureHBridge(int leftWheelPWM, int rightWheelPWM) {
   }
 }
 
+// Velocidad objetivo para lo que falta del tramo. Va a maxSpeed casi todo el
+// camino y baja en rampa hasta minSpeed en los ultimos speedReductionThreshold
+// mm, para no pasarse de largo. El signo indica el sentido.
 float DesiredSpeed(float distance, float wheelDistance) {
   float remainingDistance = distance - wheelDistance;
   float desiredSpeed = maxSpeed;
@@ -128,6 +138,10 @@ bool IsStationary(float currentLeftSpeed, float currentRightSpeed,
   return false;
 }
 
+// Un paso del control de movimiento: mide lo recorrido por cada rueda, corre el
+// PID contra la velocidad objetivo y aplica el PWM. Devuelve true cuando ambas
+// ruedas llegaron o cuando el robot lleva SteadyStateTime sin moverse, que es
+// la salida por atasco.
 bool MoveDistanceByWheel(float leftDistance, float rightDistance) {
   currentMillis = millis();
   millisDifference = currentMillis - movement.previousMillis;

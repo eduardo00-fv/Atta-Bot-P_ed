@@ -315,11 +315,11 @@ void ReactiveNavStep() {
     seg     = nav.avoidSegment;
     avoiding = true;
   } else if (rightBlocked) {
-    bias    = nav.avoidSideAngle;   // bias izquierda
+    bias    = nav.avoidSideAngle;
     seg     = nav.avoidSegment;
     avoiding = true;
   } else if (leftBlocked) {
-    bias    = -nav.avoidSideAngle;  // bias derecha
+    bias    = -nav.avoidSideAngle;
     seg     = nav.avoidSegment;
     avoiding = true;
   }
@@ -392,7 +392,9 @@ int MeetSlotIndex(float tx, float ty, float ring, int n) {
   if (count > n) count = n;
   if (count <= 1) return 0;
 
-  for (int a = 0; a < count - 1; a++) {         // orden por id
+  // El orden por id es lo que fija el desempate y hace que los N robots lleguen
+  // a la misma reparticion.
+  for (int a = 0; a < count - 1; a++) {
     for (int b = a + 1; b < count; b++) {
       if (id[b] < id[a]) {
         int   ti = id[a]; id[a] = id[b]; id[b] = ti;
@@ -402,7 +404,7 @@ int MeetSlotIndex(float tx, float ty, float ring, int n) {
     }
   }
 
-  float sx[MAXN], sy[MAXN];                     // posición de cada slot
+  float sx[MAXN], sy[MAXN];
   for (int s = 0; s < count; s++) {
     float ang = 2.0f * PI * s / count;
     sx[s] = tx + ring * cosf(ang);
@@ -411,9 +413,10 @@ int MeetSlotIndex(float tx, float ty, float ring, int n) {
 
   bool robotDone[MAXN] = {false};
   bool slotDone[MAXN]  = {false};
-  int  asg[MAXN];                               // robot → slot
+  // asg[robot] = slot. Greedy: gana el par mas corto, y el que llega se queda.
+  int  asg[MAXN];
   for (int k = 0; k < count; k++) asg[k] = k;
-  for (int k = 0; k < count; k++) {             // greedy: el par más corto gana
+  for (int k = 0; k < count; k++) {
     float best = 1.0e12f;
     int   br = -1, bs = -1;
     for (int r = 0; r < count; r++) {
@@ -517,9 +520,11 @@ void MaybeDisperseHop() {
     vx += (x - disperse.nX[i]) / (d * d);
     vy += (y - disperse.nY[i]) / (d * d);
   }
+  // Norma nula = el robot esta justo encima del vecino y no hay direccion de
+  // huida definida; se sortea una sobre [0, 2π).
   float norm = sqrt(vx * vx + vy * vy);
-  if (norm < 1e-9f) {                    // sobre el vecino: dirección aleatoria
-    float ang = random(0, 62832) / 10000.0f;   // ~[0, 2π)
+  if (norm < 1e-9f) {
+    float ang = random(0, 62832) / 10000.0f;
     vx = cos(ang); vy = sin(ang); norm = 1.0f;
   }
 
@@ -562,6 +567,9 @@ void MaybeDisperseHop() {
                 robotID.c_str(), bestX, bestY, dmin);
 }
 
+// Decide si el obstaculo que ven los sensores es el companero que acaba de
+// reportar su pose. Compara distancia y angulo relativo, y para los sensores
+// laterales exige ademas que el otro robot este del lado que disparo.
 bool IsRobotObstacle(float x2, float y2, float angle, int sensors, String id) {
   float deltaX = x2 - robotPose.x;
   float deltaY = y2 - robotPose.y;

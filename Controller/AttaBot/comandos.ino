@@ -13,12 +13,15 @@
 // FUNCIONES DE COMUNICACIÓN
 // ============================================================================
 
+// Manda un datagrama UDP al host indicado, en el puerto del protocolo.
 void SendMessage(IPAddress host, const char *message) {
   udp.beginPacket(host, localPort);
   udp.write(reinterpret_cast<const uint8_t *>(message), strlen(message));
   udp.endPacket();
 }
 
+// printf de depuracion hacia la Base. Solo sale si el modo debug esta activo
+// (CONFIG|DEBUG|n), asi que las trazas se prenden sin reflashear.
 void MessageDebugf(const char *format, ...) {
   char buffer[200];
   va_list args;
@@ -34,6 +37,7 @@ void MessageDebugf(const char *format, ...) {
   debugCounter++;
 }
 
+// Le reporta a la Base la pose que el robot cree tener.
 void SendPose() {
   obstacles.robotDetected = false;
   const char *message = "CHECK_OBSTACLE|%d|%.1f|%.1f|%.1f";
@@ -44,6 +48,9 @@ void SendPose() {
   movement.previousMillis = millis();
 }
 
+// Parte un mensaje del protocolo por su delimitador. Devuelve siempre seis
+// campos, con vacios al final si vinieron menos, para que los handlers puedan
+// leer argumentos opcionales sin chequear la cantidad.
 std::array<String, 6> SeparateCommand(const String &command, char delimiter) {
   std::array<String, 6> results;
   int startIndex = 0;
@@ -86,7 +93,7 @@ void HandleConfig(const std::array<String, 6> &arguments) {
     congregation.Reset();
     disperse.Reset();
     nav.Reset();
-    ekf.Reset();   // sin esto la deriva del EKF sobrevive entre sesiones
+    ekf.Reset();
     state = STOP;
     SendMessage(robots["Base"], "CONFIG|RECEIVED");
     debugUdp = 0;
@@ -353,8 +360,10 @@ void HandleMeet(const std::array<String, 6> &arguments) {
   //
   // MEET|x|y|R fuerza el radio (mismo rango que NAV_CONFIG|PARKING_DIST) para
   // tantear en vivo sin reflashear; sin el 3er argumento manda la fórmula.
-  const float MEET_SEP  = 250.0f;   // mm centro a centro entre slots vecinos
-  const float MEET_RMIN = 200.0f;   // piso: cuerpo 150mm + error de pose
+  // Separacion centro a centro entre slots vecinos, y piso del radio: 150mm de
+  // cuerpo mas el error de pose.
+  const float MEET_SEP  = 250.0f;
+  const float MEET_RMIN = 200.0f;
   int n = disperse.nCount + 1;
   if (n > DisperseState::MAX_NEIGHBORS + 1) n = DisperseState::MAX_NEIGHBORS + 1;
   float ring = (n >= 2) ? MEET_SEP / (2.0f * sinf(PI / n)) : MEET_RMIN;
@@ -382,13 +391,16 @@ void HandleMeet(const std::array<String, 6> &arguments) {
                 congregation.totalFollowers, ring);
 
   fsmInstruction[0] = WAIT;
-  fsmInstruction[1] = robotID.toInt() * 200;   // arranque escalonado
+  fsmInstruction[1] = robotID.toInt() * 200;
   instructionList.push_back(fsmInstruction);
   fsmInstruction[0] = REQUEST_POSITION;
   fsmInstruction[1] = 0;
   instructionList.push_back(fsmInstruction);
 }
 
+// CONGREGATION|<lider>|<indice>|<total> — arranca la congregacion sobre el
+// anillo del lider. Con VIRTUAL en vez de un id, el punto de reunion es fijo y
+// no hay nadie difundiendo pose.
 void HandleCongregation(const std::array<String, 6> &arguments) {
   congregation.leaderID = arguments[1];
   congregation.isLeader = (congregation.leaderID == robotID);
@@ -396,7 +408,7 @@ void HandleCongregation(const std::array<String, 6> &arguments) {
   congregation.hasGlobalTarget = false;
   congregation.stagingDone = false;
   congregation.slotAngleSet = false;
-  congregation.poseFresh = false;   // el slot espera una pose de cámara nueva
+  congregation.poseFresh = false;
   congregation.followerIndex  = arguments[2].toInt();
   congregation.totalFollowers = (arguments[3] != "") ? arguments[3].toInt() : 1;
 
@@ -431,7 +443,7 @@ void HandleFormation(const std::array<String, 6> &arguments) {
   congregation.followerIndex  = arguments[3].toInt();
   congregation.totalFollowers = (arguments[4] != "") ? arguments[4].toInt() : 1;
   congregation.formationAxis  = (arguments[5] != "") ? arguments[5].toFloat() : 0.0f;
-  disperse.Reset();  // no dispersar y formar a la vez
+  disperse.Reset();
 
   nav.Reset();
   instructionList.clear();
@@ -510,7 +522,7 @@ void HandlePositionResponse(const std::array<String, 6> &arguments) {
   robotPose.x = arguments[1].toFloat();
   robotPose.y = arguments[2].toFloat();
   robotPose.angle = arguments[3].toFloat();
-  congregation.poseFresh = true;   // habilita anclar el slot (ver LEADER_POSITION)
+  congregation.poseFresh = true;
 
   // Congregación VIRTUAL: no hay líder que difunda su pose, así que el
   // recálculo del slot se dispara acá, con cada pose propia nueva. El punto
@@ -581,7 +593,7 @@ void HandleCancelCongregation(const std::array<String, 6> &arguments) {
   // DISPERSE — dispersión de enjambre: repeler vecinos hasta separación >= mm
   // DISPERSE|<mm>. Los vecinos llegan por NEIGHBOR_POSITIONS (1 Hz de la Base).
 void HandleDisperse(const std::array<String, 6> &arguments) {
-  congregation.Reset();               // no formar y dispersar a la vez
+  congregation.Reset();
   disperse.Reset();
   disperse.target = (arguments[1] != "") ? arguments[1].toFloat() : 600.0f;
   nav.Reset();
@@ -617,7 +629,7 @@ void HandleNeighborPositions(const std::array<String, 6> &arguments) {
         disperse.nX[i]  = nx;
         disperse.nY[i]  = ny;
       } else {
-        disperse.selfX    = nx;   // insumo compartido para el reparto de MEET
+        disperse.selfX    = nx;
         disperse.selfY    = ny;
         disperse.selfSeen = true;
       }
@@ -791,16 +803,19 @@ void HandleSelftest(const std::array<String, 6> &arguments) {
     interrupts();
     float yaw0 = yaw;
 
-    int lp = (fase == 1) ? 0 : pwm;      // fase 0: izq · 1: der · 2: ambos
+    // Fase 0 mueve solo la rueda izquierda, 1 solo la derecha y 2 las dos. El
+    // yaw se relee durante el tramo para mantenerlo fresco, y despues del corte
+    // se espera a que frene antes de medir.
+    int lp = (fase == 1) ? 0 : pwm;
     int rp = (fase == 0) ? 0 : pwm;
     ConfigureHBridge(lp, rp);
     unsigned long t0 = millis();
     while (millis() - t0 < STEP_MS) {
-      LeerYaw();                          // mantener el yaw fresco
+      LeerYaw();
       delay(10);
     }
     ConfigureHBridge(0, 0);
-    delay(400);                           // dejar frenar antes de medir
+    delay(400);
     LeerYaw();
 
     noInterrupts();
@@ -855,6 +870,8 @@ void HandleGetStatus(const std::array<String, 6> &arguments) {
   SendMessage(robots["Base"], buffer);
 }
 
+// RESET_EVASION — borra a mano todo el rastro de evasion. Escotilla de
+// emergencia para cuando un robot queda trabado creyendo que sigue evadiendo.
 void HandleResetEvasion(const std::array<String, 6> &arguments) {
   evasionTracker.Reset();
   intContext.Clear();
@@ -881,7 +898,7 @@ void HandleSearchObject(const std::array<String, 6> &arguments) {
   frontSensor.enableColor(true);
   instructionList.clear();
   fsmInstruction[0] = RANDOM_WALK;
-  fsmInstruction[1] = 600000;   // patrulla de 10 min (se re-arma al evadir)
+  fsmInstruction[1] = 600000;
   instructionList.push_back(fsmInstruction);
   state = READ_INSTRUCTION;
   MessageDebugf("DEBUG: -1, ID: %s, SEARCH: buscando objeto %s",
@@ -905,14 +922,19 @@ void HandleColorRead(const std::array<String, 6> &arguments) {
   SendMessage(robots["Base"], buf);
 }
 
+// ABORT_NAV — corta cualquier navegacion o busqueda en curso y deja el robot
+// quieto.
 void HandleAbortNav(const std::array<String, 6> &arguments) {
   nav.Reset();
   if (search.active && frontSensorInitialized) frontSensor.enableColor(false);
   search.Reset();
   instructionList.clear();
-  imuTurnActive       = false;  // si se abortó a mitad de un giro, no dejar el
-  imuTurnIsCorrection = false;  // tracking IMU activo: el próximo TURN debe
-  imuTurnCorrCount    = 0;      // reinicializarse limpio (start yaw/accum/target)
+  // Si se aborto a mitad de un giro, el seguimiento por IMU no puede quedar
+  // activo: el proximo TURN tiene que reinicializar yaw de arranque, acumulado y
+  // objetivo desde cero.
+  imuTurnActive       = false;
+  imuTurnIsCorrection = false;
+  imuTurnCorrCount    = 0;
   state = STOP;
   SendMessage(robots["Base"], "GT abortado");
   MessageDebugf("DEBUG: -1, ID: %s, Navegación abortada manualmente",
@@ -928,6 +950,8 @@ void HandleGetYaw(const std::array<String, 6> &arguments) {
   SendMessage(robots["Base"], buffer);
 }
 
+// Punto de entrada del protocolo: lee un datagrama, lo parte en comando y
+// argumentos, y despacha al handler que corresponda.
 void ReadUdpPackets() {
   int packetBytes = udp.parsePacket();
   if (!packetBytes) {

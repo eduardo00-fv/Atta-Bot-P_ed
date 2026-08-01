@@ -9,9 +9,13 @@
 // en AttaBot.ino y desde aca se ven directo, sin extern ni cabeceras.
 
 // ============================================================================
-// LOOP PRINCIPAL
+// ESTADOS DE LA FSM
 // ============================================================================
 
+// Espera pasiva de instructionValue ms. Es el unico estado donde se atiende el
+// OTA, asi que el robot solo acepta una actualizacion cuando esta quieto. Al
+// vencer el plazo pasa a leer la proxima instruccion, salvo que el movimiento
+// anterior no haya terminado: ahi retrocede primero.
 void StateWait() {
   ArduinoOTA.handle();
 
@@ -25,9 +29,11 @@ void StateWait() {
       state = REVERSE;
     }
   }
-
 }
 
+// Avanza instructionValue mm. Si un sensor ve un obstaculo a mitad de camino,
+// guarda en intContext cuanto faltaba y corta: RESUME_AFTER_EVASION retoma
+// justo ese resto en vez de repetir el tramo entero.
 void StateMove() {
   movementReady = MoveDistanceByWheel(instructionValue, instructionValue);
 
@@ -59,11 +65,18 @@ void StateMove() {
 
     state = STOP;
   }
-
 }
 
+// Giro en el lugar. Con IMU disponible es lazo cerrado en yaw: acumula el giro
+// real con unwrap incremental, re-apunta el arco restante en cada ciclo y al
+// terminar mide el residuo y encola correcciones hasta entrar en tolerancia o
+// agotar imuTurnMaxCorrections. El objetivo lo define el IMU y no la geometria
+// supuesta, asi que la rueda loca, el stiction y un centerToWheelDistance mal
+// calibrado dejan de producir deficit.
+//
+// Si el yaw deja de avanzar (IMU muda o congelada) cierra por encoders para no
+// girar infinito. Sin IMU cae al giro a ciegas por distancia de rueda.
 void StateTurn() {
-  // Capturar yaw inicial la primera vez que se entra al estado
   if (imuAvailable && !imuTurnActive) {
     imuTurnActive      = true;
     imuTurnStartYaw    = yaw;
@@ -81,7 +94,7 @@ void StateTurn() {
     float dYaw = yaw - imuTurnPrevYaw;
     if (dYaw >  180.0f) dYaw -= 360.0f;
     if (dYaw < -180.0f) dYaw += 360.0f;
-    imuTurnAccumDeg += dYaw * yawScale;  // grados físicos, no crudos del gyro
+    imuTurnAccumDeg += dYaw * yawScale;
     imuTurnPrevYaw   = yaw;
 
     if (imuTurnSettleUntil != 0) {
@@ -93,8 +106,10 @@ void StateTurn() {
       }
       imuTurnSettleUntil = 0;
 
-      float delta = imuTurnAccumDeg;           // unwrapped: válido >180°
-      float error = imuTurnTargetDeg - delta;  // positivo = giró de menos
+      // delta viene sin wrap, asi que sirve para arcos de mas de 180°; un error
+      // positivo significa que el robot giro de menos.
+      float delta = imuTurnAccumDeg;
+      float error = imuTurnTargetDeg - delta;
       MessageDebugf("DEBUG: -1, ID: %s, TURN IMU: objetivo=%.1f° real=%.1f° error=%.1f° corr#%d (yaw %.1f→%.1f)",
                     robotID.c_str(), imuTurnTargetDeg, delta, error,
                     imuTurnCorrCount, imuTurnStartYaw, yaw);
@@ -149,7 +164,7 @@ void StateTurn() {
           ConfigureHBridge(0, 0);
           imuTurnSettleUntil = millis() + imuTurnSettleMs;
         }
-        movementReady = false;  // el giro termina tras el settle
+        movementReady = false;
       }
     }
   } else {
@@ -184,14 +199,15 @@ void StateTurn() {
       movementReady = false;
     }
 
-    imuTurnActive = false;  // cancelar seguimiento IMU si el giro fue interrumpido
+    imuTurnActive = false;
     imuTurnIsCorrection = false;
     imuTurnCorrCount = 0;
     state = STOP;
   }
-
 }
 
+// Camina al azar durante instructionValue ms, encolando tramos que arma
+// SelectMovementRW. Al vencerse vuelve a leer la cola.
 void StateRandomWalk() {
   if (previousMillisRW == 0) {
     previousMillisRW = millis();
@@ -214,6 +230,8 @@ void StateRandomWalk() {
   state = READ_INSTRUCTION;
 }
 
+// Retrocede una distancia fija para despegarse de lo que sea que bloquee, antes
+// de reintentar.
 void StateReverse() {
   movementReady = MoveDistanceByWheel(reverseDistance, reverseDistance);
 
@@ -226,9 +244,11 @@ void StateReverse() {
                   robotID.c_str());
     state = STOP;
   }
-
 }
 
+// Corta los motores y decide que sigue. Si el movimiento habia terminado bien,
+// vuelve a WAIT; si se corto por un obstaculo, va a identificarlo y de paso le
+// manda la pose a la Base.
 void StateStop() {
   ConfigureHBridge(0, 0);
 
@@ -245,9 +265,12 @@ void StateStop() {
     SendPose();
     state = IDENTIFY_OBSTACLE;
   }
-
 }
 
+// Saca la proxima instruccion de la cola y salta a su estado. Con la cola vacia
+// vuelve a WAIT. El bitmap de obstaculos se limpia solo si no venimos de una
+// evasion ni de una instruccion interrumpida, porque en esos casos todavia hace
+// falta saber que sensor disparo.
 void StateReadInstruction() {
   if (!isEvading && !intContext.wasInterrupted) {
 
@@ -272,9 +295,9 @@ void StateReadInstruction() {
     state = WAIT;
     instructionValue = instructionCompletedDelay;
   }
-
 }
 
+// Le avisa a la Base que termino la secuencia de instrucciones.
 void StateMessageBase() {
   const char *message = "";
   if (instructionValue == 1) {
@@ -284,9 +307,11 @@ void StateMessageBase() {
   SendMessage(robots["Base"], message);
   state = WAIT;
   instructionValue = instructionCompletedDelay;
-
 }
 
+// Decide si lo que bloquea es otro robot o un obstaculo del escenario. Espera
+// obstacleWaitTime a que llegue un OBSTACLE_DETECTED de algun companero: si
+// llega, alcanza con esperar a que se aparte; si no, es fijo y hay que evadir.
 void StateIdentifyObstacle() {
   currentMillis = millis();
   if (obstacles.robotDetected) {
@@ -301,9 +326,11 @@ void StateIdentifyObstacle() {
     MessageDebugf("DEBUG: -1, ID: %s, Obstáculo encontrado no es un robot",
                   robotID.c_str());
   }
-
 }
 
+// Le pide la pose a la Base y espera el POSITION_RESPONSE para dar el siguiente
+// paso de navegacion. Sin IP de base aborta, y si la respuesta no llega a
+// tiempo reintenta, porque un paquete UDP perdido no puede colgar la corrida.
 void StateRequestPosition() {
   if (robots.find("Base") == robots.end() ||
       robots["Base"] == IPAddress(0, 0, 0, 0)) {
@@ -341,9 +368,13 @@ void StateRequestPosition() {
     state = READ_INSTRUCTION;
     instructionValue = 0;
   }
-
 }
 
+// Maniobra de evasion. Elige el rodeo segun el patron de bits de los sensores y
+// encola retroceso, giro y avance. Tras varias evasiones seguidas en el mismo
+// punto asume deadlock y hace un escape comprometido hacia el interior de la
+// arena, en vez del giro de 180° a ciegas que dejaba al robot rebotando contra
+// la misma esquina.
 void StateActiveEvasion() {
   if (!obstacles.HasAnyObstacle()) {
     // Sin obstáculo real — puede haber desaparecido entre detección y aquí
@@ -511,9 +542,10 @@ void StateActiveEvasion() {
                 "avance=%dmm, forzado=%d",
                 robotID.c_str(), obstacles.GetObstaclePattern().c_str(),
                 avoidanceAngle, avoidanceDistance, needsRetreat);
-
 }
 
+// Retoma la instruccion que la evasion interrumpio, con el resto que quedo
+// guardado en intContext, y limpia el rastro de la evasion.
 void StateResumeAfterEvasion() {
   if (!intContext.wasInterrupted) {
     resumeScheduled = false;
@@ -577,9 +609,11 @@ void StateResumeAfterEvasion() {
   state = READ_INSTRUCTION;
 }
 
+// Aproximacion lenta al candidato hasta el alcance del APDS9960, unos pocos cm,
+// que es donde la lectura de color es confiable. Al llegar se detiene, espera
+// una lectura valida y clasifica; si el color no era el buscado o no alcanza a
+// llegar, evade y vuelve a patrullar. Validado en Webots.
 void StateSearchApproach() {
-  // Aproximación lenta al candidato hasta el alcance del APDS9960 (~pocos
-  // cm), donde la lectura de color es confiable. Validado en sim (Webots).
   if (!search.active || !frontSensorInitialized) {
     ConfigureHBridge(0, 0);
     state = READ_INSTRUCTION;
@@ -631,6 +665,11 @@ void StateSearchApproach() {
   }
 }
 
+// ============================================================================
+// LOOP PRINCIPAL
+// ============================================================================
+
+// Housekeeping de cada ciclo y despacho del estado en curso.
 void loop() {
   ledCtrl.update();
   WiFiStatus();
@@ -712,6 +751,9 @@ void loop() {
 // FUNCIONES AUXILIARES
 // ============================================================================
 
+// Sortea el proximo tramo del random walk: girar a un lado, al otro o avanzar,
+// con las probabilidades y las tablas de angulos y distancias de arriba. Si hay
+// un obstaculo detectado, la probabilidad de avanzar se pone en cero.
 void SelectMovementRW() {
   int probabilityTurnPos = 15;
   int probabilityMove = 70 * (obstacleDetected ? 0 : 1);
@@ -761,6 +803,7 @@ void SelectMovementRW() {
 }
 
 #ifdef DebugSerial
+// Consola serie de diagnostico, solo con DebugSerial activo.
 void ReadSerialCommands() {
   if (Serial.available()) {
     String command = Serial.readString();

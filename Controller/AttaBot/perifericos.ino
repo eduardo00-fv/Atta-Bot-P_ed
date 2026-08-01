@@ -14,6 +14,8 @@
 // FUNCIONES DE LED
 // ============================================================================
 
+// Refresca el LED. El parpadeo se hace por tiempo y no con delay, para no
+// bloquear el ciclo.
 void LedController::update() {
   unsigned long now = millis();
   switch (currentState) {
@@ -50,10 +52,12 @@ void LedController::update() {
   }
 }
 
+// Color fijo.
 void setLedColor(uint8_t red, uint8_t green, uint8_t blue) {
   ledCtrl.setSolid(red, green, blue, maxBrightness);
 }
 
+// Brillo global del LED.
 void setLedBrightness(uint8_t brightness) {
   ledCtrl.brightness = brightness;
   if (brightness == 0)
@@ -71,6 +75,9 @@ void setLedBlink(uint8_t red, uint8_t green, uint8_t blue,
 // FUNCIONES IMU
 // ============================================================================
 
+// Arranca la ICM-20948 y su DMP, restaura los sesgos guardados y deja
+// imuAvailable en true solo si todo el camino salio bien. Si falla, el robot
+// sigue funcionando: los giros caen al modo a ciegas por encoders.
 void setupIMU() {
   DebugSerialPrintln("Inicializando IMU ICM-20948...");
 
@@ -100,7 +107,7 @@ void setupIMU() {
     DebugSerialPrintln("  2. AD0_VAL debe ser 1 (0x69) o 0 (0x68)");
     DebugSerialPrintln("  3. Que no haya conflictos con otros dispositivos I2C");
     ledCtrl.setBlink(255, 0, 0, maxBrightness, 500);
-    return;  // imuAvailable permanece false
+    return;
   }
 
   DebugSerialPrintln("Inicializando DMP...");
@@ -135,9 +142,9 @@ void setupIMU() {
     return;
   }
 
-  // --- Restaurar calibración desde Preferences ---
+  // Restaurar la calibración guardada. El namespace se abre de solo lectura.
   biasStore store;
-  preferences.begin("attabot-config", true);  // read-only
+  preferences.begin("attabot-config", true);
   store.biasGyroX  = preferences.getInt("bias_gx", 0);
   store.biasGyroY  = preferences.getInt("bias_gy", 0);
   store.biasGyroZ  = preferences.getInt("bias_gz", 0);
@@ -179,6 +186,8 @@ void setupIMU() {
   ledCtrl.setOff();
 }
 
+// Lee el yaw del DMP y actualiza la variable global. Es la unica fuente de
+// orientacion inercial del firmware.
 void LeerYaw() {
   if (!imuAvailable) return;
 

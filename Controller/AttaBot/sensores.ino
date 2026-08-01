@@ -14,6 +14,9 @@
 // FUNCIONES DE SENSORES Y HARDWARE
 // ============================================================================
 
+// Intenta arrancar el APDS9960, reintentando cada frontSensorRetryInterval si
+// no responde. Se llama desde loop porque el bus I2C a veces no esta listo en
+// el arranque.
 void SetupFrontSensor() {
   if (frontSensorInitialized)
     return;
@@ -43,11 +46,13 @@ void SetupFrontSensor() {
   }
 }
 
+// Vigila el enlace WiFi y reporta solo los CAMBIOS de estado, no cada ciclo.
+// lastStatus arranca en 255, un valor que WiFi.status() nunca devuelve, para que
+// el primer sondeo cuente como cambio.
 void WiFiStatus() {
-  static uint8_t lastStatus = 255; // Inicializar con valor inválido
+  static uint8_t lastStatus = 255;
   uint8_t currentStatus = WiFi.status();
 
-  // Debug: mostrar cambios de estado
   if (currentStatus != lastStatus) {
     const char *statusStr[] = {
         "WL_IDLE_STATUS",     // 0
@@ -125,6 +130,14 @@ void WiFiStatus() {
   }
 }
 
+// Muestrea los tres sensores de obstaculo y arma el patron de ocupacion.
+//
+// Los laterales son de umbral fijo y se leen por interrupcion, asi que aca solo
+// se aplica el filtro por duracion minima: un flanco mas corto que
+// minObstacleTime es ruido. El central es graduado y se compara contra
+// centralIRThreshold. Cualquiera de los tres puede enmascararse en vivo con
+// SENSOR_MASK, que es como se convive con un sensor defectuoso sin desarmar el
+// robot.
 void ReadSensors() {
   if (((millis() - movement.previousMillis) <= samplingTime - 2) ||
       isLateralCycleActive || isCentralCycleActive || (debugUdp == 3)) {

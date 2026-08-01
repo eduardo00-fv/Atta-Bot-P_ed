@@ -74,9 +74,12 @@ char receivedPacket[255];
 float pulsesPerRev = 574;
 const float wheelCircumference = PI * 44.5;
 float millimetersPerPulse = wheelCircumference / pulsesPerRev;
-float centerToWheelDistance = 41.5;  // configurable vía NAV_CONFIG|WHEEL_DIST
-float yawScale = 1.0f;  // escala del gyro por robot (físico/IMU, calibrada con
-                        // ArUco; ±2.4% medido) — NAV_CONFIG|YAW_SCALE|x|SAVE
+// Los dos se ajustan en vivo desde la Base y se persisten: la media distancia
+// entre ruedas con NAV_CONFIG|WHEEL_DIST y la escala del gyro con
+// NAV_CONFIG|YAW_SCALE|x|SAVE. yawScale es la razon entre el giro fisico y el
+// que reporta la IMU, calibrada contra ArUco; se midio hasta ±2.4% por robot.
+float centerToWheelDistance = 41.5;
+float yawScale = 1.0f;
 
 // NO USAR radians() EN ESTE SKETCH — usar DegToRad/DegToArc.
 //
@@ -174,19 +177,21 @@ const std::array<int, 7> possibleAngles = {30, 45, 60, 75, 90, 135, 180};
 const std::array<int, 4> possibleAdvances = {200, 250, 300, 350};
 enum possibleDirections { TURN_POS = 0, MOVE_FORWARD, TURN_NEG };
 
-// Filtro de saltos bruscos en actualización de pose
-const float max_pose_jump =
-    500; // Máximo salto permitido en mm por actualización
-const float max_angle_jump = 179; // Máximo salto permitido en grados
-const int max_pose_jump_rejections =
-    3; // Rechazos consecutivos antes de re-sincronizar con la cámara
+// Filtro de saltos bruscos al actualizar la pose: un salto de mas de 500mm o de
+// mas de 179° entre lecturas se descarta por misread de la camara. Tras tres
+// rechazos seguidos se acepta igual, porque a esa altura el que esta mal es el
+// modelo interno y hay que re-sincronizar con la camara.
+const float max_pose_jump = 500;
+const float max_angle_jump = 179;
+const int max_pose_jump_rejections = 3;
 int poseJumpRejections = 0;
 
 // IMU
 const float conversionFactor = 8192.0;
 float yaw;
 float imuGravity;
-bool imuAvailable = false;  // true solo si setupIMU() completó exitosamente
+// Solo pasa a true si setupIMU() completo sin errores.
+bool imuAvailable = false;
 
 // LEDs
 int maxBrightness = 140;
@@ -198,11 +203,11 @@ int minLowBatteryTime = 200;
 // Contador de mensajes
 int countMessages = 0;
 
-// Sensor frontal (APDS9960)
+// Sensor frontal (APDS9960). Si no arranca al principio se reintenta cada 5s,
+// porque el bus I2C a veces no esta listo en el primer intento.
 bool frontSensorInitialized = false;
 unsigned long lastFrontSensorAttempt = 0;
-const unsigned long frontSensorRetryInterval =
-    5000; // Reintentar cada 5 segundos
+const unsigned long frontSensorRetryInterval = 5000;
 volatile bool lateralSensorsEnabled = false;
 
 // ============================================================================
@@ -212,7 +217,8 @@ volatile bool lateralSensorsEnabled = false;
 InterruptionContext intContext;
 EvasionTracker evasionTracker;
 CongregationState congregation;
-unsigned long lastLeaderCast = 0;  // throttle del broadcast LEADER_POSITION del líder
+// Throttle del broadcast LEADER_POSITION que emite el lider.
+unsigned long lastLeaderCast = 0;
 
 // Ventana móvil sobre la pose que difunde el líder, para no propagar el ruido
 // de la cámara al goal de los seguidores. La usa SmoothLeaderPose().
@@ -414,6 +420,8 @@ void SearchEvadeAndResume();
 // INTERRUPCIONES (ISR)
 // ============================================================================
 
+// Barre el bus I2C y lista lo que responde. Diagnostico de banco: si la IMU o
+// el APDS9960 no arrancan, esto dice si el problema es el cable o la libreria.
 void i2cScan() {
   Serial.println("\n=== I2C SCAN ===");
   int found = 0;
@@ -433,6 +441,9 @@ void i2cScan() {
   Serial.println("================\n");
 }
 
+// Encoder en cuadratura de la rueda izquierda. Compara la lectura anterior con
+// la nueva y suma o resta segun la transicion, de modo que el conteo lleva
+// signo y sobrevive a los rebotes.
 void IRAM_ATTR LeftWheelPulses() {
   int MSB = digitalRead(leftEncoderC2);
   int LSB = digitalRead(leftEncoderC1);
@@ -446,6 +457,7 @@ void IRAM_ATTR LeftWheelPulses() {
   pastLeftEncoder = encoder;
 }
 
+// Encoder en cuadratura de la rueda derecha, espejo del izquierdo.
 void IRAM_ATTR RightWheelPulses() {
   int MSB = digitalRead(rightEncoderC1);
   int LSB = digitalRead(rightEncoderC2);
@@ -459,18 +471,23 @@ void IRAM_ATTR RightWheelPulses() {
   pastRightEncoder = encoder;
 }
 
+// Flanco del infrarrojo izquierdo. Solo anota el instante: el filtro por
+// duracion minima corre en ReadSensors, fuera de la interrupcion.
 void IRAM_ATTR DetectLeftObstacle() {
   if (lateralSensorsEnabled && digitalRead(leftInfraredSensor) == LOW) {
     leftObsStartTime = micros();
   }
 }
 
+// Flanco del infrarrojo derecho, espejo del izquierdo.
 void IRAM_ATTR DetectRightObstacle() {
   if (lateralSensorsEnabled && digitalRead(rightInfraredSensor) == LOW) {
     rightObsStartTime = micros();
   }
 }
 
+// Aviso de bateria baja. Anota el instante para que el filtro por duracion
+// descarte los bajones momentaneos que produce el arranque de los motores.
 void LowBattery() {
   if (digitalRead(batteryStatus) == LOW) {
     lowBatteryTime = millis();
@@ -481,6 +498,9 @@ void LowBattery() {
 // FUNCIONES DE SETUP Y CONFIGURACIÓN
 // ============================================================================
 
+// Carga los pulsos por revolucion desde NVS, o guarda el valor por defecto la
+// primera vez. Cada robot tiene el suyo: se calibran contra ArUco y se midieron
+// diferencias de ~2% entre unidades.
 void InitializePPR() {
   preferences.begin("attabot-config", false);
 
@@ -509,6 +529,7 @@ void InitializePPR() {
                     (uint32_t)chipid);
 }
 
+// Persiste un PPR nuevo y recalcula lo que depende de el.
 void SavePPR(float newPPR) {
   preferences.begin("attabot-config", false);
   preferences.putFloat("ppr", newPPR);
@@ -516,6 +537,8 @@ void SavePPR(float newPPR) {
   DebugSerialPrintf("PPR guardado permanentemente: %.2f\n", newPPR);
 }
 
+// Carga las constantes del PID desde NVS, o guarda las de fabrica la primera
+// vez.
 void InitializePID() {
   preferences.begin("attabot-config", false);
   int   savedRes = preferences.getInt  ("pid_res", -1);
@@ -542,6 +565,7 @@ void InitializePID() {
   }
 }
 
+// Persiste constantes de PID nuevas.
 void SavePID(float kp, float ki, float kd) {
   preferences.begin("attabot-config", false);
   preferences.putInt  ("pid_res", pwm_resolution);
@@ -553,6 +577,8 @@ void SavePID(float kp, float ki, float kd) {
                     pwm_resolution, kp, ki, kd);
 }
 
+// Persiste los sesgos de giroscopo y acelerometro que dejo la calibracion del
+// DMP, para no tener que repetirla en cada arranque.
 void SaveIMUBias(biasStore* store) {
   preferences.begin("attabot-config", false);
   preferences.putInt("bias_gx", store->biasGyroX);
@@ -568,14 +594,22 @@ void SaveIMUBias(biasStore* store) {
   DebugSerialPrintln("Bias IMU guardados en Preferences");
 }
 
+// Recalcula la constante de conversion pulso->mm. Hay que llamarla despues de
+// cambiar el PPR o la circunferencia de rueda.
 void updateMillimetersPerPulse() {
   millimetersPerPulse = wheelCircumference / pulsesPerRev;
 }
 
+// Arranque: pines, PWM de motores, interrupciones de encoder e infrarrojos,
+// carga de la configuracion persistida, LED, IMU, sensor frontal, WiFi y OTA.
+//
+// El arranque se escalona con un retardo aleatorio: con varios robots
+// encendiendo a la vez, todos pedian IP en el mismo instante y el AP dejaba
+// afuera a alguno.
 void setup() {
 #ifdef DebugSerial
   Serial.begin(115200);
-  delay(500); // Dar tiempo al Serial Monitor para conectar
+  delay(500);
   Serial.println("\n\n=== INICIO DE SETUP ===");
 #endif
 
@@ -583,7 +617,7 @@ void setup() {
   // juntos Usa la MAC address como semilla para que cada robot tenga un delay
   // único
   randomSeed(ESP.getEfuseMac());
-  unsigned long startupDelay = random(100, 2000); // Entre 100ms y 2 segundos
+  unsigned long startupDelay = random(100, 2000);
   DebugSerialPrintf("Esperando %lu ms antes de iniciar WiFi...\n",
                     startupDelay);
   delay(startupDelay);
@@ -663,7 +697,8 @@ void setup() {
 
   DebugSerialPrintln("[8] Configurando encoders...");
   pinMode(leftEncoderC1, INPUT_PULLUP);
-  pinMode(leftEncoderC2, INPUT); // GPIO 35 es input-only, sin pull-up
+  // GPIO 35 es input-only y no admite pull-up interno.
+  pinMode(leftEncoderC2, INPUT);
                                  // (compatible con ESP32 Core 3.x)
   pinMode(rightEncoderC1, INPUT_PULLUP);
   pinMode(rightEncoderC2, INPUT_PULLUP);
