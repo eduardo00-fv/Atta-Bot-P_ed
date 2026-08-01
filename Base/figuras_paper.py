@@ -142,10 +142,17 @@ def fig_fases(ds, runs):
     fig.savefig(f'{OUT}/fig_fases_{ds["slug"]}.png', dpi=150)
 
 
-def fig_trayectorias(ds, runs):
+def fig_trayectorias(ds, runs, paper=False):
+    """Trayectorias sobre la geometría real.
+
+    Con `paper=True` sale la versión que va al artículo: en inglés, con las
+    etiquetas de escenario del paper, sin título embebido —de eso se encarga el
+    caption de LaTeX— y en PDF vectorial como el resto de las figuras.
+    """
     W, H = ds['arena']
+    orden = PAPER_ORDER if paper else ORDER
     fig, axes = plt.subplots(1, 5, figsize=(16, 2.9 * (H / W) / (1750 / 2400)))
-    for ax, sc in zip(axes, ORDER):
+    for ax, sc in zip(axes, orden):
         for x, y, w, h in ds['obstaculos'][sc]:
             ax.add_patch(Rectangle((x - w / 2, y - h / 2), w, h,
                                    fc='#b9a888', ec='#8a7c60', lw=.6))
@@ -179,7 +186,15 @@ def fig_trayectorias(ds, runs):
         ax.set_yticks([])
         for s in ax.spines.values():
             s.set_visible(False)
-        ax.set_title(sc, fontsize=9, color=INK)
+        ax.set_title(PAPER_ETIQ[orden.index(sc)] if paper else sc,
+                     fontsize=9, color=INK)
+    if paper:
+        fig.tight_layout()
+        out = os.path.join(BASE, '..', 'Docs', 'paper', 'nuevo paper',
+                           f'trajectories_{ds["slug"]}.pdf')
+        fig.savefig(out, bbox_inches='tight')
+        print(' ', os.path.normpath(out))
+        return
     fig.suptitle(f'Trayectorias durante la congregación — {ds["nombre"]}. '
                  'La cruz es el punto de encuentro; las cajas, los obstáculos.',
                  fontsize=10, x=.01, ha='left')
