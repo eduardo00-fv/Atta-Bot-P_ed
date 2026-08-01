@@ -568,16 +568,59 @@ the agents arrive the final geometry is imposed by the controller and not by the
 scenario. Compactness is informative as a time series --- how quickly the swarm
 tightens --- rather than as a final value.
 
+\subsection{Physical experiments}
+
+The same five configurations were run in the physical arena with four agents and
+three repetitions each, the repetitions differing in the initial arrangement of
+the swarm. \textbf{No statistically significant differences were found.} A
+one-way ANOVA over the five configurations does not reject equal means for the
+aggregation time ($p = 0.40$), and neither factor of the design reaches
+significance when taken separately: $p = 0.61$ for the gap width and $p = 0.50$
+for the obstacle size. The most likely reason is the sample size. Three
+repetitions per configuration leave the between-run variability of a physical
+swarm --- marker occlusions, unit-to-unit differences, the exact pose at which
+the random walk ends --- larger than the effect being sought.
+
+The point estimates, however, are not arbitrary: several of them agree with the
+simulation, and the agreements are on the features the simulation identifies as
+driven by topology.
+
+First, the obstacle-free control is the fastest condition in both settings
+($15.5$~s against a minimum of $27.7$~s among the obstacle configurations in the
+laboratory, and $17.1$~s against $23.5$~s in simulation): the mere presence of
+the barrier costs time regardless of its shape.
+
+Second, the slowest configuration is the same one in both, namely large
+obstacles with narrow gaps, which is also the configuration with the smallest
+effective passage.
+
+Third, the ordering of the five configurations agrees more than chance would
+suggest, with a rank correlation between the two settings of $\rho = 0.70$ for
+the aggregation time and $\rho = 0.60$ for the final compactness. Compactness in
+particular reproduces both extremes: the obstacle-free control yields the
+tightest swarm and the large-obstacle narrow-gap configuration the loosest, in
+the laboratory as in simulation.
+
+Fourth, of the four available within-size comparisons --- narrowing the gap while
+holding the obstacle size fixed, in each setting --- three show the expected
+increase in aggregation time. The exception is the small-obstacle pair in the
+laboratory.
+
+One quantity does not agree, and it is worth stating because it is the one that
+carries the effect in simulation. The normalized distance travelled shows no
+correspondence between the two settings ($\rho = -0.30$), and in the laboratory
+the obstacle-free control does not produce the straightest paths, which it
+should. This metric depends on each agent completing a well-defined trajectory
+between two points, and it is the most sensitive of the three to the localization
+gaps caused by marker occlusion. With four agents and three repetitions there is
+no redundancy to absorb them.
+
 \subsection{Effect of swarm size}
 
-The same design was run with four agents in the physical arena, and the ordering
-of the configurations is preserved. However, at that swarm size neither factor
-reaches significance: $p = 0.61$ for the gap width and $p = 0.50$ for the
-obstacle size on the aggregation time, and $p = 0.10$ on the travelled distance.
-The dependence on topology is therefore not an unconditional property of the
-aggregation behavior. It is evident with ten agents and not detectable with four,
-under the same passage widths, the same obstacle areas and the same control
-software.
+Taken together, the dependence on topology is not an unconditional property of
+the aggregation behavior. It is statistically evident with ten agents and not
+detectable with four, under the same passage widths, the same obstacle areas and
+the same control software.
 
 A congestion argument accounts for this. The passage acts as a shared resource,
 and the cost it imposes grows with the number of agents that must traverse it
