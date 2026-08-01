@@ -23,7 +23,7 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, '..', '..'))
-FQBN = 'esp32:esp32:esp32'
+FQBN = 'esp32:esp32:esp32:PartitionScheme=min_spiffs'
 
 CLI_CANDIDATOS = [
     '/opt/arduino-ide/resources/app/lib/backend/resources/arduino-cli',
@@ -74,7 +74,10 @@ def main():
             'compilerPath': compilador,
             'cStandard': 'c11',
             'cppStandard': 'c++17',
-            'intelliSenseMode': 'gcc-x86',
+            # El compilador es xtensa, que no esta en la lista de la extension.
+            # Se declara el gcc generico de 64 bits y los macros de verdad los
+            # saca la extension consultando compilerPath.
+            'intelliSenseMode': 'linux-gcc-x64',
             'includePath': incs + [os.path.join(HERE, '**')],
             'defines': defs,
             'forcedInclude': ([os.path.join(core, 'Arduino.h')] if core else []),

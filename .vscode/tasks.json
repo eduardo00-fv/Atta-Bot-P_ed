@@ -5,7 +5,7 @@
             "label": "firmware: compilar",
             "detail": "arduino-cli contra el core 3.3.11. Los errores quedan clicables en el panel Problemas.",
             "type": "shell",
-            "command": "/opt/arduino-ide/resources/app/lib/backend/resources/arduino-cli compile --fqbn esp32:esp32:esp32 --build-path build .",
+            "command": "/opt/arduino-ide/resources/app/lib/backend/resources/arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs --build-path build .",
             "options": { "cwd": "${workspaceFolder}/Controller/AttaBot" },
             "group": { "kind": "build", "isDefault": true },
             "presentation": { "reveal": "always", "panel": "dedicated" },
@@ -22,7 +22,7 @@
             "label": "firmware: compilar con warnings",
             "detail": "Igual pero con --warnings all: formatos de printf, volatile, shadowing.",
             "type": "shell",
-            "command": "/opt/arduino-ide/resources/app/lib/backend/resources/arduino-cli compile --fqbn esp32:esp32:esp32 --warnings all --build-path build .",
+            "command": "/opt/arduino-ide/resources/app/lib/backend/resources/arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs --warnings all --build-path build .",
             "options": { "cwd": "${workspaceFolder}/Controller/AttaBot" },
             "presentation": { "reveal": "always", "panel": "dedicated" },
             "problemMatcher": {
@@ -40,6 +40,31 @@
             "type": "shell",
             "command": "${workspaceFolder}/Base/.venv/bin/python OTA.py --build ${input:robotsOTA}",
             "options": { "cwd": "${workspaceFolder}/Controller/AttaBot" },
+            "presentation": { "reveal": "always", "panel": "dedicated" },
+            "problemMatcher": []
+        },
+        {
+            "label": "firmware: compilar y subir por USB",
+            "detail": "Obligatorio la PRIMERA vez en cada robot: partitions.csv cambia la tabla y eso no se puede por OTA.",
+            "type": "shell",
+            "command": "/opt/arduino-ide/resources/app/lib/backend/resources/arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs --build-path build --upload --port ${input:puertoUSB} .",
+            "options": { "cwd": "${workspaceFolder}/Controller/AttaBot" },
+            "presentation": { "reveal": "always", "panel": "dedicated" },
+            "problemMatcher": []
+        },
+        {
+            "label": "firmware: ver puertos USB",
+            "detail": "Lista las placas conectadas, para saber qué poner en la tarea de arriba.",
+            "type": "shell",
+            "command": "/opt/arduino-ide/resources/app/lib/backend/resources/arduino-cli board list",
+            "presentation": { "reveal": "always" },
+            "problemMatcher": []
+        },
+        {
+            "label": "firmware: monitor serie",
+            "detail": "Abre la consola del robot conectado. Ctrl+C para salir.",
+            "type": "shell",
+            "command": "/opt/arduino-ide/resources/app/lib/backend/resources/arduino-cli monitor --port ${input:puertoUSB} --config baudrate=115200",
             "presentation": { "reveal": "always", "panel": "dedicated" },
             "problemMatcher": []
         },
@@ -93,6 +118,12 @@
             "type": "promptString",
             "description": "Robots destino por último octeto, separados por espacio. Vacío = todos.",
             "default": ""
+        },
+        {
+            "id": "puertoUSB",
+            "type": "promptString",
+            "description": "Puerto serie del robot. Correr 'firmware: ver puertos USB' si no sabés cuál es.",
+            "default": "/dev/ttyUSB0"
         }
     ]
 }

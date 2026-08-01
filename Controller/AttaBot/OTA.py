@@ -51,7 +51,10 @@ CLI_CANDIDATOS = [
     os.path.expanduser('~/.local/bin/arduino-cli'),
     '/usr/bin/arduino-cli',
 ]
-FQBN = 'esp32:esp32:esp32'  
+# El PartitionScheme NO es decorativo: partitions.csv le da al sketch un slot de
+# 1.97MB en vez de los 1.31MB del layout por defecto. Sin declararlo, arduino-cli
+# mide contra el slot equivocado y reporta 93% de uso cuando el real es 62%.
+FQBN = 'esp32:esp32:esp32:PartitionScheme=min_spiffs'
 
 IPS = [
     "192.168.1.101",

@@ -18,17 +18,27 @@ Antes de subir verifica que el `.bin` sea más nuevo que **todos** los `.ino` y
 `.h` del sketch. Un OTA que sube un binario viejo es indistinguible de uno que
 funciona, hasta que se prueba el robot.
 
-Para compilar sin subir:
+Por USB (obligatorio la primera vez en cada robot, ver abajo):
 
 ```sh
-/opt/arduino-ide/resources/app/lib/backend/resources/arduino-cli \
-  compile --fqbn esp32:esp32:esp32 --build-path build .
+CLI=/opt/arduino-ide/resources/app/lib/backend/resources/arduino-cli
+$CLI board list                      # ver en qué puerto quedó
+$CLI compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs \
+     --build-path build --upload --port /dev/ttyUSB0 .
+$CLI monitor --port /dev/ttyUSB0 --config baudrate=115200
 ```
 
-Agregar `--warnings all` para el pase de warnings.
+Desde VS Code lo mismo está como tareas: `firmware: compilar y subir por USB`,
+`ver puertos USB` y `monitor serie`.
 
-⚠ El **primer** flasheo de cada robot tiene que ser por USB, porque
-`partitions.csv` cambia la tabla de particiones y eso no se puede hacer por OTA.
+⚠ **El `PartitionScheme=min_spiffs` del FQBN no es decorativo.** `partitions.csv`
+le da al sketch un slot de 1.97MB en vez de los 1.31MB del layout por defecto.
+Sin declararlo, `arduino-cli` compila igual pero mide contra el slot equivocado y
+reporta 93% de uso cuando el real es 62%.
+
+⚠ **El primer flasheo de cada robot tiene que ser por USB**, porque
+`partitions.csv` cambia la tabla de particiones y eso no se puede hacer por OTA:
+el OTA escribe en el slot de aplicación, nunca en la tabla.
 
 ## Estructura del sketch
 
