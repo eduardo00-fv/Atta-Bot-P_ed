@@ -1,0 +1,38 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Base SIM + Webots (todo en uno)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Base/AttaBot_Base.py",
+            "args": ["--sim", "--robots", "2"],
+            "cwd": "${workspaceFolder}/Base",
+            "python": "${workspaceFolder}/Base/.venv/bin/python",
+            "console": "integratedTerminal",
+            "preLaunchTask": "webots-diferido",
+            "justMyCode": true
+        },
+        {
+            "name": "Base SIM (solo la base)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Base/AttaBot_Base.py",
+            "args": ["--sim", "--robots", "2"],
+            "cwd": "${workspaceFolder}/Base",
+            "python": "${workspaceFolder}/Base/.venv/bin/python",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Base LAB (cámara real)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Base/AttaBot_Base.py",
+            "cwd": "${workspaceFolder}/Base",
+            "python": "${workspaceFolder}/Base/.venv/bin/python",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ]
+}

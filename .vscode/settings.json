@@ -1,0 +1,14 @@
+{
+    "files.associations": {
+        "*.ino": "cpp"
+    },
+    "C_Cpp.default.configurationProvider": "",
+    "python.defaultInterpreterPath": "${workspaceFolder}/Base/.venv/bin/python",
+    "search.exclude": {
+        "**/.venv": true,
+        "Controller/AttaBot/build": true,
+        "Base/PositionLogs": true,
+        "Base/ConsoleLogs": true,
+        "Base/Videos": true
+    }
+}

@@ -9,8 +9,17 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .dist-info/
-.vscode/
 .idea/
+
+# De .vscode se versiona lo portable (tareas, lanzadores, ajustes) y se ignora
+# lo que describe ESTA maquina: c_cpp_properties.json lleva rutas absolutas al
+# core ESP32 y lo regenera Controller/AttaBot/vscode_setup.py.
+.vscode/*
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/settings.json
+!.vscode/extensions.json
+
 .DS_Store
 Thumbs.db
 .env

@@ -1,0 +1,98 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "firmware: compilar",
+            "detail": "arduino-cli contra el core 3.3.11. Los errores quedan clicables en el panel Problemas.",
+            "type": "shell",
+            "command": "/opt/arduino-ide/resources/app/lib/backend/resources/arduino-cli compile --fqbn esp32:esp32:esp32 --build-path build .",
+            "options": { "cwd": "${workspaceFolder}/Controller/AttaBot" },
+            "group": { "kind": "build", "isDefault": true },
+            "presentation": { "reveal": "always", "panel": "dedicated" },
+            "problemMatcher": {
+                "owner": "cpp",
+                "fileLocation": ["autoDetect", "${workspaceFolder}/Controller/AttaBot"],
+                "pattern": {
+                    "regexp": "^(.*):(\\d+):(\\d+):\\s+(warning|error|note):\\s+(.*)$",
+                    "file": 1, "line": 2, "column": 3, "severity": 4, "message": 5
+                }
+            }
+        },
+        {
+            "label": "firmware: compilar con warnings",
+            "detail": "Igual pero con --warnings all: formatos de printf, volatile, shadowing.",
+            "type": "shell",
+            "command": "/opt/arduino-ide/resources/app/lib/backend/resources/arduino-cli compile --fqbn esp32:esp32:esp32 --warnings all --build-path build .",
+            "options": { "cwd": "${workspaceFolder}/Controller/AttaBot" },
+            "presentation": { "reveal": "always", "panel": "dedicated" },
+            "problemMatcher": {
+                "owner": "cpp",
+                "fileLocation": ["autoDetect", "${workspaceFolder}/Controller/AttaBot"],
+                "pattern": {
+                    "regexp": "^(.*):(\\d+):(\\d+):\\s+(warning|error|note):\\s+(.*)$",
+                    "file": 1, "line": 2, "column": 3, "severity": 4, "message": 5
+                }
+            }
+        },
+        {
+            "label": "firmware: compilar y subir por OTA",
+            "detail": "Pide los robots destino (vacío = todos). Valida que el .bin sea más nuevo que las fuentes.",
+            "type": "shell",
+            "command": "${workspaceFolder}/Base/.venv/bin/python OTA.py --build ${input:robotsOTA}",
+            "options": { "cwd": "${workspaceFolder}/Controller/AttaBot" },
+            "presentation": { "reveal": "always", "panel": "dedicated" },
+            "problemMatcher": []
+        },
+        {
+            "label": "firmware: rehacer IntelliSense",
+            "detail": "Regenera .vscode/c_cpp_properties.json. Correr tras actualizar el core o instalar una librería.",
+            "type": "shell",
+            "command": "${workspaceFolder}/Base/.venv/bin/python vscode_setup.py",
+            "options": { "cwd": "${workspaceFolder}/Controller/AttaBot" },
+            "problemMatcher": []
+        },
+        {
+            "label": "webots-diferido",
+            "detail": "Cierra Webots previos y lo relanza 4s después (la base debe tomar el 6060 primero)",
+            "type": "shell",
+            "command": "flatpak kill com.cyberbotics.webots 2>/dev/null; nohup bash -c 'sleep 4; exec flatpak run com.cyberbotics.webots ${env:HOME}/Documents/AttaBot-Sim/webots/worlds/attabot.wbt' >/tmp/webots_vscode.log 2>&1 & exit 0",
+            "presentation": { "reveal": "silent" },
+            "problemMatcher": []
+        },
+        {
+            "label": "cerrar Webots",
+            "type": "shell",
+            "command": "flatpak kill com.cyberbotics.webots",
+            "problemMatcher": []
+        },
+        {
+            "label": "E2E base real (headless, ~2min)",
+            "type": "shell",
+            "command": "python -u tools/experimento_base_real.py",
+            "options": { "cwd": "${env:HOME}/Documents/AttaBot-Sim" },
+            "problemMatcher": []
+        },
+        {
+            "label": "métricas: sesión más reciente",
+            "type": "shell",
+            "command": "${workspaceFolder}/Base/.venv/bin/python analyze_logs.py",
+            "options": { "cwd": "${workspaceFolder}/Base" },
+            "problemMatcher": []
+        },
+        {
+            "label": "métricas: histórico completo",
+            "type": "shell",
+            "command": "${workspaceFolder}/Base/.venv/bin/python analyze_logs.py --all",
+            "options": { "cwd": "${workspaceFolder}/Base" },
+            "problemMatcher": []
+        }
+    ],
+    "inputs": [
+        {
+            "id": "robotsOTA",
+            "type": "promptString",
+            "description": "Robots destino por último octeto, separados por espacio. Vacío = todos.",
+            "default": ""
+        }
+    ]
+}
