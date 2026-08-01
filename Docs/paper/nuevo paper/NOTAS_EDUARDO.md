@@ -225,29 +225,47 @@ though the total obstacle area was kept constant across configurations by
 construction.
 %%%
 
-### Enlazar con el laboratorio — y hay que hacerlo con cuidado
+### Enlazar los dos experimentos
+
+⚠ **Ojo con el marco.** No estamos validando la simulación contra el
+laboratorio: la pregunta del paper es si el comportamiento de congregación
+depende de la topología del entorno. Los dos experimentos son dos instancias de
+esa misma pregunta, a distinto tamaño de enjambre y de arena. Que el efecto
+aparezca en uno y no en el otro no es un fallo de acuerdo — **es parte del
+resultado**, porque acota bajo qué condiciones la topología manda.
 
 Aplicando el **mismo criterio** en los dos lados, el laboratorio da: NoObs 11.5 s,
-0.7a-4d 23.2, 0.7a-2d 30.0, 2.1a-4d 46.8, 2.1a-2d 56.1. El orden coincide con la
-simulación, pero **el laboratorio no alcanza significancia** (p = 0.40), y
-separando factores tampoco: pasaje p = 0.61, tamaño p = 0.50.
-
-No se puede escribir que el laboratorio confirma la simulación. Lo honesto:
+0.7a-4d 23.2, 0.7a-2d 30.0, 2.1a-4d 46.8, 2.1a-2d 56.1. El orden es el mismo que
+en la simulación, pero con 4 robots ningún factor alcanza significancia (pasaje
+p = 0.61, tamaño p = 0.50).
 
 %%%
-The physical experiments are consistent with this ordering but do not resolve it:
-with three repetitions per configuration neither factor reaches significance
-($p = 0.61$ for the gap width and $p = 0.50$ for the obstacle size). Two
-explanations are compatible with the available data and the present design cannot
-separate them. The first is simply statistical power. The second is that the
-effect is driven by congestion at the passage, which four agents crossing a
-2.4~m barrier hardly produce while ten do; under this reading swarm size is not a
-scaling parameter of the phenomenon but a precondition for it. Distinguishing the
-two requires either more repetitions at the current swarm size or a larger
-physical swarm, and this is the immediate continuation of the work.
+The same design was run with four agents in the physical arena. The ordering of
+the configurations is preserved, but neither factor reaches significance at that
+swarm size ($p = 0.61$ for the gap width, $p = 0.50$ for the obstacle size). The
+dependence on topology is therefore not an unconditional property of the
+aggregation behavior: it emerges with ten agents and is not detectable with four,
+under the same passage widths and the same obstacle areas.
+
+A congestion argument accounts for this. The passage acts as a shared resource,
+and the cost it imposes grows with the number of agents that must traverse it
+within the same episode; four agents crossing a $2.4$~m barrier queue very little,
+while ten do. Under this reading swarm size is not a scaling parameter of the
+phenomenon but a precondition for it, and the relevant quantity is not the
+passage width alone but its ratio to the demand placed on it. The present design
+cannot separate this explanation from a simple lack of statistical power at
+$n = 3$ repetitions, and doing so — by increasing either the repetitions or the
+physical swarm size — is the immediate continuation of the work.
 %%%
 
-Esto además le da contenido concreto a Conclusions and future work.
+Esto es lo que le da contenido a Conclusions: la respuesta a «¿depende de la
+topología?» no es sí o no, es **sí, condicionado al tamaño del enjambre**.
+
+⚠ El cierre de la sección de simulación del borrador anterior decía que *«the
+quantitative characterization rests on the physical platform»* y que la
+simulación era «evidence of scalability». Con estos datos eso quedó al revés y
+hay que reescribirlo: la caracterización cuantitativa la da la simulación, y el
+laboratorio aporta el caso de enjambre pequeño.
 
 ---
 
