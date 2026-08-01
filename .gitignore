@@ -35,3 +35,6 @@ Base/simulacion_31-07/Videos/
 # Copia del dataset que armo el usuario para compartir (incluye videos)
 Base/analisis_30-07/data/
 Base/analisis_30-07.zip
+
+# Salida de arduino-cli (el .bin se regenera con: python3 OTA.py --build)
+Controller/AttaBot/build/

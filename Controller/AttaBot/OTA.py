@@ -5,6 +5,7 @@ Uso:
     python3 OTA.py                 # a todas las IPs de la lista
     python3 OTA.py 101 104         # solo a .101 y .104 (atajo por último octeto)
     python3 OTA.py 192.168.1.101   # IP completa también vale
+    python3 OTA.py --build 101     # compila primero y despues sube
 
 Antes de subir verifica que el .bin sea más nuevo que el código fuente. Esa
 guarda existe porque el 2026-07-29 el .bin del build tenía SEIS SEMANAS: subirlo
@@ -22,14 +23,35 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# El .bin lo produce el IDE de Arduino en el build path del sketch. Ruta relativa
-# al script: la absoluta hardcodeada rompía el repo en cualquier otra máquina.
-BIN = os.path.join(HERE, 'build', 'esp32.esp32.esp32', 'AttaBot.ino.bin')
+# Ruta relativa al script: la absoluta hardcodeada rompía el repo en cualquier
+# otra máquina. Se aceptan los dos layouts de build: el del IDE, que mete el .bin
+# en un subdirectorio con el nombre del FQBN, y el de `arduino-cli --build-path`,
+# que lo deja plano.
+BIN_CANDIDATOS = [
+    os.path.join(HERE, 'build', 'esp32.esp32.esp32', 'AttaBot.ino.bin'),
+    os.path.join(HERE, 'build', 'AttaBot.ino.bin'),
+]
 # Fuentes que tienen que ser MÁS VIEJAS que el .bin para que subir tenga sentido.
-SOURCES = [os.path.join(HERE, 'AttaBot.ino'), os.path.join(HERE, 'utils.h')]
+# Se listan por glob y NO a mano: cuando el sketch se repartió en varios .ino
+# (2026-08-01) la lista fija seguía nombrando solo AttaBot.ino y utils.h, así que
+# editar comandos.ino y subir pasaba el chequeo con un binario viejo — que es
+# exactamente el fallo que esta guarda existe para evitar.
+SOURCES = sorted(glob.glob(os.path.join(HERE, '*.ino'))
+                 + glob.glob(os.path.join(HERE, '*.h')))
 
-PORT = 3232          # puerto OTA (ArduinoOTA usa 3232 por defecto)
-PASS = "attabot1234"  # password de ArduinoOTA.setPassword()
+# Puerto por defecto de ArduinoOTA y la clave de ArduinoOTA.setPassword().
+PORT = 3232
+PASS = "attabot1234"
+
+# arduino-cli para compilar sin abrir el IDE. El primero es el que el propio IDE
+# trae adentro, asi que en esta maquina no hay nada que instalar; el segundo es
+# por si algun dia se instala suelto.
+CLI_CANDIDATOS = [
+    '/opt/arduino-ide/resources/app/lib/backend/resources/arduino-cli',
+    os.path.expanduser('~/.local/bin/arduino-cli'),
+    '/usr/bin/arduino-cli',
+]
+FQBN = 'esp32:esp32:esp32'  
 
 IPS = [
     "192.168.1.101",
@@ -60,12 +82,18 @@ def find_espota():
     return found[-1]
 
 
-def check_binary_fresh():
-    """Aborta si el .bin no existe o es más viejo que el código fuente."""
-    if not os.path.isfile(BIN):
-        sys.exit(f'✗ No existe el binario:\n  {BIN}\n'
-                 '  Compilá el sketch en el IDE de Arduino antes de subir.')
+def find_bin():
+    """El .bin más nuevo entre los layouts de build conocidos."""
+    hay = [b for b in BIN_CANDIDATOS if os.path.isfile(b)]
+    if not hay:
+        sys.exit('✗ No existe el binario. Buscado en:\n  '
+                 + '\n  '.join(BIN_CANDIDATOS)
+                 + '\n  Compilá primero: python3 OTA.py --build')
+    return max(hay, key=os.path.getmtime)
 
+
+def check_binary_fresh(BIN):
+    """Aborta si el .bin es más viejo que alguna fuente del sketch."""
     bin_time = os.path.getmtime(BIN)
     stale = [(s, os.path.getmtime(s)) for s in SOURCES
              if os.path.isfile(s) and os.path.getmtime(s) > bin_time]
@@ -77,8 +105,8 @@ def check_binary_fresh():
         for s, t in stale:
             print(f'  más nuevo: {os.path.basename(s)} '
                   f'{time.strftime("%Y-%m-%d %H:%M", time.localtime(t))}')
-        print('\n  Recompilá en el IDE de Arduino. Si subís así, el robot va a '
-              'arrancar bien\n  pero con el firmware viejo adentro.')
+        print('\n  Recompilá (python3 OTA.py --build). Si subís así, el robot '
+              'va a arrancar bien\n  pero con el firmware viejo adentro.')
         sys.exit(1)
 
     print(f'✓ Binario: {time.strftime("%Y-%m-%d %H:%M", time.localtime(bin_time))} '
@@ -95,7 +123,26 @@ def resolve_targets(args):
     return out
 
 
-def upload(ip, espota, results):
+def compilar():
+    """Compila el sketch con el arduino-cli que trae el IDE, sin abrir el IDE.
+
+    No hace falta instalar nada: el binario viene adentro de /opt/arduino-ide y
+    el core ESP32 ya está en ~/.arduino15. Deja el .bin en build/, que es donde
+    lo busca este mismo script.
+    """
+    cli = next((c for c in CLI_CANDIDATOS if os.path.isfile(c)), None)
+    if cli is None:
+        sys.exit('✗ No encontré arduino-cli. Buscado en:\n  '
+                 + '\n  '.join(CLI_CANDIDATOS))
+    print(f'Compilando con {cli}')
+    r = subprocess.run([cli, 'compile', '--fqbn', FQBN,
+                        '--build-path', os.path.join(HERE, 'build'), HERE])
+    if r.returncode != 0:
+        sys.exit('✗ La compilación falló; no se sube nada.')
+    print()
+
+
+def upload(ip, espota, BIN, results):
     print(f"🚀 Subiendo firmware a {ip} ...")
     try:
         subprocess.run(
@@ -113,15 +160,21 @@ def upload(ip, espota, results):
 
 
 def main():
+    args = sys.argv[1:]
+    if '--build' in args:
+        args.remove('--build')
+        compilar()
+
     espota = find_espota()
     print(f'espota: {espota}')
-    check_binary_fresh()
+    BIN = find_bin()
+    check_binary_fresh(BIN)
 
-    targets = resolve_targets(sys.argv[1:])
+    targets = resolve_targets(args)
     print(f'Objetivos: {", ".join(targets)}\n')
 
     results = {}
-    threads = [threading.Thread(target=upload, args=(ip, espota, results))
+    threads = [threading.Thread(target=upload, args=(ip, espota, BIN, results))
                for ip in targets]
     for t in threads:
         t.start()
