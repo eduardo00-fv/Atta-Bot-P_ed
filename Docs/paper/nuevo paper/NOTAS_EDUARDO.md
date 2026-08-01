@@ -206,6 +206,46 @@ Números finales, con R = anillo efectivo + 2 diámetros = 900 mm y el criterio 
 
 ANOVA de una vía sobre el escenario: **F(4,10) = 13.81, p = 0.00044**.
 
+### ⚠ CORRECCIÓN IMPORTANTE: ese p no es robusto
+
+Probé la sensibilidad al radio de la zona de congregación y el resultado se
+mueve muchísimo:
+
+| radio | corridas que convergen | ANOVA escenario | pasaje 2d vs 4d |
+|---|---|---|---|
+| 800 mm | 9/15 | p = 0.074 | p = 0.139 |
+| 850 mm | 12/15 | p = 0.015 | p = 0.0075 |
+| **900 mm** | **15/15** | **p = 0.00044** | **p = 0.0025** |
+| 1000 mm | 15/15 | p = 0.750 | p = 0.641 |
+| 1100 mm | 13/15 | p = 0.118 | p = 0.675 |
+
+O sea que **elegí sin querer el valor donde más significativo sale**. Con el
+radio muy chico se descartan corridas donde un robot se asienta apenas afuera;
+con el radio muy grande el criterio se cumple tan temprano que los escenarios
+dejan de distinguirse. Un p-valor que salta de 0.0004 a 0.75 según un umbral no
+puede ser el titular del paper.
+
+**Las métricas SIN umbral no tienen ese problema** y ahí sí hay un resultado
+sólido:
+
+| métrica | simulación | laboratorio |
+|---|---|---|
+| ratio de ruta, ANOVA escenario | **p = 0.020** | p = 0.146 |
+| ratio de ruta, pasaje 2d vs 4d | 1.70 vs 1.46 — **p = 0.00076** | p = 0.100 |
+| compactación (ec. 1), ANOVA | p = 0.054 | p = 0.296 |
+
+**El titular debería ser el ratio de ruta**, no el tiempo: no depende de ningún
+umbral, y el efecto del pasaje sale con p = 0.00076. El tiempo se reporta al lado,
+con el mismo orden, pero declarando que depende de cómo se defina la zona.
+
+La compactación final es la menos discriminante (p = 0.054) y tiene una
+explicación: el comportamiento manda a cada robot a un puesto de un anillo cuyo
+radio lo fija el tamaño del enjambre, así que la geometría final la impone el
+controlador y no el escenario. Sirve como serie temporal —qué tan rápido se
+aprieta— más que como valor final.
+
+Así quedó escrito en `main.tex`.
+
 %%%
 The ten-agent simulation resolves the effect that the physical experiments
 suggest but cannot establish. Congregation time grows monotonically as the

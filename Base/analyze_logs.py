@@ -79,8 +79,13 @@ def session_tag(path):
     return re.sub(r'^(Position|Console)_Log_', '', name).rsplit('.', 1)[0]
 
 
-def find_sessions():
+def find_sessions(extra_dir=None):
     """Retorna [(tag, position_csv, console_csv|None)] ordenado por mtime.
+
+    `extra_dir` agrega otro par PositionLogs/ConsoleLogs a la búsqueda. Lo usa
+    `run_campaign` con la carpeta del manifiesto, para que una campaña
+    empaquetada aparte (con sus propios logs al lado) se analice sin tener que
+    devolver los CSV a Base/.
 
     Acepta CUALQUIER csv en PositionLogs, no solo 'Position_Log_*': en el lab las
     corridas se renombran al escenario (SinObs_ALin.csv) apenas terminan, y con
@@ -90,9 +95,14 @@ def find_sessions():
     al renombrar a mano es fácil renombrar el PositionLog y olvidar el Console_Log,
     y ambos archivos se cierran juntos al final de la corrida.
     """
-    positions = sorted(glob.glob(os.path.join(POS_DIR, '*.csv')),
+    pos_dirs, con_dirs = [POS_DIR], [CON_DIR]
+    if extra_dir:
+        pos_dirs.append(os.path.join(extra_dir, 'PositionLogs'))
+        con_dirs.append(os.path.join(extra_dir, 'ConsoleLogs'))
+    positions = sorted((p for d in pos_dirs
+                        for p in glob.glob(os.path.join(d, '*.csv'))),
                        key=os.path.getmtime)
-    consoles = glob.glob(os.path.join(CON_DIR, '*.csv'))
+    consoles = [c for d in con_dirs for c in glob.glob(os.path.join(d, '*.csv'))]
     by_tag = {session_tag(p): p for p in consoles}
 
     out = []
@@ -803,7 +813,8 @@ def run_campaign(a):
     if not manifest:
         print(f'✗ Manifiesto vacío o ilegible: {a.campaign}')
         return
-    available = {tag: (pos, con) for tag, pos, con in find_sessions()}
+    available = {tag: (pos, con) for tag, pos, con
+                 in find_sessions(os.path.dirname(os.path.abspath(a.campaign)))}
 
     runs, robots, missing = [], [], []
     scen_meta, series_by_scen = {}, {}
