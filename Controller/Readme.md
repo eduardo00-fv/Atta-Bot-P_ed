@@ -1,6 +1,54 @@
 # Robot controller
 
-C++ files for the robot microcontroller. Uses Arduino IDE for compiling and uploading.
+C++ files for the robot microcontroller.
+
+## Cómo se compila y se sube
+
+No hace falta abrir el IDE. `OTA.py` compila y sube por WiFi en un solo paso,
+usando el `arduino-cli` que el propio IDE trae adentro:
+
+```sh
+cd Controller/AttaBot
+python3 OTA.py --build          # compila y sube a todos los robots
+python3 OTA.py --build 101 104  # solo a .101 y .104
+python3 OTA.py 101              # sube lo ya compilado
+```
+
+Antes de subir verifica que el `.bin` sea más nuevo que **todos** los `.ino` y
+`.h` del sketch. Un OTA que sube un binario viejo es indistinguible de uno que
+funciona, hasta que se prueba el robot.
+
+Para compilar sin subir:
+
+```sh
+/opt/arduino-ide/resources/app/lib/backend/resources/arduino-cli \
+  compile --fqbn esp32:esp32:esp32 --build-path build .
+```
+
+Agregar `--warnings all` para el pase de warnings.
+
+⚠ El **primer** flasheo de cada robot tiene que ser por USB, porque
+`partitions.csv` cambia la tabla de particiones y eso no se puede hacer por OTA.
+
+## Estructura del sketch
+
+Arduino concatena todos los `.ino` de la carpeta en una sola unidad de
+traducción — primero el que se llama como la carpeta, después el resto en orden
+alfabético. Por eso las constantes, las variables globales y las declaraciones
+forward viven en `AttaBot.ino` y los demás archivos las ven directo, sin
+`extern` ni cabeceras. La contra es que no hay encapsulación real: cualquier
+archivo puede tocar cualquier global.
+
+| archivo | qué lleva |
+|---|---|
+| `AttaBot.ino` | debug, pines, constantes, globales, declaraciones, ISR, `setup()` |
+| `comandos.ino` | protocolo con la Base y un handler por comando UDP |
+| `estados.ino` | `loop()` y una función por estado de la FSM |
+| `navegacion.ino` | ReactiveNav, congregación, MEET, dispersión |
+| `sensores.ino` | IR laterales, APDS9960 central, WiFi |
+| `motores.ino` | PID por rueda, puente H, movimiento por distancia |
+| `perifericos.ino` | LED, IMU y el EKF pasivo |
+| `utils.h` | estructuras de estado y helpers inline |
 
 ## Versiones (leer antes de aceptar un update del IDE)
 
