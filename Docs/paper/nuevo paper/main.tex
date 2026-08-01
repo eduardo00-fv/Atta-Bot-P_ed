@@ -56,7 +56,7 @@ Aporte: Caracterización experimental del impacto de la topología del entorno e
 \subsection{Atta-bot robots}
 The Atta-bot robotic platform is a differential-drive mobile robot designed as an agent for swarm research, in tasks such as exploration, collaborative navigation, and mapping in indoor environments (Figure \ref{fig:attas}). Its name is inspired by the Atta family of leaf cutter ants, which exhibit remarkable collective behaviors.
 The first version of the robot was presented in \cite{Atta-Bot} and was successfully used for swarm experimentation in \cite{Brenes-Torres_2025, Adaptative-Brenes}.   This redesigned version, detailed in \cite{aguilera2024attabot}, substantially optimizes dimensions and mass compared to its predecessor, adopting a compact cylindrical chassis approximately 105 mm in diameter, and a rechargeable LiPo battery providing a continuous operating autonomy of more than 4 hours. 
-Its electronic architecture unifies processing into a single ESP32 SoC microcontroller, which coordinates the actuators and integrated instrumentation, including wheel-coupled encoders for PID motion control, and a peripheral array of infrared proximity sensors for obstacle detection and avoidance. 
+Its electronic architecture unifies processing into a single ESP32 SoC microcontroller, which coordinates the actuators and integrated instrumentation, including wheel-coupled encoders for PID motion control, and, for obstacle detection and avoidance, a pair of lateral infrared sensors together with a forward-facing optical proximity sensor. 
 Finally, the robot communicates with the base station or other robots over a WiFi network using the UDP transport protocol, which minimizes transmission latency to allow a continuous stream of telemetry data, ensuring real-time swarm coordination.
 
 \begin{figure}
@@ -129,16 +129,22 @@ per-robot gyroscope scale factor compensates the unit-to-unit differences
 measured during calibration.
 
 \subsubsection{Obstacle avoidance}
-Three infrared proximity sensors (left, centre and right) produce a three-bit
-occupancy pattern. Each pattern maps to a rotation away from the obstructed side
-followed by a clearance advance, as listed in Table~\ref{tab:avoidance}. Purely
+Obstacle sensing combines two lateral infrared sensors, one on each side, with
+a central optical proximity sensor facing forward. The infrared pair are
+threshold devices whose triggering distance is set by a potentiometer on each
+unit, so each one reports a single bit; the central sensor is an APDS9960, which
+returns a graded proximity reading over the I\textsuperscript{2}C bus and is
+thresholded in firmware. The three together produce a three-bit occupancy
+pattern. Each pattern maps to a rotation away from the obstructed side followed by a
+clearance advance, as listed in Table~\ref{tab:avoidance}. Purely
 lateral detections produce mild corrections, whereas frontal and bilateral
 detections produce larger rotations and shorter advances. Symmetric patterns,
 which carry no directional information, resolve the turn direction randomly to
 avoid deterministic deadlocks between facing robots.
 
 \begin{table}[htbp]
-\caption{Avoidance maneuver as a function of the sensor pattern (L, C, R).}
+\caption{Avoidance maneuver as a function of the occupancy pattern, with L
+and R the lateral infrared sensors and C the central proximity sensor.}
 \label{tab:avoidance}
 \centering
 \begin{tabular}{cccl}
@@ -355,8 +361,8 @@ simulator.
 The simulated agent reproduces the Atta-bot physically and logically. The model
 matches the chassis diameter, mass distribution and differential-drive geometry
 of the platform, and instruments it with the same sensor set: wheel encoders
-feeding the same PID motion control, and the infrared proximity array with
-equivalent placement and detection cones. The behaviors described above are
+feeding the same PID motion control, and the two lateral infrared sensors plus
+the central proximity sensor with equivalent placement and detection cones. The behaviors described above are
 ported without modification of their logic or of their numeric constants, so
 segment lengths, confirmation windows, avoidance angles and ring geometry are
 identical in both settings.
@@ -383,10 +389,9 @@ obstacle configuration is instantiated with the same procedure that defines it
 in the physical experiments, and repetitions differ only in the initial
 placement of the agents.
 
-One modelling parameter proved decisive and is reported explicitly. The infrared
-proximity sensors are threshold devices whose triggering distance is set by a
-potentiometer on each unit, so their range is a calibration choice rather than a
-physical constant. With the range initially set to $200$~mm the simulated swarm
+One modelling parameter proved decisive and is reported explicitly. The range of
+the lateral infrared sensors is set by a potentiometer on each unit, so it is a
+calibration choice rather than a physical constant. With the range initially set to $200$~mm the simulated swarm
 never traversed the narrow configurations: for an agent centred in a
 $2 \cdot d_{robot}$ gap the lateral sensors, mounted at $30^\circ$, see the
 obstacle at $158$~mm and therefore fire continuously, driving the agent into
