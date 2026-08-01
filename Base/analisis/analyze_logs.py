@@ -893,6 +893,54 @@ def kruskal_wallis(groups):
     return {'H': H, 'df': k - 1, 'p': _chi2_sf(H, k - 1), 'n': n, 'k': k}
 
 
+def print_group_test(groups):
+    """Compara los grupos y reporta la prueba que corresponda.
+
+    Primero Levene: si las varianzas NO son homogéneas, el ANOVA de una vía no
+    aplica y el estadístico que vale es Kruskal-Wallis, que trabaja sobre rangos
+    y no supone ni normalidad ni varianzas iguales.
+
+    Esto no es una preferencia de estilo. En este experimento las varianzas
+    difieren de verdad —un escenario va de 21 a 179s y otro de 25 a 36— y por eso
+    el paper reporta Kruskal-Wallis. Hasta el 2026-08-01 esta salida imprimía
+    solo el ANOVA, o sea justo el estadístico que el artículo descarta y por la
+    razón que lo descarta: quien reprodujera el comando obtenía un número que
+    contradecía el texto.
+
+    Cuando Levene no rechaza se imprimen los dos, y ojo que NO siempre coinciden:
+    sobre el ratio de ruta del laboratorio las varianzas salen homogéneas
+    (p=0.20) y aun así el ANOVA no ve diferencia entre escenarios (p=0.15)
+    mientras Kruskal-Wallis sí (p=0.016). El ratio es una razón acotada por abajo
+    en 1 y con cola larga a la derecha, y la prueba de rangos aguanta esa asimetría
+    mucho mejor que la paramétrica. Ante desacuerdo manda Kruskal-Wallis, que es
+    la que supone menos.
+    """
+    lev = levene(groups)
+    kw = kruskal_wallis(groups)
+    if kw is None:
+        print('  insuficientes datos')
+        return
+
+    def estrellas(p):
+        return ('***' if p < 0.001 else '**' if p < 0.01 else
+                '*' if p < 0.05 else 'n.s.')
+
+    heterogenea = lev is not None and lev['p'] < 0.05
+    if lev is not None:
+        print(f'  Levene W({lev["df1"]},{lev["df2"]})={lev["W"]:.2f} '
+              f'p={lev["p"]:.4g} → varianzas '
+              + ('DISPARES, el ANOVA no aplica' if heterogenea else 'homogéneas'))
+
+    print(f'  Kruskal-Wallis H({kw["df"]})={kw["H"]:.2f}  p={kw["p"]:.4g}  '
+          f'{estrellas(kw["p"])}   (n={kw["n"]}, k={kw["k"]})')
+
+    if not heterogenea:
+        an = one_way_anova(groups)
+        if an is not None:
+            print(f'  ANOVA F({an["df1"]},{an["df2"]})={an["F"]:.2f}  '
+                  f'p={an["p"]:.4g}  {estrellas(an["p"])}   (control)')
+
+
 def load_manifest(path):
     """Manifiesto de campaña: CSV con columnas
     session,scenario[,arranque][,scenario_json].
@@ -1053,28 +1101,18 @@ def run_campaign(a):
             ('ratio de ruta',
              {sc: [x['route_ratio'] for x in robots if x['scenario'] == sc]
               for sc in order})):
-        res = one_way_anova(groups)
-        if res is None:
-            print(f'\nANOVA {label}: insuficientes datos')
-            continue
-        sig = '***' if res['p'] < 0.001 else '**' if res['p'] < 0.01 else \
-              '*' if res['p'] < 0.05 else 'n.s.'
-        print(f'\nANOVA {label}: F({res["df1"]},{res["df2"]})={res["F"]:.2f}  '
-              f'p={res["p"]:.4g}  {sig}   (n={res["n"]}, k={res["k"]})')
+        print(f'\n{label}')
+        print_group_test(groups)
 
     # Control del segundo factor. Si el arranque saliera significativo, las
     # corridas de un mismo escenario no serían repeticiones intercambiables.
     arr = sorted({r['arranque'] for r in runs if r['arranque']})
     if len(arr) > 1:
-        res = one_way_anova({x: [r['t_conv_frac_s'] for r in runs
-                                 if r['arranque'] == x
-                                 and r['t_conv_frac_s'] is not None]
-                             for x in arr})
-        if res is not None:
-            sig = 'SIGNIFICATIVO ⚠' if res['p'] < 0.05 else 'n.s. (bien: es ruido)'
-            print(f'\nANOVA control por arranque (tiempo 90%): '
-                  f'F({res["df1"]},{res["df2"]})={res["F"]:.2f}  '
-                  f'p={res["p"]:.4g}  {sig}')
+        print('\ncontrol por arranque (tiempo 90%) — debería salir n.s.')
+        print_group_test({x: [r['t_conv_frac_s'] for r in runs
+                              if r['arranque'] == x
+                              and r['t_conv_frac_s'] is not None]
+                          for x in arr})
 
     stem = a.campaign_out or 'campana'
     with open(f'{stem}_runs.csv', 'w', newline='') as f:
