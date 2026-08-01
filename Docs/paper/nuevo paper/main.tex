@@ -501,7 +501,14 @@ In order to measure the impact of the scenario topology on the aggregation of th
 
 
 \section{Results and analysis}
-TODOS
+
+Group differences are assessed with the Kruskal--Wallis test rather than with a
+one-way ANOVA. The design has three repetitions per configuration, the
+distributions are skewed, and the dispersion is markedly uneven across
+configurations --- a run in which one agent fails to cross produces a value far
+outside the range of the others. Under those conditions the equal-variance and
+normality assumptions of ANOVA do not hold, whereas a rank-based test remains
+valid. Effects are reported as medians throughout, for the same reason.
 
 \subsection{Simulation with ten agents}
 
@@ -529,11 +536,13 @@ $2.1a$--$2d$   & $2.00\,d$      & 49.2 & 6.13 \\
 
 The clearest effect appears in the distance travelled, which has the advantage of
 requiring no threshold and therefore of being independent of how the aggregation
-zone is defined. Agents traverse $1.70$ times the straight-line distance to their
-slot when the gaps are $2 \cdot d_{robot}$ against $1.46$ times when they are
-$4 \cdot d_{robot}$ ($F = 11.6$, $p = 0.00076$), while the obstacle size produces
-no distinguishable difference. A one-way ANOVA over the five configurations is
-also significant ($F(4,145) = 3.02$, $p = 0.020$).
+zone is defined ($H = 34.5$, $p < 0.0001$ across the five configurations). It
+separates into two contrasts. The presence of the barrier lengthens the paths,
+from a median of $1.22$ times the straight-line distance in the obstacle-free
+control to $1.53$ with obstacles ($p = 0.0012$). Narrowing the passage lengthens
+them further, to $1.60$ for $2 \cdot d_{robot}$ gaps against $1.34$ for
+$4 \cdot d_{robot}$ ($p < 0.0001$), while the obstacle size produces no
+distinguishable difference.
 
 \begin{figure}
     \centering
@@ -548,11 +557,10 @@ also significant ($F(4,145) = 3.02$, $p = 0.020$).
 
 
 The aggregation time shows the same ordering, growing monotonically as the
-passage narrows, and a one-way ANOVA over the five configurations rejects equal
-means ($F(4,10) = 13.81$, $p = 0.00044$) with the gap width again carrying the
-effect ($42.1$~s for $2 \cdot d_{robot}$ against $26.3$~s for
-$4 \cdot d_{robot}$, $p = 0.0025$) and the obstacle size carrying none
-($33.3$~s against $35.1$~s, $p = 0.78$). This result must be read with the
+passage narrows ($H = 13.1$, $p = 0.011$), with the gap width again carrying the
+effect ($43.6$~s median for $2 \cdot d_{robot}$ against $27.1$~s for
+$4 \cdot d_{robot}$, $p = 0.0050$) and the obstacle size carrying none. This
+result must be read with the
 caveat that it depends on the radius chosen for the aggregation zone: a radius
 too small discards runs in which one agent settles slightly outside, and a
 radius too large is satisfied so early that the configurations become
@@ -562,7 +570,7 @@ threshold-free in the way the travelled distance is, and it is reported here as
 supporting rather than primary evidence.
 
 Swarm compactness at the end of the episode is the least discriminating of the
-three metrics ($p = 0.054$). This is expected: the behavior drives every agent
+three metrics ($H = 8.9$, $p = 0.064$). This is expected: the behavior drives every agent
 to an assigned slot on a ring whose radius is fixed by the swarm size, so once
 the agents arrive the final geometry is imposed by the controller and not by the
 scenario. Compactness is informative as a time series --- how quickly the swarm
@@ -572,48 +580,39 @@ tightens --- rather than as a final value.
 
 The same five configurations were run in the physical arena with four agents and
 three repetitions each, the repetitions differing in the initial arrangement of
-the swarm. \textbf{No statistically significant differences were found.} A
-one-way ANOVA over the five configurations does not reject equal means for the
-aggregation time ($p = 0.40$), and neither factor of the design reaches
-significance when taken separately: $p = 0.61$ for the gap width and $p = 0.50$
-for the obstacle size. The most likely reason is the sample size. Three
-repetitions per configuration leave the between-run variability of a physical
-swarm --- marker occlusions, unit-to-unit differences, the exact pose at which
-the random walk ends --- larger than the effect being sought.
+the swarm.
 
-The point estimates, however, are not arbitrary: several of them agree with the
-simulation, and the agreements are on the features the simulation identifies as
-driven by topology.
+\textbf{What the two settings agree on is that obstacles matter, and both say so
+significantly.} The presence of the barrier raises the median aggregation time
+from $11.5$ to $32.1$~s in the laboratory ($p = 0.043$) and from $17.1$ to
+$30.1$~s in simulation ($p = 0.0093$), and it lengthens the paths from $1.28$ to
+$1.66$ times the straight-line distance in the laboratory ($p = 0.041$) and from
+$1.22$ to $1.53$ in simulation ($p = 0.0012$). Four independent tests, two
+metrics in two settings, all in the same direction.
 
-First, the obstacle-free control is the fastest condition in both settings
-($15.5$~s against a minimum of $27.7$~s among the obstacle configurations in the
-laboratory, and $17.1$~s against $23.5$~s in simulation): the mere presence of
-the barrier costs time regardless of its shape.
+\textbf{What the physical experiments do not resolve is the width of the
+passage.} Narrowing the gaps changes the median aggregation time from $35.0$ to
+$32.1$~s, which the test cannot separate from noise ($p = 1.00$), and the
+travelled distance from $1.82$ to $1.48$, that is, in the direction opposite to
+the simulation and again without significance ($p = 0.069$). The most likely
+reason is the sample size: three repetitions per configuration leave the
+between-run variability of a physical swarm --- marker occlusions, unit-to-unit
+differences, the pose at which the random walk ends --- larger than the effect
+being sought. A single run in which one agent never crossed contributes
+normalized distances of $5.4$, $8.5$ and $13.4$, an order of magnitude above the
+rest; removing it does not reverse the contrast, which indicates that the
+absence of an effect is not the doing of one outlier.
 
-Second, the slowest configuration is the same one in both, namely large
-obstacles with narrow gaps, which is also the configuration with the smallest
-effective passage.
-
-Third, the ordering of the five configurations agrees more than chance would
-suggest, with a rank correlation between the two settings of $\rho = 0.70$ for
-the aggregation time and $\rho = 0.60$ for the final compactness. Compactness in
-particular reproduces both extremes: the obstacle-free control yields the
-tightest swarm and the large-obstacle narrow-gap configuration the loosest, in
-the laboratory as in simulation.
-
-Fourth, of the four available within-size comparisons --- narrowing the gap while
-holding the obstacle size fixed, in each setting --- three show the expected
-increase in aggregation time. The exception is the small-obstacle pair in the
-laboratory.
-
-One quantity does not agree, and it is worth stating because it is the one that
-carries the effect in simulation. The normalized distance travelled shows no
-correspondence between the two settings ($\rho = -0.30$), and in the laboratory
-the obstacle-free control does not produce the straightest paths, which it
-should. This metric depends on each agent completing a well-defined trajectory
-between two points, and it is the most sensitive of the three to the localization
-gaps caused by marker occlusion. With four agents and three repetitions there is
-no redundancy to absorb them.
+Beyond the barrier contrast, the point estimates agree with the simulation on
+features the simulation identifies as topological. The obstacle-free control is
+the fastest condition in both settings, and the slowest configuration is the same
+one in both, namely large obstacles with narrow gaps, which is also the
+configuration with the smallest effective passage. The ordering of the five
+configurations correlates between the two settings, with a rank correlation of
+$\rho = 0.70$ for the aggregation time and $\rho = 0.60$ for the final
+compactness; compactness reproduces both extremes, the obstacle-free control
+yielding the tightest swarm and the large-obstacle narrow-gap configuration the
+loosest.
 
 \subsection{Effect of swarm size}
 

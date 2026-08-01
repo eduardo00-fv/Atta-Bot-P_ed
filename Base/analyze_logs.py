@@ -777,6 +777,120 @@ def one_way_anova(groups):
     return {'F': F, 'df1': df1, 'df2': df2, 'p': p, 'n': n, 'k': k}
 
 
+def _gammaln(x):
+    """log Γ(x) — Lanczos, suficiente para los p-valores de χ²."""
+    g = [676.5203681218851, -1259.1392167224028, 771.32342877765313,
+         -176.61502916214059, 12.507343278686905, -0.13857109526572012,
+         9.9843695780195716e-6, 1.5056327351493116e-7]
+    if x < 0.5:
+        return math.log(math.pi / math.sin(math.pi * x)) - _gammaln(1 - x)
+    x -= 1
+    a = 0.99999999999980993
+    t = x + 7.5
+    for i, c in enumerate(g):
+        a += c / (x + i + 1)
+    return 0.5 * math.log(2 * math.pi) + (x + 0.5) * math.log(t) - t + math.log(a)
+
+
+def _chi2_sf(x, k):
+    """P(χ²_k > x) — serie para x < k+1, fracción continua para el resto."""
+    if x <= 0:
+        return 1.0
+    a, xx = k / 2.0, x / 2.0
+    if xx < a + 1:
+        term = 1.0 / a
+        s, n = term, 0
+        while abs(term) > abs(s) * 1e-12 and n < 500:
+            n += 1
+            term *= xx / (a + n)
+            s += term
+        return 1.0 - s * math.exp(-xx + a * math.log(xx) - _gammaln(a))
+    b, c = xx + 1 - a, 1e30
+    d = 1.0 / b
+    h = d
+    for i in range(1, 500):
+        an = -i * (i - a)
+        b += 2
+        d = an * d + b
+        if abs(d) < 1e-30:
+            d = 1e-30
+        c = b + an / c
+        if abs(c) < 1e-30:
+            c = 1e-30
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1) < 1e-12:
+            break
+    return math.exp(-xx + a * math.log(xx) - _gammaln(a)) * h
+
+
+def levene(groups):
+    """Prueba de Levene (centrada en la mediana) de homogeneidad de varianzas.
+
+    ANOVA supone que todos los grupos tienen la misma varianza. En estos
+    experimentos NO se cumple —un escenario puede ir de 21 a 179s y otro de 25 a
+    36— así que antes de reportar un ANOVA hay que mirar esto. Se usa la variante
+    de Brown-Forsythe (desviaciones respecto de la MEDIANA), que es la robusta
+    cuando los datos no son normales.
+    """
+    g = [list(v) for v in groups.values() if len(v) > 1]
+    k = len(g)
+    if k < 2:
+        return None
+    z = [[abs(x - _median(v)) for x in v] for v in g]
+    n = sum(len(v) for v in z)
+    zbar = [sum(v) / len(v) for v in z]
+    ztot = sum(sum(v) for v in z) / n
+    num = sum(len(v) * (m - ztot) ** 2 for v, m in zip(z, zbar)) / (k - 1)
+    den = sum((x - m) ** 2 for v, m in zip(z, zbar) for x in v) / (n - k)
+    if den == 0:
+        return None
+    W = num / den
+    return {'W': W, 'df1': k - 1, 'df2': n - k,
+            'p': _betai((n - k) / 2.0, (k - 1) / 2.0,
+                        (n - k) / ((n - k) + (k - 1) * W))}
+
+
+def kruskal_wallis(groups):
+    """Kruskal-Wallis: la alternativa no paramétrica al ANOVA de una vía.
+
+    Trabaja sobre RANGOS, así que no supone normalidad ni varianzas iguales y
+    aguanta los valores extremos que deja una corrida fallida. Es la prueba
+    adecuada para este diseño: pocas repeticiones, varianzas dispares y
+    distribuciones asimétricas.
+    """
+    g = [list(v) for v in groups.values() if v]
+    k = len(g)
+    if k < 2:
+        return None
+    todos = sorted((x, i) for i, v in enumerate(g) for x in v)
+    n = len(todos)
+    rangos = [0.0] * n
+    i = 0
+    while i < n:                      # promedio de rangos en los empates
+        j = i
+        while j + 1 < n and todos[j + 1][0] == todos[i][0]:
+            j += 1
+        r = (i + j) / 2.0 + 1
+        for t in range(i, j + 1):
+            rangos[t] = r
+        i = j + 1
+    suma = [0.0] * k
+    for (x, gi), r in zip(todos, rangos):
+        suma[gi] += r
+    H = 12.0 / (n * (n + 1)) * sum(s * s / len(v) for s, v in zip(suma, g)) \
+        - 3 * (n + 1)
+    # corrección por empates
+    emp = {}
+    for x, _ in todos:
+        emp[x] = emp.get(x, 0) + 1
+    ties = sum(t ** 3 - t for t in emp.values() if t > 1)
+    if ties and n > 1:
+        H /= 1 - ties / (n ** 3 - n)
+    return {'H': H, 'df': k - 1, 'p': _chi2_sf(H, k - 1), 'n': n, 'k': k}
+
+
 def load_manifest(path):
     """Manifiesto de campaña: CSV con columnas
     session,scenario[,arranque][,scenario_json].
