@@ -3,6 +3,7 @@
 % The preceding line is only needed to identify funding in the first footnote. If that is unneeded, please comment it out.
 \usepackage{cite}
 \usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithm}
 \usepackage{algorithmic}
 \usepackage{graphicx}
 \usepackage{textcomp}
@@ -122,7 +123,10 @@ within $50$~mm of the goal. Rotations are closed-loop on the yaw estimated by
 the IMU rather than commanded open-loop from wheel odometry: the remaining arc
 is re-aimed on every cycle, the motors are cut $3^\circ$ before the target so
 that inertia completes the rotation, and up to four iterative corrections are
-issued until the residual error falls below $3^\circ$.
+issued until the residual error falls below $3^\circ$. The yaw is obtained
+from the quaternion produced by the sensor's digital motion processor, and a
+per-robot gyroscope scale factor compensates the unit-to-unit differences
+measured during calibration.
 
 \subsubsection{Obstacle avoidance}
 Three infrared proximity sensors (left, centre and right) produce a three-bit
@@ -180,6 +184,48 @@ e_y = y + L\sin(\theta + s\varphi)
 \label{eq:escape_proj}
 \end{equation}
 
+The escape maneuver is armed by a counter of consecutive evasions: three
+evasions within a $5$~s window indicate that the local avoidance rule is not
+making progress, which is the signature of a corner or of a passage narrower
+than the maneuvering envelope of the robot. Algorithm~\ref{alg:nav}
+summarizes the complete navigation cycle.
+
+\begin{algorithm}
+\caption{Goal-directed navigation with obstacle avoidance}
+\label{alg:nav}
+\begin{algorithmic}[1]
+\REQUIRE goal $p_g$; pose $(x,y,\theta)$ supplied by the vision system
+\STATE $k \leftarrow 0$ \COMMENT{consecutive evasion counter}
+\WHILE{$\lVert p_g - (x,y) \rVert > d_{arrival}$}
+    \STATE request current pose from the base station
+    \STATE $\alpha \leftarrow \operatorname{atan2}(y_g - y,\; x_g - x) - \theta$
+    \IF{$\lvert \alpha \rvert > \alpha_{realign}$}
+        \STATE rotate $\alpha$, closed loop on IMU yaw
+    \ENDIF
+    \STATE $d \leftarrow \min \left( d_{segment},\; \lVert p_g - (x,y) \rVert \right)$
+    \STATE advance $d$
+    \IF{proximity sensors triggered during the segment}
+        \STATE $b \leftarrow$ occupancy pattern (L,\,C,\,R)
+        \STATE broadcast own pose and $b$; wait $t_{confirm}$
+        \IF{a peer claims to be the sensed body}
+            \STATE wait $t_{yield}$ \COMMENT{yield, do not evade}
+        \ELSE
+            \STATE $(\varphi_a, d_a) \leftarrow \textsc{Lookup}(b)$
+            \STATE rotate $\varphi_a$ away from the obstructed side
+            \STATE advance $d_a$
+            \STATE $k \leftarrow k + 1$
+        \ENDIF
+        \IF{$k \geq k_{max}$}
+            \STATE reverse; rotate $s^{*}\varphi$ using (\ref{eq:escape});
+                   advance $L$
+            \STATE $k \leftarrow 0$
+        \ENDIF
+    \ENDIF
+\ENDWHILE
+\STATE stop
+\end{algorithmic}
+\end{algorithm}
+
 \subsubsection{Congregation}
 The congregation behavior aggregates the swarm around a target point without a
 designated leader, so that agents must cross the obstacle field to reach a
@@ -217,6 +263,77 @@ assigned slot is performed in two stages: the robot first navigates to a staging
 waypoint located $150$~mm outside its slot along the radial direction, and only
 then enters radially, which prevents an agent from cutting across the ring and
 traversing slots that are already occupied.
+Algorithm~\ref{alg:cong} details the procedure.
+
+\subsubsection{Congregation}
+The congregation behavior aggregates the swarm around a target point without a
+designated leader, so that agents must cross the obstacle field to reach a
+region where no other agent is initially present. Every robot receives the same
+target and the same list of peer positions, broadcast at $1$~Hz.
+
+Driving all agents to the identical point would end in mutual evasion and
+crowding around the target, so each robot instead occupies a distinct slot on a
+ring centred on it. The ring radius grows with the swarm size in order to keep a
+constant arc length per agent, with a lower bound for small swarms, as defined in
+equation \ref{eq:ring}, where $n$ is the number of known agents,
+$s_{arc} = 250$~mm is the arc allocated per agent and $R_{min} = 300$~mm:
+
+\begin{equation}
+R = \max \left( R_{min},\; \frac{n \cdot s_{arc}}{2\pi} \right)
+\label{eq:ring}
+\end{equation}
+
+The $n$ slots are then distributed uniformly over the ring around the target
+$p_{t} = (x_t, y_t)$, following equation \ref{eq:slots}:
+
+\begin{equation}
+p_{s} = p_{t} + R \left( \cos \frac{2\pi s}{n},\; \sin \frac{2\pi s}{n} \right),
+\quad s = 0, \ldots, n-1
+\label{eq:slots}
+\end{equation}
+
+Slot assignment is decided independently by each agent and requires no
+negotiation. Every robot sorts the shared list of peers by identifier and then
+greedily matches robot--slot pairs in increasing order of distance, which
+minimizes path crossing between agents. Since all robots sort the same list and
+apply the same deterministic rule, they all derive the same assignment and no
+slot is claimed twice. The approach to the assigned slot is performed in two
+stages: the robot first navigates to a staging waypoint located $150$~mm outside
+its slot along the radial direction, and only then enters radially. Without this
+two-stage entry an agent may cut across the ring and traverse slots that are
+already occupied. Algorithm~\ref{alg:cong} details the procedure.
+
+\begin{algorithm}
+\caption{Leaderless congregation on a target point}
+\label{alg:cong}
+\begin{algorithmic}[1]
+\REQUIRE target $p_t$; peer positions $P$, broadcast at $1$~Hz
+\STATE $A \leftarrow P \cup \{\textit{self}\}$;\quad $n \leftarrow \lvert A \rvert$
+\STATE $R \leftarrow \max \left( R_{min},\; n \, s_{arc} / 2\pi \right)$
+       \COMMENT{ring radius, (\ref{eq:ring})}
+\FOR{$s = 0$ \TO $n-1$}
+    \STATE $p_s \leftarrow p_t + R \left( \cos \tfrac{2\pi s}{n},\;
+           \sin \tfrac{2\pi s}{n} \right)$
+\ENDFOR
+\STATE sort $A$ by identifier
+       \COMMENT{identical ordering on every agent}
+\STATE $U_a \leftarrow A$;\quad $U_s \leftarrow \{p_0, \ldots, p_{n-1}\}$
+\WHILE{$U_a \neq \emptyset$}
+    \STATE $(a^{*}, s^{*}) \leftarrow
+           \operatorname*{arg\,min}_{a \in U_a,\, s \in U_s}
+           \lVert \textit{pos}(a) - p_s \rVert$
+    \STATE assign $a^{*} \rightarrow s^{*}$; remove both from $U_a$, $U_s$
+\ENDWHILE
+\STATE $p_{slot} \leftarrow$ slot assigned to \textit{self}
+\STATE $\hat{u} \leftarrow (p_{slot} - p_t) / \lVert p_{slot} - p_t \rVert$
+       \COMMENT{outward radial direction}
+\STATE navigate to $p_{slot} + m \, \hat{u}$
+       \COMMENT{staging waypoint, $m = 150$~mm}
+\STATE navigate to $p_{slot}$
+       \COMMENT{radial entry}
+\STATE stop and hold position
+\end{algorithmic}
+\end{algorithm}
 
 When the target point lies close to a wall, the slots that would fall outside
 the arena are redistributed over the largest safe arc and the radius is grown by
@@ -261,6 +378,11 @@ laboratory. Second, the agents are not identical to each other: per-unit
 asymmetries measured on the physical robots, such as differences in effective
 wheel scale and in infrared sensitivity, are assigned from a profile file.
 
+Worlds are generated parametrically from the topology description, so each
+obstacle configuration is instantiated with the same procedure that defines it
+in the physical experiments, and repetitions differ only in the initial
+placement of the agents.
+
 One modelling parameter proved decisive and is reported explicitly. The infrared
 proximity sensors are threshold devices whose triggering distance is set by a
 potentiometer on each unit, so their range is a calibration choice rather than a
@@ -283,6 +405,18 @@ qualitatively and not only quantitatively: the ring radius of (\ref{eq:ring})
 grows with $n$, so the target region itself becomes larger, while the passage
 width remains fixed. This separates the contribution of swarm size from the
 contribution of topology.
+
+\begin{figure*}
+    \centering
+    \includegraphics[width=0.95\linewidth]{fig_trayectorias_sim.png}
+    \caption{Trajectories of the ten simulated agents during the aggregation
+    phase, with the three repetitions of each configuration superimposed. Boxes
+    are the obstacles and the cross marks the meeting point. Trajectories are
+    split wherever the localization of an agent is lost, so that no straight
+    segment crosses an obstacle that the agent did not traverse.}
+    \label{fig:sim_trajectories}
+\end{figure*}
+
 
 \subsection{Scenario topology and aggregation metrics}
 
