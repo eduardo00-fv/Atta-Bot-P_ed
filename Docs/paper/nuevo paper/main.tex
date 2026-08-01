@@ -287,7 +287,14 @@ contribution of topology.
 \subsection{Scenario topology and aggregation metrics}
 
 The environment used for experimentation consisted on a (2,40 x 1,75) m flat surface with closed walls and obtacles placed at the middle (Figure \ref{fig:escenario}). Since the article seeks to indentify key elements on the scenario topology that  affects aggregation behavior, several obstacle configurations were defined by using two obstacle sizes and two gap widths between obstacles. 
-Obstacles size were of approximate $0.74 \cdot a_{robot}$ (a=area), obstacle area less than the robot size, and $2.12 \cdot a_{robot}$, area larger than the robot size. The used passage gap width between obstacles were of $2 \cdot d_{robot}$ (d=diameter) and $4 \cdot d_{robot}$. The obstacles total area was between 1,2\% and 1,5\% of the total scenario area, this ratio was keep constant among the different configurations. 
+Obstacles size were of approximate $0.74 \cdot a_{robot}$ (a=area), obstacle area less than the robot size, and $2.12 \cdot a_{robot}$, area larger than the robot size. The passage gap widths between obstacles were nominally $2 \cdot d_{robot}$
+(d=diameter) and $4 \cdot d_{robot}$. Since the physical obstacles were placed by
+hand, the gaps actually built were measured from the overhead video and are
+reported with the results: $2.5$ and $2.7 \cdot d_{robot}$ for the narrow
+configurations and $5.0$ and $5.3 \cdot d_{robot}$ for the wide ones, that is,
+about a quarter wider than nominal but with the two levels cleanly separated by a
+factor of two. The simulated scenarios, generated programmatically, match the
+nominal values exactly. The obstacles total area was between 1,2\% and 1,5\% of the total scenario area, this ratio was keep constant among the different configurations. 
 
 Accordingly the validated configurations were: 
 \begin{itemize}
@@ -302,10 +309,17 @@ Accordingly the validated configurations were:
 \begin{figure}
     \centering
     \includegraphics[width=0.7\linewidth]{escenario.JPG} \\
-    (a) \\ 
-    \includegraphics[width=0.95\linewidth]{scenario_configurations.jpg} \\
-    (b)
-    \caption{Experimental scenario configuration. (a) Controlled environment used for physical swarm validation. (b) Obstacles and gaps configurations.}
+    (a) \\
+    \includegraphics[width=0.95\linewidth]{scenario_configurations_lab.pdf} \\
+    (b) \\
+    \includegraphics[width=0.95\linewidth]{scenario_configurations_sim.pdf} \\
+    (c)
+    \caption{Experimental scenario configurations. (a) Controlled environment
+    used for physical swarm validation. (b) Obstacle layouts of the physical
+    arena, drawn to scale; positions were recovered from the overhead video and
+    obstacles are drawn at their nominal size. (c) Obstacle layouts of the
+    simulated arena, where grey blocks close the barrier against the walls. The
+    star marks the meeting point in both cases.}
     \label{fig:escenario}
 \end{figure}
 
