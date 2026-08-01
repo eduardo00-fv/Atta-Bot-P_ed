@@ -136,17 +136,29 @@ const float maxRobotAngleMargin = 80;
 const int obstacleWaitTime = 600;
 const int reverseDistance = -40;
 
-// Escape de deadlock (ACTIVE_EVASION tras N evasiones): giro de rodeo hacia el
-// interior de la arena en vez del giro 180° ciego. Espeja escape_turn() de la
-// réplica de sim (attabot_firmware.py). El lado se elige proyectando el tramo
-// por cada lado y tomando el que queda más adentro (DISP_ARENA como límites).
-const float escapeTurnDeg = 95.0f;   // ° del giro comprometido
-const float escapeMoveMm  = 300.0f;  // mm del tramo de rodeo
+// Escape de deadlock (ACTIVE_EVASION tras N evasiones): giro de rodeo de 95°
+// hacia el interior de la arena, en vez del giro 180° ciego, con un tramo de
+// 300mm. Espeja escape_turn() de la réplica de sim (attabot_firmware.py). El
+// lado se elige proyectando el tramo por cada lado y tomando el que queda más
+// adentro, con DISP_ARENA como límites.
+const float escapeTurnDeg = 95.0f;
+const float escapeMoveMm  = 300.0f;
+
 // Arena del escenario en curso (marco cámara). NO es constante: la base la
 // envía con NAV_CONFIG|ARENA|w|h al registrar cada robot, porque cambia por
 // escenario (4 robots = 2400×1750, 10 robots = 3800×2800).
 float arenaWidthMm  = 2400.0f;
 float arenaHeightMm = 1750.0f;
+
+// Límites de los saltos de dispersión: la arena en curso menos un inset, para
+// que ningún salto apunte a la pared. Antes eran cuatro #define fijos al montaje
+// de 2400×1550 del lab, así que en cualquier otro escenario los robots se
+// dispersaban contra un borde imaginario.
+#define DISP_INSET 350.0f
+#define DISP_ARENA_XMIN DISP_INSET
+#define DISP_ARENA_XMAX (arenaWidthMm - DISP_INSET)
+#define DISP_ARENA_YMIN DISP_INSET
+#define DISP_ARENA_YMAX (arenaHeightMm - DISP_INSET)
 
 // Debug
 int debugUdp = 0;
@@ -171,7 +183,6 @@ const int max_pose_jump_rejections =
 int poseJumpRejections = 0;
 
 // IMU
-const float gravity = 9806.65;
 const float conversionFactor = 8192.0;
 float yaw;
 float imuGravity;
@@ -203,140 +214,42 @@ EvasionTracker evasionTracker;
 CongregationState congregation;
 unsigned long lastLeaderCast = 0;  // throttle del broadcast LEADER_POSITION del líder
 
-// Suavizado de la pose que DIFUNDE el líder. La cámara le mete σ≈10mm y σ≈3.8°
-// (medido 2026-07-27 sobre un robot quieto) y ese ruido se propagaba tal cual al
-// goal de cada seguidor. Promedio móvil corto; el ángulo se promedia por
-// seno/coseno para no romperse en el wrap de 360°. Si el líder se mueve de
-// verdad (salto > LEADER_SMOOTH_RESET) la ventana se reinicia, así el suavizado
-// no introduce retardo cuando hace falta seguirlo.
+// Ventana móvil sobre la pose que difunde el líder, para no propagar el ruido
+// de la cámara al goal de los seguidores. La usa SmoothLeaderPose().
 const int   LEADER_SMOOTH_N     = 4;
-const float LEADER_SMOOTH_RESET = 100.0f;  // mm
+const float LEADER_SMOOTH_RESET = 100.0f;
 float leaderSmX[LEADER_SMOOTH_N], leaderSmY[LEADER_SMOOTH_N];
 float leaderSmS[LEADER_SMOOTH_N], leaderSmC[LEADER_SMOOTH_N];
 int   leaderSmCount = 0, leaderSmIdx = 0;
 
-// Slot del anillo de congregación, seguro contra paredes y SIN colisiones
-// entre slots. Determinista con datos que TODOS los seguidores comparten (pose
-// del líder, n, arena vía NAV_CONFIG|ARENA): cada uno calcula el MISMO anillo
-// y toma el ángulo de su índice — descentralizado sin negociación.
-//
-// Por qué no corregir solo el ángulo propio: la versión greedy rotaba cada
-// slot invasor hacia el lado libre por separado y los ENCIMABA — medido
-// 2026-07-27 con el líder a 311mm de la pared: 5 de 9 slots quedaron a
-// 31-62mm entre sí y el enjambre nunca asentó. Acá los n slots se reparten
-// parejos sobre el arco seguro más largo; si el arco no alcanza para n
-// cuerpos (MIN_ARC c/u), el radio crece hasta que sí.
-//
-// n==1 (useBearing): se respeta el bearing líder→robot si cae en el arco
-// (mínimo recorrido); si no, el extremo del arco más cercano.
-// Escribe el radio efectivo en *outR (puede ser > nominal).
-float SafeRingSlotAngle(float lx, float ly, int idx, int n, float nominalR,
-                        float bearing, bool useBearing, float *outR) {
-  const float MARGIN = 200.0f;    // holgura slot-pared (cuerpo 75 + margen)
-  const float MIN_ARC = 250.0f;   // mm de arco por robot (mismo valor que Base)
-  const float growth[6] = {1.0f, 1.2f, 1.4f, 1.7f, 2.0f, 2.5f};
-  const int NS = 72;              // muestreo del círculo cada 5°
-  const float STEP = 2.0f * PI / NS;
-  float fallback = useBearing ? bearing : (2.0f * PI * idx) / max(1, n);
-  *outR = nominalR;
-
-  for (int gi = 0; gi < 6; gi++) {
-    float R = nominalR * growth[gi];
-    bool safe[NS];
-    int nSafe = 0;
-    for (int k = 0; k < NS; k++) {
-      float sx = lx + R * cosf(k * STEP);
-      float sy = ly + R * sinf(k * STEP);
-      safe[k] = (sx >= MARGIN && sy >= MARGIN &&
-                 sx <= arenaWidthMm - MARGIN && sy <= arenaHeightMm - MARGIN);
-      if (safe[k]) nSafe++;
-    }
-    if (nSafe == NS) {            // círculo completo libre: abanico/bearing puro
-      *outR = R;
-      return fallback;
-    }
-    if (nSafe == 0) continue;
-    // Arco contiguo seguro más largo (recorrido circular 2·NS)
-    int bestStart = 0, bestLen = 0, curStart = -1, curLen = 0;
-    for (int k = 0; k < 2 * NS; k++) {
-      if (safe[k % NS]) {
-        if (curLen == 0) curStart = k % NS;
-        curLen++;
-        if (curLen > bestLen && curLen <= NS) {
-          bestLen = curLen;
-          bestStart = curStart;
-        }
-      } else {
-        curLen = 0;
-      }
-    }
-    float arcLen = bestLen * STEP;
-    if (R * arcLen >= n * MIN_ARC || gi == 5) {
-      *outR = R;
-      float a0 = bestStart * STEP;
-      if (useBearing) {
-        float rel = fmodf(bearing - a0 + 4.0f * PI, 2.0f * PI);
-        if (rel <= arcLen) return bearing;
-        return ((2.0f * PI - rel) < (rel - arcLen)) ? a0 : a0 + arcLen;
-      }
-      return a0 + (idx + 0.5f) * arcLen / max(1, n);
-    }
-  }
-  return fallback;
-}
-
-// Agrega la pose actual del líder y devuelve la promediada por referencia.
-void SmoothLeaderPose(float xIn, float yIn, float angIn,
-                      float *xOut, float *yOut, float *angOut) {
-  if (leaderSmCount > 0) {
-    float ax = 0, ay = 0;
-    for (int i = 0; i < leaderSmCount; i++) { ax += leaderSmX[i]; ay += leaderSmY[i]; }
-    ax /= leaderSmCount;  ay /= leaderSmCount;
-    if (CalculateDistance(xIn, yIn, ax, ay) > LEADER_SMOOTH_RESET) {
-      leaderSmCount = 0;  leaderSmIdx = 0;   // el líder se movió: ventana nueva
-    }
-  }
-  float rad = angIn * DEG_TO_RAD;
-  leaderSmX[leaderSmIdx] = xIn;
-  leaderSmY[leaderSmIdx] = yIn;
-  leaderSmS[leaderSmIdx] = sin(rad);
-  leaderSmC[leaderSmIdx] = cos(rad);
-  leaderSmIdx = (leaderSmIdx + 1) % LEADER_SMOOTH_N;
-  if (leaderSmCount < LEADER_SMOOTH_N) leaderSmCount++;
-
-  float sx = 0, sy = 0, ss = 0, sc = 0;
-  for (int i = 0; i < leaderSmCount; i++) {
-    sx += leaderSmX[i];  sy += leaderSmY[i];
-    ss += leaderSmS[i];  sc += leaderSmC[i];
-  }
-  *xOut   = sx / leaderSmCount;
-  *yOut   = sy / leaderSmCount;
-  *angOut = atan2(ss, sc) * RAD_TO_DEG;
-}
-DisperseState disperse;  // dispersión de enjambre (DISPERSE + NEIGHBOR_POSITIONS)
-EKFState ekf;  // observador pasivo por ahora — la nav sigue usando robotPose
+// Estado de los tres subsistemas de enjambre. El EKF es observador pasivo: la
+// navegación sigue corriendo sobre robotPose salvo que se encienda EKF_NAV.
+DisperseState disperse;
+EKFState ekf;
 SearchState search;
 
-// SEARCH_OBJECT: aproximación y clasificación de color
-const int SEARCH_CREEP_PWM = 70;         // PWM de aproximación lenta
-const uint8_t SEARCH_PROX_NEAR = 180;    // readProximity() ≥ esto = al alcance
-const unsigned long SEARCH_APPROACH_TIMEOUT = 6000;  // ms
+// SEARCH_OBJECT: PWM de aproximación lenta, umbral de readProximity() a partir
+// del cual el objeto está al alcance, y tope de la fase de acercamiento.
+const int SEARCH_CREEP_PWM = 70;
+const uint8_t SEARCH_PROX_NEAR = 180;
+const unsigned long SEARCH_APPROACH_TIMEOUT = 6000;
+
 ObstacleState obstacles;
 MovementMetrics movement;
 LedController ledCtrl;
 
-// IMU — control de frecuencia de lectura
+// Lectura del IMU a 50Hz, por debajo del ODR del DMP (~112Hz).
 unsigned long lastImuRead = 0;
-const unsigned long imuReadInterval = 20;  // ms — 50Hz, por debajo del ODR del DMP (~112Hz)
+const unsigned long imuReadInterval = 20;
 
 // Reporte pasivo del EKF a la base, para VALIDARLO sin que controle nada.
 // El EKF corre siempre como observador (EKF_NAV arranca apagado), así que
 // mandando su pose se puede medir cuánto deriva contra el ArUco durante las
 // corridas normales: la base lo escribe en la misma fila del PositionLog que la
 // pose de cámara, y el error queda como una resta de columnas. Sin esto la única
-// forma de verlo era polear GET_STATUS a mano.
+// forma de verlo era polear GET_STATUS a mano. 2Hz alcanza para medir deriva.
 unsigned long lastEkfReport = 0;
-const unsigned long ekfReportInterval = 500;  // ms — 2Hz alcanza para medir deriva
+const unsigned long ekfReportInterval = 500;
 
 // Variables de control de movimiento
 unsigned long currentMillis = millis();
@@ -358,7 +271,6 @@ bool maskCentralIR = false;
 // Configurable en vivo con SENSOR_THRESHOLD|C|<n>[|SAVE] y persistido en NVS.
 int centralIRThreshold = 2;
 int cycleCounter = 0;
-int microsDifference;
 volatile unsigned long leftObsStartTime = 0;
 volatile unsigned long rightObsStartTime = 0;
 unsigned long centralObsStartTime = 0;
@@ -371,49 +283,44 @@ RobotState state = WAIT;
 float instructionValue = 100;
 bool movementReady = true;
 
-// Navegación reactiva unificada (GT + congregación)
+// Navegación reactiva unificada (GT + congregación). EKF_NAV|1 pasa la nav a la
+// pose del EKF en vez del ArUco crudo; arranca apagado para poder A/B-testearlo
+// contra el comportamiento conocido.
 ReactiveNav nav;
-// EKF_NAV|1 → la nav se controla con la pose del EKF en vez del ArUco crudo.
-// Arranca apagado para poder A/B-testear contra el comportamiento conocido.
 bool ekfNavEnabled = false;
 
-// IMU-assisted TURN: giro cerrado en yaw — el arco restante se re-apunta con
-// el IMU en cada ciclo, y al final se corrige si quedó residuo
-bool  imuTurnActive   = false;
-bool  imuTurnIsCorrection = false;  // el residuo se cierra SIN brake-lead (lead=0);
-                                    // si no, en arcos chicos el coast reservado se
-                                    // come la corrección entera (cmd -5.3° → real 0.8°)
-int   imuTurnCorrCount = 0;         // correcciones hechas en este giro (tope: imuTurnMaxCorrections)
+// Giro cerrado en yaw: el arco restante se re-apunta con el IMU en cada ciclo y
+// al final se corrige el residuo. imuTurnPrevYaw sirve para el unwrap
+// incremental y imuTurnAccumDeg guarda el giro medido sin wrap, de modo que
+// soporta arcos de más de 180°. imuTurnTargetDeg lleva signo (+ = CCW).
+bool  imuTurnActive = false;
+bool  imuTurnIsCorrection = false;
+int   imuTurnCorrCount = 0;
 float imuTurnStartYaw = 0.0f;
-float imuTurnPrevYaw  = 0.0f;    // última lectura para unwrap incremental
-float imuTurnAccumDeg = 0.0f;    // giro acumulado medido por IMU (sin wrap, soporta >180°)
-float imuTurnTargetDeg = 0.0f;   // ángulo objetivo con signo (+ = CCW, - = CW)
-unsigned long imuTurnSettleUntil = 0;  // !=0: motores cortados, midiendo coast
-const float imuTurnBrakeLead = 3.0f;   // cortar motores N° antes: la inercia
-                                       // (coast, 2-12° medido vs ArUco) completa el giro
-const unsigned long imuTurnSettleMs = 400;  // ventana para que el coast termine
-                                            // antes de la verificación final
-const float imuTurnTolerance = 3.0f;   // residuo bajo el cual el giro se da por bueno;
-                                       // con corrección iterativa ahora sí aterriza acá
-const int imuTurnMaxCorrections = 4;   // tope de correcciones por giro — evita
-                                       // perseguir el ruido del gyro indefinidamente
+float imuTurnPrevYaw = 0.0f;
+float imuTurnAccumDeg = 0.0f;
+float imuTurnTargetDeg = 0.0f;
+unsigned long imuTurnSettleUntil = 0;
+
+// Constantes del giro asistido, todas medidas contra el ArUco:
+//   BrakeLead      cortar motores 3° antes, que la inercia (coast de 2-12°)
+//                  completa el giro;
+//   SettleMs       ventana para que ese coast termine antes de verificar;
+//   Tolerance      residuo bajo el cual el giro se da por bueno;
+//   MaxCorrections tope de correcciones por giro, para no perseguir el ruido
+//                  del gyro indefinidamente.
+// La corrección del residuo se hace SIN brake-lead (imuTurnIsCorrection): en
+// arcos chicos el coast reservado se comía la corrección entera, y un comando
+// de -5.3° terminaba girando 0.8°.
+const float imuTurnBrakeLead = 3.0f;
+const unsigned long imuTurnSettleMs = 400;
+const float imuTurnTolerance = 3.0f;
+const int imuTurnMaxCorrections = 4;
+
 const int instructionCompletedDelay = 400;
 std::array<float, 2> fsmInstruction;
 std::deque<std::array<float, 2>> instructionList;
 
-// ¿Ya hay un REQUEST_POSITION esperando en la cola? El guard
-// congregation.waitingForResponse solo se levanta cuando la FSM EJECUTA la
-// instrucción, no cuando se encola; entre ambos momentos puede haber cientos de
-// ms (el WAIT de arranque de CONGREGATION). Sin este chequeo se encolaban dos
-// pedidos, llegaban dos POSITION_RESPONSE, corrían dos ReactiveNavStep y la cola
-// quedaba con un ciclo duplicado: de ahí en más el robot ejecutaba giros
-// calculados para una pose vieja (medido 2026-07-27: giros un ciclo atrasados).
-bool RequestPositionQueued() {
-  for (const auto &ins : instructionList) {
-    if ((int)ins[0] == REQUEST_POSITION) return true;
-  }
-  return false;
-}
 pose robotPose(0, 0, 0);
 
 // Evasión
@@ -466,6 +373,15 @@ float DesiredSpeed(float distance, float wheelDistance);
 bool IsStationary(float currentLeftSpeed, float currentRightSpeed,
                   float leftWheelDistance, float rightWheelDistance);
 void SelectMovementRW();
+
+// Navegación y congregación
+float SafeRingSlotAngle(float lx, float ly, int idx, int n, float nominalR,
+                        float bearing, bool useBearing, float *outR);
+void SmoothLeaderPose(float xIn, float yIn, float angIn,
+                      float *xOut, float *yOut, float *angOut);
+void UpdateCongregationGoal(float leaderX, float leaderY, float leaderAngle);
+void ReactiveNavStep();
+bool RequestPositionQueued();
 
 // Auxiliares
 std::array<String, 6> SeparateCommand(const String &command, char delimiter);
@@ -1472,127 +1388,253 @@ void loop() {
 // NAVEGACIÓN REACTIVA UNIFICADA — GT y Congregación
 // ============================================================================
 
-// Ejecuta un paso de navegación hacia (nav.goalX, nav.goalY).
-// Calcula el ángulo hacia el objetivo y aplica bias reactivo si hay obstáculo
-// en los sensores IR. Encola TURN+WAIT+MOVE+WAIT+REQUEST_POSITION.
-// Llamar desde el handler de POSITION_RESPONSE cuando nav.isActive.
-// Recalcula el slot de congregación y el goal de navegación a partir de la
-// pose del líder. La usan DOS caminos: LEADER_POSITION (líder robot, difunde su
-// pose) y CONGREGATION|VIRTUAL (punto fijo, sin nadie que difunda). Extraerla
-// evita que las dos formas de congregar se desincronicen al tocar una sola.
-void UpdateCongregationGoal(float leaderX, float leaderY, float leaderAngle) {
+// Ángulo del slot del anillo de congregación, seguro contra paredes y sin
+// colisiones entre slots. Determinista con datos que TODOS los seguidores
+// comparten (pose del líder, n, arena vía NAV_CONFIG|ARENA): cada uno calcula
+// el MISMO anillo y toma el ángulo de su índice, así que la repartición es
+// descentralizada y no hace falta negociar.
+//
+// Por qué no corregir solo el ángulo propio: la versión greedy rotaba cada slot
+// invasor hacia el lado libre por separado y los ENCIMABA. Medido el 2026-07-27
+// con el líder a 311mm de la pared, 5 de 9 slots quedaron a 31-62mm entre sí y
+// el enjambre nunca asentó. Acá los n slots se reparten parejos sobre el arco
+// seguro más largo, y si ese arco no alcanza para n cuerpos (MIN_ARC cada uno)
+// el radio crece hasta que sí.
+//
+// Con n==1 (useBearing) se respeta el bearing líder→robot si cae dentro del
+// arco, que es el recorrido mínimo; si no, se va al extremo más cercano.
+// Escribe el radio efectivo en *outR, que puede ser mayor que el nominal.
+float SafeRingSlotAngle(float lx, float ly, int idx, int n, float nominalR,
+                        float bearing, bool useBearing, float *outR) {
+  const float MARGIN = 200.0f;
+  const float MIN_ARC = 250.0f;
+  const float growth[6] = {1.0f, 1.2f, 1.4f, 1.7f, 2.0f, 2.5f};
+  const int NS = 72;
+  const float STEP = 2.0f * PI / NS;
+  float fallback = useBearing ? bearing : (2.0f * PI * idx) / max(1, n);
+  *outR = nominalR;
 
-      // Calcular el slot y el waypoint de aproximación (staging → parking).
-      const float STAGING_MARGIN = 150.0f;
-      int    n     = max(1, congregation.totalFollowers);
-      String shape = congregation.formationShape;
-      float  parkX, parkY;
+  for (int gi = 0; gi < 6; gi++) {
+    float R = nominalR * growth[gi];
+    bool safe[NS];
+    int nSafe = 0;
+    for (int k = 0; k < NS; k++) {
+      float sx = lx + R * cosf(k * STEP);
+      float sy = ly + R * sinf(k * STEP);
+      safe[k] = (sx >= MARGIN && sy >= MARGIN &&
+                 sx <= arenaWidthMm - MARGIN && sy <= arenaHeightMm - MARGIN);
+      if (safe[k]) nSafe++;
+    }
+    if (nSafe == NS) {
+      *outR = R;
+      return fallback;
+    }
+    if (nSafe == 0) continue;
 
-      if (shape == "linea" || shape == "cuna") {
-        // Slot perpendicular al heading del líder (fila), con eje opcional de la
-        // Base (formationAxis). cuna: además desplazado k·s hacia atrás (V detrás
-        // del líder). Staging POR DETRÁS de la fila (opuesto al heading) para que
-        // cada robot entre por su propio carril y no cruce los slots vecinos.
-        float leaderAngle = leaderAngle;   // ° heading del líder
-        float s   = congregation.parkingDist;
-        float rad = leaderAngle * PI / 180.0f;
-        float hx  = cos(rad), hy = sin(rad);          // heading unitario
-        float pa  = rad + PI / 2.0f + congregation.formationAxis * PI / 180.0f;
-        float px  = cos(pa), py = sin(pa);            // eje de la fila
-        int   k    = congregation.followerIndex / 2 + 1;
-        int   side = (congregation.followerIndex % 2 == 0) ? 1 : -1;
-        float ox   = side * k * s * px;
-        float oy   = side * k * s * py;
-        if (shape == "cuna") { ox -= k * s * hx; oy -= k * s * hy; }
-        congregation.slotX = leaderX + ox;
-        congregation.slotY = leaderY + oy;
-        if (congregation.stagingDone) {
-          parkX = congregation.slotX;
-          parkY = congregation.slotY;
-        } else {
-          parkX = congregation.slotX - STAGING_MARGIN * hx;
-          parkY = congregation.slotY - STAGING_MARGIN * hy;
+    int bestStart = 0, bestLen = 0, curStart = -1, curLen = 0;
+    for (int k = 0; k < 2 * NS; k++) {
+      if (safe[k % NS]) {
+        if (curLen == 0) curStart = k % NS;
+        curLen++;
+        if (curLen > bestLen && curLen <= NS) {
+          bestLen = curLen;
+          bestStart = curStart;
         }
       } else {
-        // circulo / congregación clásica: slot en círculo alrededor del líder,
-        // aproximación radial (waypoint STAGING_MARGIN más lejos por el mismo
-        // rayo → la recta al goal nunca cruza el círculo de parking ni al líder).
-        // El slot de n==1 sale del bearing líder→ROBOT, así que exige una pose
-        // propia fresca. LEADER_POSITION suele llegar ANTES del primer
-        // POSITION_RESPONSE: latchear ahí anclaba el slot a una lectura vieja y
-        // el robot salía al lado contrario, sin recalcular nunca (2026-07-27).
-        // Sin pose fresca: pedirla y esperar al próximo LEADER_POSITION (4Hz).
-        if (!congregation.slotAngleSet && n == 1 && !congregation.poseFresh) {
-          if (!congregation.waitingForResponse && !nav.pendingInit &&
-              !RequestPositionQueued()) {
-            fsmInstruction[0] = REQUEST_POSITION;
-            fsmInstruction[1] = 0;
-            instructionList.push_back(fsmInstruction);
-          }
-          return;
-        }
-
-        if (!congregation.slotAngleSet) {
-          // Anillo wall-safe DETERMINISTA (ver SafeRingSlotAngle): todos los
-          // seguidores calculan el mismo anillo con datos compartidos y cada
-          // uno toma su índice — la Base solo comparte posiciones.
-          float bearing = atan2(robotPose.y - leaderY, robotPose.x - leaderX);
-          float effR;
-          congregation.slotAngle = SafeRingSlotAngle(
-              leaderX, leaderY, congregation.followerIndex, n,
-              congregation.parkingDist, bearing, n == 1, &effR);
-          congregation.slotRadius = effR;
-          congregation.slotAngleSet = true;
-          // Saltarse el staging solo si el slot quedó SOBRE el rayo
-          // líder→robot con el radio nominal: ahí la recta al slot no cruza
-          // al líder. Si el anillo se corrió o creció, aproximación radial.
-          if (n == 1 && fabs(congregation.slotAngle - bearing) < 0.01f &&
-              effR <= congregation.parkingDist + 1.0f) {
-            congregation.stagingDone = true;
-          }
-        }
-        float angle = congregation.slotAngle;
-        congregation.slotX = leaderX + congregation.slotRadius * cos(angle);
-        congregation.slotY = leaderY + congregation.slotRadius * sin(angle);
-        float goalDist = congregation.stagingDone
-                             ? congregation.slotRadius
-                             : congregation.slotRadius + STAGING_MARGIN;
-        parkX = leaderX + goalDist * cos(angle);
-        parkY = leaderY + goalDist * sin(angle);
+        curLen = 0;
       }
-
-      if (nav.isActive) {
-        // Banda muerta: LEADER_POSITION llega ~3Hz con la pose CRUDA del líder,
-        // así que sin esto el goal se corría unos pocos mm en cada mensaje y el
-        // navegador re-apuntaba contra el ruido en vez de contra el movimiento
-        // real del líder. Solo se reubica si el cambio es significativo.
-        if (CalculateDistance(nav.goalX, nav.goalY, parkX, parkY) >
-            nav.goalDeadband) {
-          nav.goalX = parkX;
-          nav.goalY = parkY;
-        }
-      } else if (!nav.pendingInit) {
-        nav.goalX       = parkX;
-        nav.goalY       = parkY;
-        nav.pendingInit = true;
-        if (!congregation.waitingForResponse && !RequestPositionQueued()) {
-          fsmInstruction[0] = REQUEST_POSITION;
-          fsmInstruction[1] = 0;
-          instructionList.push_back(fsmInstruction);
-        }
-        MessageDebugf("DEBUG: -1, ID: %s, %s: slot %d/%d → %s (%.1f,%.1f)",
-                      robotID.c_str(),
-                      shape.length() ? shape.c_str() : "CONGREGATION",
-                      congregation.followerIndex, n,
-                      congregation.stagingDone ? "parking" : "staging",
-                      parkX, parkY);
+    }
+    float arcLen = bestLen * STEP;
+    if (R * arcLen >= n * MIN_ARC || gi == 5) {
+      *outR = R;
+      float a0 = bestStart * STEP;
+      if (useBearing) {
+        float rel = fmodf(bearing - a0 + 4.0f * PI, 2.0f * PI);
+        if (rel <= arcLen) return bearing;
+        return ((2.0f * PI - rel) < (rel - arcLen)) ? a0 : a0 + arcLen;
       }
+      return a0 + (idx + 0.5f) * arcLen / max(1, n);
+    }
+  }
+  return fallback;
 }
 
+// Agrega la pose actual del líder a la ventana móvil y devuelve la promediada
+// por referencia. La cámara le mete σ≈10mm y σ≈3.8° (medido el 2026-07-27 sobre
+// un robot quieto) y ese ruido se propagaba tal cual al goal de cada seguidor.
+// El ángulo se promedia por seno/coseno para no romperse en el wrap de 360°. Si
+// el líder se movió de verdad, con un salto mayor a LEADER_SMOOTH_RESET, la
+// ventana se reinicia: así el suavizado no introduce retardo justo cuando hace
+// falta seguirlo.
+void SmoothLeaderPose(float xIn, float yIn, float angIn,
+                      float *xOut, float *yOut, float *angOut) {
+  if (leaderSmCount > 0) {
+    float ax = 0, ay = 0;
+    for (int i = 0; i < leaderSmCount; i++) { ax += leaderSmX[i]; ay += leaderSmY[i]; }
+    ax /= leaderSmCount;  ay /= leaderSmCount;
+    if (CalculateDistance(xIn, yIn, ax, ay) > LEADER_SMOOTH_RESET) {
+      leaderSmCount = 0;  leaderSmIdx = 0;
+    }
+  }
+  float rad = angIn * DEG_TO_RAD;
+  leaderSmX[leaderSmIdx] = xIn;
+  leaderSmY[leaderSmIdx] = yIn;
+  leaderSmS[leaderSmIdx] = sin(rad);
+  leaderSmC[leaderSmIdx] = cos(rad);
+  leaderSmIdx = (leaderSmIdx + 1) % LEADER_SMOOTH_N;
+  if (leaderSmCount < LEADER_SMOOTH_N) leaderSmCount++;
+
+  float sx = 0, sy = 0, ss = 0, sc = 0;
+  for (int i = 0; i < leaderSmCount; i++) {
+    sx += leaderSmX[i];  sy += leaderSmY[i];
+    ss += leaderSmS[i];  sc += leaderSmC[i];
+  }
+  *xOut   = sx / leaderSmCount;
+  *yOut   = sy / leaderSmCount;
+  *angOut = atan2(ss, sc) * RAD_TO_DEG;
+}
+
+// ¿Ya hay un REQUEST_POSITION esperando en la cola? El guard
+// congregation.waitingForResponse solo se levanta cuando la FSM EJECUTA la
+// instrucción, no cuando se encola, y entre ambos momentos puede haber cientos
+// de ms (el WAIT de arranque de CONGREGATION). Sin este chequeo se encolaban dos
+// pedidos, llegaban dos POSITION_RESPONSE, corrían dos ReactiveNavStep y la cola
+// quedaba con un ciclo duplicado: de ahí en más el robot ejecutaba giros
+// calculados para una pose vieja (medido el 2026-07-27, giros un ciclo atrasados).
+bool RequestPositionQueued() {
+  for (const auto &ins : instructionList) {
+    if ((int)ins[0] == REQUEST_POSITION) return true;
+  }
+  return false;
+}
+
+// Recalcula el slot de congregación y el waypoint de aproximación a partir de la
+// pose del líder. La usan DOS caminos: LEADER_POSITION, donde hay un robot líder
+// que difunde su pose, y CONGREGATION|VIRTUAL, un punto fijo sin nadie que
+// difunda. Vive extraída para que las dos formas de congregar no se
+// desincronicen al tocar una sola.
+//
+// El robot va primero a un waypoint de STAGING y solo después al slot, de modo
+// que la recta al objetivo nunca cruce el círculo de parking ni al líder. Cómo
+// se arma ese par depende de la forma pedida:
+//
+//   linea, cuna  Slot perpendicular al heading del líder, con eje opcional de la
+//                Base (formationAxis). La cuna además lo desplaza k·s hacia
+//                atrás, formando la V detrás del líder. El staging va POR DETRÁS
+//                de la fila, opuesto al heading, para que cada robot entre por su
+//                propio carril y no cruce los slots vecinos.
+//
+//   circulo      Slot sobre el anillo wall-safe determinista que arma
+//                SafeRingSlotAngle, con aproximación radial: el waypoint queda
+//                STAGING_MARGIN más lejos sobre el mismo rayo.
+//
+// El caso n==1 del círculo saca el slot del bearing líder→ROBOT, así que exige
+// una pose propia fresca. LEADER_POSITION suele llegar ANTES del primer
+// POSITION_RESPONSE; latchear ahí anclaba el slot a una lectura vieja y el robot
+// salía al lado contrario sin recalcular nunca (2026-07-27). Sin pose fresca se
+// pide una y se espera al próximo LEADER_POSITION, que llega a 4Hz.
+void UpdateCongregationGoal(float leaderX, float leaderY, float leaderAngle) {
+  const float STAGING_MARGIN = 150.0f;
+  int    n     = max(1, congregation.totalFollowers);
+  String shape = congregation.formationShape;
+  float  parkX, parkY;
+
+  if (shape == "linea" || shape == "cuna") {
+    float s   = congregation.parkingDist;
+    float rad = leaderAngle * PI / 180.0f;
+    float hx  = cos(rad), hy = sin(rad);
+    float pa  = rad + PI / 2.0f + congregation.formationAxis * PI / 180.0f;
+    float px  = cos(pa), py = sin(pa);
+    int   k    = congregation.followerIndex / 2 + 1;
+    int   side = (congregation.followerIndex % 2 == 0) ? 1 : -1;
+    float ox   = side * k * s * px;
+    float oy   = side * k * s * py;
+    if (shape == "cuna") { ox -= k * s * hx; oy -= k * s * hy; }
+    congregation.slotX = leaderX + ox;
+    congregation.slotY = leaderY + oy;
+    if (congregation.stagingDone) {
+      parkX = congregation.slotX;
+      parkY = congregation.slotY;
+    } else {
+      parkX = congregation.slotX - STAGING_MARGIN * hx;
+      parkY = congregation.slotY - STAGING_MARGIN * hy;
+    }
+  } else {
+    if (!congregation.slotAngleSet && n == 1 && !congregation.poseFresh) {
+      if (!congregation.waitingForResponse && !nav.pendingInit &&
+          !RequestPositionQueued()) {
+        fsmInstruction[0] = REQUEST_POSITION;
+        fsmInstruction[1] = 0;
+        instructionList.push_back(fsmInstruction);
+      }
+      return;
+    }
+
+    if (!congregation.slotAngleSet) {
+      float bearing = atan2(robotPose.y - leaderY, robotPose.x - leaderX);
+      float effR;
+      congregation.slotAngle = SafeRingSlotAngle(
+          leaderX, leaderY, congregation.followerIndex, n,
+          congregation.parkingDist, bearing, n == 1, &effR);
+      congregation.slotRadius = effR;
+      congregation.slotAngleSet = true;
+
+      // El staging se saltea solo si el slot quedó SOBRE el rayo líder→robot con
+      // el radio nominal, porque ahí la recta al slot no cruza al líder. Si el
+      // anillo se corrió o creció, hace falta la aproximación radial.
+      if (n == 1 && fabs(congregation.slotAngle - bearing) < 0.01f &&
+          effR <= congregation.parkingDist + 1.0f) {
+        congregation.stagingDone = true;
+      }
+    }
+    float angle = congregation.slotAngle;
+    congregation.slotX = leaderX + congregation.slotRadius * cos(angle);
+    congregation.slotY = leaderY + congregation.slotRadius * sin(angle);
+    float goalDist = congregation.stagingDone
+                         ? congregation.slotRadius
+                         : congregation.slotRadius + STAGING_MARGIN;
+    parkX = leaderX + goalDist * cos(angle);
+    parkY = leaderY + goalDist * sin(angle);
+  }
+
+  // Banda muerta al reubicar el goal: LEADER_POSITION llega a ~3Hz con la pose
+  // CRUDA del líder, así que sin esto el objetivo se corría unos pocos mm en
+  // cada mensaje y el navegador terminaba re-apuntando contra el ruido en vez
+  // de contra el movimiento real del líder.
+  if (nav.isActive) {
+    if (CalculateDistance(nav.goalX, nav.goalY, parkX, parkY) >
+        nav.goalDeadband) {
+      nav.goalX = parkX;
+      nav.goalY = parkY;
+    }
+  } else if (!nav.pendingInit) {
+    nav.goalX       = parkX;
+    nav.goalY       = parkY;
+    nav.pendingInit = true;
+    if (!congregation.waitingForResponse && !RequestPositionQueued()) {
+      fsmInstruction[0] = REQUEST_POSITION;
+      fsmInstruction[1] = 0;
+      instructionList.push_back(fsmInstruction);
+    }
+    MessageDebugf("DEBUG: -1, ID: %s, %s: slot %d/%d → %s (%.1f,%.1f)",
+                  robotID.c_str(),
+                  shape.length() ? shape.c_str() : "CONGREGATION",
+                  congregation.followerIndex, n,
+                  congregation.stagingDone ? "parking" : "staging",
+                  parkX, parkY);
+  }
+}
+
+// Ejecuta un paso de navegación hacia (nav.goalX, nav.goalY): calcula el ángulo
+// al objetivo, le aplica bias reactivo si hay obstáculo en los sensores IR y
+// encola TURN+WAIT+MOVE+WAIT+REQUEST_POSITION. Se llama desde el handler de
+// POSITION_RESPONSE cuando nav.isActive.
+//
+// La fuente de pose depende de EKF_NAV: con EKF_NAV|1 se navega con el estado
+// fusionado (encoders+gyro+ArUco) en vez del ArUco crudo, porque el rumbo del
+// EKF no trae el σ≈3.8° de la cámara, que es lo que disparaba los giros
+// espurios.
 void ReactiveNavStep() {
-  // Fuente de pose para el control. Con EKF_NAV|1 se navega con el estado
-  // fusionado (encoders+gyro+ArUco) en vez del ArUco crudo: el rumbo del EKF no
-  // trae el σ≈3.8° de la cámara, que es lo que disparaba los giros espurios.
   bool  useEkf  = ekfNavEnabled && ekf.initialized;
   float x       = useEkf ? ekf.x : robotPose.x;
   float y       = useEkf ? ekf.y : robotPose.y;
@@ -2119,23 +2161,6 @@ std::array<String, 6> SeparateCommand(const String &command, char delimiter) {
 }
 
 // ============================================================================
-// DISPERSIÓN DE ENJAMBRE — port 1:1 de maybe_disperse_hop() del controller de
-// sim validado en Webots. Se llama al recibir NEIGHBOR_POSITIONS (1 Hz).
-// Constantes de arena = FOV útil del lab (2.4 x 1.55 m) con inset de 350mm para
-// que los saltos no apunten a la pared. Ajustar si cambia el montaje de cámara.
-// ============================================================================
-// Límites de los saltos de dispersión: la arena en curso (NAV_CONFIG|ARENA, que
-// la Base manda al registrar) menos un inset para que ningún salto apunte a la
-// pared. Antes eran cuatro #define fijos al montaje de 2400×1550 del lab, así
-// que en cualquier otro escenario los robots se dispersaban contra un borde
-// imaginario.
-#define DISP_INSET 350.0f
-#define DISP_ARENA_XMIN DISP_INSET
-#define DISP_ARENA_XMAX (arenaWidthMm - DISP_INSET)
-#define DISP_ARENA_YMIN DISP_INSET
-#define DISP_ARENA_YMAX (arenaHeightMm - DISP_INSET)
-
-// ============================================================================
 // MEET — reparto de los slots del anillo por CERCANÍA, resuelto localmente.
 //
 // Es el mismo greedy que hacía la Base (par (distancia, robot, slot) más chico
@@ -2238,17 +2263,19 @@ int MeetSlotIndex(float tx, float ty, float ring, int n) {
   return 0;
 }
 
-
+// Un paso de dispersión de enjambre, port 1:1 de maybe_disperse_hop() del
+// controller de sim validado en Webots. Se llama al recibir NEIGHBOR_POSITIONS,
+// a 1Hz. Solo actúa si la dispersión está activa, el robot está OCIOSO (sin
+// navegación ni instrucciones en cola) y conoce vecinos; un robot ocupado
+// espera al siguiente tick para reevaluar. Los saltos se acotan a DISP_ARENA
+// para que ninguno apunte a la pared.
 void MaybeDisperseHop() {
-  // Guardas: dispersión activa, robot OCIOSO (sin nav ni instrucciones), con
-  // vecinos. Un robot ocupado espera al siguiente tick para reevaluar.
   if (!disperse.IsActive() || nav.isActive || nav.pendingInit ||
       !instructionList.empty() || disperse.nCount == 0) {
     return;
   }
   float x = robotPose.x, y = robotPose.y;
 
-  // Vecino más cercano
   float dmin = 1e12f;
   for (int i = 0; i < disperse.nCount; i++) {
     float d = CalculateDistance(x, y, disperse.nX[i], disperse.nY[i]);
@@ -2351,7 +2378,6 @@ bool IsRobotObstacle(float x2, float y2, float angle, int sensors, String id) {
 
   float angleBetweenRobots = atan2f(deltaY, deltaX) * RAD_TO_DEG + 180;
   float angleDifference = angleBetweenRobots - angle;
-https://meet.google.com/fdh-njby-vde?hs=224
   if (angleDifference > 180) {
     angleDifference -= 360;
   } else if (angleDifference < -180) {
