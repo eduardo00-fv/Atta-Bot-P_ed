@@ -29,7 +29,7 @@ que un humano usaría, la GUI expone 16.
 
 | Falta | Para qué | Prioridad |
 |---|---|---|
-| `MEET` | congregación sin líder — **el experimento del paper** | alta |
+| `MEET` | congregación sobre un punto, sin líder | alta |
 | `SENSOR_MASK` | enmascarar un IR defectuoso (Atta_1 tiene el derecho fantasma) | alta |
 | `NAV_CONFIG` | arena, distancia de ruedas, escala de yaw, alcance IR, parking | alta |
 | `SELFTEST` | prueba de motores e IMU en banco | alta |
@@ -85,7 +85,7 @@ vistazo si el enjambre está sano — y hoy esa pregunta se contesta leyendo el 
 ### Fase 4 — enjambre y experimentos
 
 `DISPERSE`, `FORMATION` con su figura, y un botón que lance una corrida completa
-del protocolo del paper (random walk → MEET) con los parámetros del escenario.
+de un protocolo de congregación (random walk → MEET) con sus parámetros.
 
 ## Orden sugerido
 

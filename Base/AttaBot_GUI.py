@@ -251,8 +251,7 @@ class AttaBotGUI(QMainWindow):
         callables abren un diálogo.
 
         Hasta el 2026-08-01 acá había 16 comandos de los 29 que entiende el
-        firmware. Faltaban MEET —el experimento del paper—, todo el enjambre y
-        toda la configuración en vivo.
+        firmware. Faltaban MEET, todo el enjambre y toda la configuración en vivo.
         """
         return [
             ('Movimiento', [
@@ -490,7 +489,7 @@ class AttaBotGUI(QMainWindow):
         return op if ok else None
 
     def _dlgMeet(self):
-        """MEET|x|y[|radio] — el experimento del paper.
+        """MEET|x|y[|radio] — congregación sobre un punto, sin líder.
 
         Se manda por broadcast siempre: la gracia de MEET es que los N robots
         resuelven el mismo reparto de slots desde el mismo mensaje. Mandárselo a
