@@ -501,8 +501,8 @@ TODOS
 \subsection{Simulation with ten agents}
 
 The ten-agent simulation was run over the same five configurations with three
-repetitions each, and every run converged. Table~\ref{tab:sim} reports the
-outcome.
+repetitions each, and every run converged. Table~\ref{tab:sim} and
+Figure~\ref{fig:sim_boxplots} report the outcome.
 
 \begin{table}[htbp]
 \caption{Simulation results, ten agents. Aggregation time is the median over
@@ -529,6 +529,18 @@ slot when the gaps are $2 \cdot d_{robot}$ against $1.46$ times when they are
 $4 \cdot d_{robot}$ ($F = 11.6$, $p = 0.00076$), while the obstacle size produces
 no distinguishable difference. A one-way ANOVA over the five configurations is
 also significant ($F(4,145) = 3.02$, $p = 0.020$).
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.72\linewidth]{results_sim.pdf}
+    \caption{Aggregation results of the ten-agent simulation, with the same three
+    metrics and the same configuration ordering as Figure~\ref{fig:boxplots}.
+    Top: distance travelled by each robot, normalized by the straight-line
+    distance to its slot. Middle: aggregation time. Bottom: swarm compactness at
+    the end of the episode, following (\ref{eq:compaction}).}
+    \label{fig:sim_boxplots}
+\end{figure}
+
 
 The aggregation time shows the same ordering, growing monotonically as the
 passage narrows, and a one-way ANOVA over the five configurations rejects equal

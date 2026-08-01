@@ -299,3 +299,53 @@ if __name__ == '__main__':
         fig_compactacion(ds, load(ds))
         fig_resumen(ds)
         print(f'  fig_*_{ds["slug"]}.png — {ds["nombre"]}')
+
+
+# ── Figura de resultados con la estructura del paper ────────────────────────
+# Tres paneles, las mismas tres metricas y el mismo orden de escenarios que las
+# figuras del laboratorio, para que las dos se lean en paralelo.
+
+PAPER_ORDER = ['BosqueD_D2', 'BosqueD_D4', 'BosqueG_D2', 'BosqueG_D4', 'SinObs']
+PAPER_ETIQ = ['0.7a-2d', '0.7a-4d', '2.1a-2d', '2.1a-4d', 'NoObs']
+
+
+def fig_paper(ds):
+    runs = list(csv.DictReader(open(ds['runs_csv'])))
+    rob = list(csv.DictReader(open(ds['robots_csv'])))
+    fig, axes = plt.subplots(3, 1, figsize=(5.4, 9.6))
+    series = (
+        ('Normalized Robot Distance',
+         [[float(r['route_ratio']) for r in rob if r['scenario'] == sc]
+          for sc in PAPER_ORDER]),
+        ('Aggregation Time (s)',
+         [[float(r['t_conv_frac_s']) for r in runs
+           if r['scenario'] == sc and r['t_conv_frac_s']]
+          for sc in PAPER_ORDER]),
+        # Compactacion segun la ecuacion del paper: raiz de la MEDIA de las
+        # distancias al cuadrado. El 1/N adentro de la raiz es lo que la hace
+        # comparable entre enjambres de distinto tamano.
+        ('Swarm Compactness',
+         [[float(r['final_rms_d']) for r in runs if r['scenario'] == sc]
+          for sc in PAPER_ORDER]),
+    )
+    for ax, (ylab, data) in zip(axes, series):
+        bp = ax.boxplot(data, patch_artist=True, widths=.55,
+                        medianprops=dict(color='#c0392b', lw=1.5),
+                        flierprops=dict(marker='o', ms=4, mfc='none', mec=INK2))
+        for patch, sc in zip(bp['boxes'], PAPER_ORDER):
+            patch.set(facecolor=COL[sc], alpha=.5, edgecolor=COL[sc])
+        for w in bp['whiskers'] + bp['caps']:
+            w.set(color=GRID, lw=1.2)
+        for i, vals in enumerate(data, start=1):
+            ax.plot([i] * len(vals), vals, 'o', ms=4, mfc=COL[PAPER_ORDER[i - 1]],
+                    mec='none', alpha=.45)
+        ax.set_xticks(range(1, 6))
+        ax.set_xticklabels(PAPER_ETIQ, fontsize=8.5)
+        ax.set_xlabel('Scenario Configuration', fontsize=9)
+        ax.set_ylabel(ylab, fontsize=9)
+        _limpiar(ax)
+    fig.tight_layout()
+    out = os.path.join(BASE, '..', 'Docs', 'paper', 'nuevo paper',
+                       f'results_{ds["slug"]}.pdf')
+    fig.savefig(out, bbox_inches='tight')
+    print(' ', os.path.normpath(out))
