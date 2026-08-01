@@ -37,7 +37,7 @@ LO HACEMOS DE ULTIMO
 \end{abstract}
 
 \begin{IEEEkeywords}
-component, formatting, style, styling, insert
+swarm robotics, aggregation, environment topology, obstacle avoidance, physical experimentation, robot simulation
 \end{IEEEkeywords}
 
 \section{Introduction}
@@ -465,6 +465,11 @@ Accordingly the validated configurations were:
 In order to measure the impact of the scenario topology on the aggregation of the robot swarms, several metrics were used: 
 \begin{itemize}
 
+% PENDIENTE (01/08): precisar como se acumula la distancia. Sumar las muestras
+% crudas la vuelve un proxy de la DURACION -- medido, correlaciona rho=+0.90 con
+% el largo del log y da 9-11 veces la recta -- porque el ruido de localizacion
+% domina. Los numeros de simulacion se calculan sobre medianas de 1s. Falta
+% cotejar con el calculo del laboratorio antes de fijar la redaccion.
     \item Robot distance: accumulated distance traveled by each robot. Normalized by the euclidean distance from start point to final aggregation point.
     
     \item Aggregation time: measured from the instant the aggregation command is
@@ -479,7 +484,14 @@ In order to measure the impact of the scenario topology on the aggregation of th
     threshold, the localization noise and the redistribution of slots near the
     wall; the resulting radii are $610$~mm for four agents and $900$~mm for ten.
     
-    \item Swarm compactness: measures how disperse is the swarm during each time of the experiment. Calculated by the squared root summatory of euclidean distances from each robot position to the swarm centroid, as defined in equation \ref{eq:compaction}, \ref{eq:centroid} and \ref{eq:avg_xy}. Values were normalized by the robot diameter.
+    \item Swarm compactness: measures how disperse the swarm is at each instant of
+    the experiment. Calculated as the root mean square of the euclidean distances
+    from each robot to the swarm centroid, as defined in (\ref{eq:compaction}),
+    (\ref{eq:centroid}) and (\ref{eq:avg_xy}), and normalized by the robot
+    diameter. Averaging inside the root, rather than summing, is what makes the
+    value comparable between swarms of different size: a plain sum grows with
+    $\sqrt{N}$ and would make the ten-agent swarm appear less compact for no
+    other reason than having more agents.
 
 \end{itemize}
  

@@ -1,5 +1,40 @@
 # Notas de trabajo sobre el paper — 31/07/2026
 
+## PARA MAÑANA (01/08) — lo que quedó abierto
+
+**1. La discrepancia de la distancia recorrida, con Juan Carlos.** Su Fig. 1
+sugiere que los pasos angostos alargan el recorrido; mi cálculo sobre los mismos
+logs da lo contrario (angostos 1.48 contra amplios 1.82, p = 0.069). Verificado
+que no es la ventana de tiempo —medir desde el comando o desde el inicio da lo
+mismo— ni la corrida fallida —quitarla no invierte el contraste—. Lo que sí
+encontré: **si la distancia se acumula sumando muestras crudas, el ruido de
+localización la domina y la métrica pasa a medir DURACIÓN** (ρ = +0.90 con el
+largo del log, y valores de 9 a 11 veces la recta). Yo acumulo sobre medianas de
+1 s. **Preguntarle cómo la acumula él.** De eso depende la redacción de la
+definición de la métrica, que quedó marcada con un comentario en `main.tex`.
+
+**2. La orientación de las cajas gruesas.** En el video se ven con el lado largo
+A LO LARGO de la barrera. Toda la columna de huecos medidos depende de eso: si
+estuvieran cruzándola, el hueco de `2.1a-2d` daría 4.2 d y el diseño se rompe.
+
+**3. El `1/N` de la compactación en la Fig. 3 de Juan Carlos.** Su figura da 1.41
+veces lo que da la ecuación del paper. Ya dejé la prosa de la métrica alineada
+con la ecuación (raíz de la MEDIA), que es la versión comparable entre 4 y 10
+robots. Confirmar con él y, si hace falta, regenerar su figura.
+
+**4. Faltan tres imágenes** para que el `.tex` compile con contenido real:
+`Atta_1_frente.jpg`, `Atta_2_atras.jpg` y `escenario.JPG`.
+
+**5. Reescribir el cierre de la sección de simulación**, que decía que la
+caracterización cuantitativa descansaba en la plataforma física. Con estos datos
+quedó al revés.
+
+**6. Medir el alcance del IR** con `ir_check.py --pot L/R` en los cuatro robots.
+Los 50 mm salieron de una estimación y sostienen el resultado de la simulación.
+
+---
+
+
 Repaso de `main.tex` contra los datos, revisión de las figuras de Juan Carlos, y
 material para las secciones que me tocan. Todo lo que va entre `%%%` es texto
 listo para pegar en LaTeX.
