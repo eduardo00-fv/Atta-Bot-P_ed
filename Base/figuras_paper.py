@@ -324,6 +324,13 @@ PAPER_ORDER = ['BosqueD_D2', 'BosqueD_D4', 'BosqueG_D2', 'BosqueG_D4', 'SinObs']
 PAPER_ETIQ = ['0.7a-2d', '0.7a-4d', '2.1a-2d', '2.1a-4d', 'NoObs']
 
 
+# Estilo de las figuras de Juan Carlos, que son de MATLAB: caja azul sin
+# relleno, mediana roja, bigotes negros punteados con tapas, atípicos como cruz
+# roja, recuadro completo del eje y rótulos en negrita. Se replica para que las
+# figuras del laboratorio y las de simulación no contrasten en el artículo.
+ML_BOX, ML_MED, ML_PTS = '#0000ff', '#ff0000', '#7fb4d8'
+
+
 def fig_paper(ds):
     runs = list(csv.DictReader(open(ds['runs_csv'])))
     rob = list(csv.DictReader(open(ds['robots_csv'])))
@@ -344,21 +351,25 @@ def fig_paper(ds):
           for sc in PAPER_ORDER]),
     )
     for ax, (ylab, data) in zip(axes, series):
-        bp = ax.boxplot(data, patch_artist=True, widths=.55,
-                        medianprops=dict(color='#c0392b', lw=1.5),
-                        flierprops=dict(marker='o', ms=4, mfc='none', mec=INK2))
-        for patch, sc in zip(bp['boxes'], PAPER_ORDER):
-            patch.set(facecolor=COL[sc], alpha=.5, edgecolor=COL[sc])
-        for w in bp['whiskers'] + bp['caps']:
-            w.set(color=GRID, lw=1.2)
+        # Los puntos van DEBAJO de la caja, como en las figuras del laboratorio.
         for i, vals in enumerate(data, start=1):
-            ax.plot([i] * len(vals), vals, 'o', ms=4, mfc=COL[PAPER_ORDER[i - 1]],
-                    mec='none', alpha=.45)
+            ax.plot([i] * len(vals), vals, 'o', ms=5, mfc=ML_PTS, mec='none',
+                    alpha=.55, zorder=1)
+        bp = ax.boxplot(data, widths=.5, zorder=2,
+                        boxprops=dict(color=ML_BOX, lw=1.1),
+                        medianprops=dict(color=ML_MED, lw=1.1),
+                        whiskerprops=dict(color='black', lw=.9, ls=(0, (4, 3))),
+                        capprops=dict(color='black', lw=.9),
+                        flierprops=dict(marker='+', ms=6, mec=ML_MED, mew=.9))
         ax.set_xticks(range(1, 6))
-        ax.set_xticklabels(PAPER_ETIQ, fontsize=8.5)
-        ax.set_xlabel('Scenario Configuration', fontsize=9)
-        ax.set_ylabel(ylab, fontsize=9)
-        _limpiar(ax)
+        ax.set_xticklabels(PAPER_ETIQ, fontsize=9)
+        ax.set_xlabel('Scenario Configuration', fontsize=9.5, fontweight='bold')
+        ax.set_ylabel(ylab, fontsize=9.5, fontweight='bold')
+        ax.grid(color='#d0d0d0', lw=.6)
+        ax.set_axisbelow(True)
+        for s in ax.spines.values():          # recuadro completo, como MATLAB
+            s.set(visible=True, color='black', linewidth=.8)
+        ax.tick_params(colors='black', labelcolor='black')
     fig.tight_layout()
     out = os.path.join(BASE, '..', 'Docs', 'paper', 'nuevo paper',
                        f'results_{ds["slug"]}.pdf')
