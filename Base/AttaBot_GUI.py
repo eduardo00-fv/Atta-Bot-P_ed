@@ -1,5 +1,15 @@
+"""Interfaz de control del enjambre AttaBot.
+
+Muestra la cámara con las anotaciones de ArUco, el mapa de cobertura, una tabla
+con el estado de cada robot y un panel de comandos agrupados por para qué sirven.
+
+El despacho de comandos NO vive acá: se delega en Base.dispatch(), el mismo que
+usa la consola. Tener dos copias fue el motivo de que la GUI se quedara sin
+FORMATION, CALIBRATE ni OCCLUDE durante meses.
+"""
 import os
 import sys
+import time
 
 # cv2 sobreescribe QT_QPA_PLATFORM_PLUGIN_PATH al importar, apuntando a sus
 # propios plugins Qt (incompatibles con PyQt5).  Solución: importar cv2 primero,
@@ -19,41 +29,108 @@ else:
 import numpy as np
 
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QLineEdit, QPushButton, QTextEdit, QComboBox, QFrame,
-    QInputDialog, QSizePolicy,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QLabel, QLineEdit, QPushButton, QTextEdit, QComboBox, QFrame, QTabWidget,
+    QInputDialog, QSizePolicy, QTableWidget, QTableWidgetItem, QHeaderView,
+    QCheckBox, QSplitter, QAbstractItemView,
 )
-from PyQt5.QtCore import Qt, pyqtSignal, pyqtSlot, QSize
-from PyQt5.QtGui import QPixmap, QImage, QFont, QKeySequence
+from PyQt5.QtCore import Qt, pyqtSignal, pyqtSlot, QSize, QTimer
+from PyQt5.QtGui import QPixmap, QImage, QFont, QColor
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AttaBotGUI
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Paleta ───────────────────────────────────────────────────────────────────
+# Oscura porque la interfaz convive con el video de una cámara cenital y un
+# fondo claro alrededor del frame cansa la vista en sesiones largas de lab.
+BG      = '#1b1d21'
+PANEL   = '#24262b'
+BORDE   = '#34373d'
+TEXTO   = '#e6e6e6'
+TENUE   = '#9aa0a8'
+ACENTO  = '#4a9eff'
+OK      = '#3ecf8e'
+ALERTA  = '#f5a623'
+ERROR   = '#ff5f57'
+
+HOJA = f"""
+QMainWindow, QWidget {{ background: {BG}; color: {TEXTO}; }}
+QFrame#panel {{ background: {PANEL}; border: 1px solid {BORDE};
+                border-radius: 6px; }}
+QLabel {{ color: {TEXTO}; }}
+QLabel#tenue {{ color: {TENUE}; font-size: 11px; }}
+QLineEdit {{ background: {BG}; color: {TEXTO}; border: 1px solid {BORDE};
+             border-radius: 4px; padding: 5px 8px;
+             selection-background-color: {ACENTO}; }}
+QLineEdit:focus {{ border-color: {ACENTO}; }}
+QComboBox {{ background: {BG}; color: {TEXTO}; border: 1px solid {BORDE};
+             border-radius: 4px; padding: 4px 8px; }}
+QComboBox QAbstractItemView {{ background: {PANEL}; color: {TEXTO};
+                               selection-background-color: {ACENTO}; }}
+QPushButton {{ background: {PANEL}; color: {TEXTO}; border: 1px solid {BORDE};
+               border-radius: 4px; padding: 5px 10px; }}
+QPushButton:hover {{ border-color: {ACENTO}; color: {ACENTO}; }}
+QPushButton:pressed {{ background: {BORDE}; }}
+QPushButton#primario {{ background: {ACENTO}; color: #0d1117;
+                        border: none; font-weight: 600; }}
+QPushButton#primario:hover {{ background: #6fb4ff; color: #0d1117; }}
+QPushButton#peligro:hover {{ border-color: {ERROR}; color: {ERROR}; }}
+QTextEdit {{ background: #16181c; color: {TEXTO}; border: 1px solid {BORDE};
+             border-radius: 6px; }}
+QTabWidget::pane {{ border: 1px solid {BORDE}; border-radius: 6px;
+                    background: {PANEL}; }}
+QTabBar::tab {{ background: transparent; color: {TENUE};
+                padding: 6px 14px; border: none; }}
+QTabBar::tab:selected {{ color: {ACENTO};
+                         border-bottom: 2px solid {ACENTO}; }}
+QTableWidget {{ background: #16181c; color: {TEXTO}; gridline-color: {BORDE};
+                border: 1px solid {BORDE}; border-radius: 6px; }}
+QHeaderView::section {{ background: {PANEL}; color: {TENUE}; border: none;
+                        border-bottom: 1px solid {BORDE}; padding: 5px; }}
+QCheckBox {{ color: {TENUE}; }}
+QSplitter::handle {{ background: {BORDE}; }}
+"""
+
 
 class AttaBotGUI(QMainWindow):
-    """
-    
-    Ventana principal de control de AttaBot.
+    """Ventana principal de control.
 
-    Muestra la cámara (con anotaciones ArUco) y el mapa de cobertura
-    en tiempo real, junto con un panel de comandos y un log de mensajes.
-
-    Las actualizaciones de frame y log llegan desde hilos de fondo vía signals.
+    Los frames y los mensajes llegan desde hilos de fondo, así que entran por
+    signals de Qt: tocar widgets desde otro hilo cuelga la aplicación.
     """
 
-    frameSignal = pyqtSignal(object, object)   # (camera_frame BGR, results_frame BGR)
-    logSignal   = pyqtSignal(str)              # mensaje para el log
+    frameSignal = pyqtSignal(object, object)   # (frame cámara BGR, mapa BGR)
+    logSignal = pyqtSignal(str)
+
+    # Columnas del panel de estado, con la clave del GET_STATUS que las llena.
+    COLUMNAS = [
+        ('Robot', None), ('Visto', None), ('Pose', 'Pos'), ('Estado', 'State'),
+        ('Nav', 'NAV'), ('IR L-C-R', 'Sensors'), ('Máscaras', 'Mask'),
+        ('Yaw', 'Yaw'), ('IMU', 'IMU'), ('Deriva EKF', None),
+    ]
+
+    # Nombres de los estados de la FSM, en el orden del enum RobotState del
+    # firmware. Si se agrega un estado allá, hay que agregarlo acá.
+    ESTADOS = ['WAIT', 'MOVE', 'TURN', 'RANDOM_WALK', 'REVERSE', 'STOP',
+               'READ_INSTR', 'MSG_BASE', 'IDENT_OBS', 'REQ_POS',
+               'ACTIVE_EVAS', 'RESUME_EVAS', 'SEARCH_APPR']
 
     def __init__(self, base):
         super().__init__()
         self.base = base
-        self._cmdHistory  = []
-        self._historyIdx  = -1
+        self._cmdHistory = []
+        self._historyIdx = -1
         self._buildUI()
         self.frameSignal.connect(self._onFrame)
         self.logSignal.connect(self._onLog)
-        self.setWindowTitle('AttaBot Control')
+        self.setWindowTitle('AttaBot — control de enjambre')
+        self.setStyleSheet(HOJA)
+        self.resize(1280, 860)
+
+        # El panel de estado se refresca solo. Pide GET_STATUS a los robots cada
+        # tantos segundos y redibuja con lo último que llegó; sin esto habría que
+        # apretar un botón para saber si un robot sigue vivo.
+        self._auto = QTimer(self)
+        self._auto.timeout.connect(self._refreshStatus)
+        self._auto.start(2000)
 
     # ── construcción de la interfaz ──────────────────────────────────────────
 
@@ -61,119 +138,225 @@ class AttaBotGUI(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         vbox = QVBoxLayout(root)
-        vbox.setSpacing(5)
-        vbox.setContentsMargins(6, 6, 6, 6)
+        vbox.setSpacing(8)
+        vbox.setContentsMargins(10, 10, 10, 10)
 
-        # ── fila de cámara ───────────────────────────────────────────────────
-        camRow = QHBoxLayout()
-        camRow.setSpacing(5)
+        split = QSplitter(Qt.Vertical)
+        split.setChildrenCollapsible(False)
 
+        arriba = QWidget()
+        camRow = QHBoxLayout(arriba)
+        camRow.setSpacing(8)
+        camRow.setContentsMargins(0, 0, 0, 0)
         self._camLabel = self._makeFrameLabel('Cámara')
         self._mapLabel = self._makeFrameLabel('Mapa de cobertura')
         camRow.addWidget(self._camLabel, stretch=1)
         camRow.addWidget(self._mapLabel, stretch=1)
-        vbox.addLayout(camRow, stretch=1)
+        split.addWidget(arriba)
 
-        # ── panel de comandos ────────────────────────────────────────────────
-        cmdFrame = QFrame()
-        cmdFrame.setFrameShape(QFrame.StyledPanel)
-        cmdBox = QVBoxLayout(cmdFrame)
-        cmdBox.setSpacing(4)
-        cmdBox.setContentsMargins(6, 4, 6, 4)
+        abajo = QWidget()
+        col = QVBoxLayout(abajo)
+        col.setSpacing(8)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.addWidget(self._buildStatusTable())
+        col.addWidget(self._buildCommandPanel())
+        col.addWidget(self._buildLog())
+        split.addWidget(abajo)
 
-        # Fila 1: selector de robot + campo de comando + botón enviar
-        row1 = QHBoxLayout()
-        row1.setSpacing(6)
+        # El video pesa menos que los controles: la cámara se mira de reojo y el
+        # trabajo real pasa en la tabla y los comandos. El splitter deja que el
+        # usuario le devuelva el alto cuando quiere ver el frame en detalle.
+        split.setStretchFactor(0, 2)
+        split.setStretchFactor(1, 3)
+        vbox.addWidget(split)
 
-        row1.addWidget(QLabel('Robot:'))
+    def _buildStatusTable(self):
+        marco = QFrame()
+        marco.setObjectName('panel')
+        caja = QVBoxLayout(marco)
+        caja.setContentsMargins(10, 8, 10, 10)
+        caja.setSpacing(6)
 
+        fila = QHBoxLayout()
+        titulo = QLabel('Estado del enjambre')
+        titulo.setFont(QFont('', 10, QFont.Bold))
+        fila.addWidget(titulo)
+        fila.addStretch()
+        self._autoChk = QCheckBox('refrescar cada 2s')
+        self._autoChk.setChecked(True)
+        fila.addWidget(self._autoChk)
+        ahora = QPushButton('Actualizar')
+        ahora.clicked.connect(lambda: self._refreshStatus(force=True))
+        fila.addWidget(ahora)
+        caja.addLayout(fila)
+
+        self._tabla = QTableWidget(0, len(self.COLUMNAS))
+        self._tabla.setHorizontalHeaderLabels([c[0] for c in self.COLUMNAS])
+        self._tabla.verticalHeader().setVisible(False)
+        self._tabla.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._tabla.setSelectionMode(QAbstractItemView.NoSelection)
+        self._tabla.setFixedHeight(140)
+        self._tabla.setFont(QFont('Monospace', 9))
+        # Cada columna al ancho de su contenido y la primera absorbe lo que
+        # sobra: con Stretch parejo la pose quedaba cortada en '(412,903) …',
+        # que es justo el dato que uno mira.
+        cab = self._tabla.horizontalHeader()
+        cab.setSectionResizeMode(QHeaderView.ResizeToContents)
+        cab.setStretchLastSection(True)
+        caja.addWidget(self._tabla)
+        return marco
+
+    def _buildCommandPanel(self):
+        marco = QFrame()
+        marco.setObjectName('panel')
+        caja = QVBoxLayout(marco)
+        caja.setContentsMargins(10, 8, 10, 10)
+        caja.setSpacing(8)
+
+        fila = QHBoxLayout()
+        fila.setSpacing(8)
+        fila.addWidget(QLabel('Destino:'))
         self._robotCombo = QComboBox()
-        self._robotCombo.setMinimumWidth(110)
+        self._robotCombo.setMinimumWidth(140)
         self._robotCombo.addItem('BROADCAST')
-        row1.addWidget(self._robotCombo)
+        fila.addWidget(self._robotCombo)
 
         self._cmdInput = QLineEdit()
-        self._cmdInput.setPlaceholderText('Comando (ej: GT|500|300 — Enter para enviar)')
+        self._cmdInput.setPlaceholderText(
+            'Comando crudo — ej. GT|500|300. ↑↓ recorre el historial, Enter envía')
         self._cmdInput.returnPressed.connect(self._send)
         self._cmdInput.installEventFilter(self)
-        row1.addWidget(self._cmdInput, stretch=1)
+        fila.addWidget(self._cmdInput, stretch=1)
 
-        sendBtn = QPushButton('Enviar ↵')
-        sendBtn.setFixedWidth(80)
-        sendBtn.clicked.connect(self._send)
-        row1.addWidget(sendBtn)
-        cmdBox.addLayout(row1)
+        enviar = QPushButton('Enviar')
+        enviar.setObjectName('primario')
+        enviar.setFixedWidth(90)
+        enviar.clicked.connect(self._send)
+        fila.addWidget(enviar)
+        caja.addLayout(fila)
 
-        # Fila 2: movimiento
-        row2 = QHBoxLayout()
-        row2.setSpacing(4)
-        movButtons = [
-            ('MOVE',      'MOVE|',              False),
-            ('TURN',      'TURN|',              False),
-            ('RANDOMW',   'RANDOMW|',           False),
-            ('WAIT',      'WAIT|',              False),
-            ('GT',        'GT|',               False),
-            ('ABORT_NAV', 'ABORT_NAV',          True),
-            ('CLEAR_EV',  'CLEAR_EVASION',      True),
-            ('RST_EV',    'RESET_EVASION',      True),
+        pestanas = QTabWidget()
+        for nombre, botones in self._gruposDeComandos():
+            pestanas.addTab(self._makeButtonGrid(botones), nombre)
+        pestanas.setFixedHeight(140)
+        caja.addWidget(pestanas)
+        return marco
+
+    def _gruposDeComandos(self):
+        """Los comandos agrupados por para qué sirven.
+
+        Cada botón es (etiqueta, ayuda, acción). La acción es un texto, y ahí
+        importa el sufijo: si termina en '|' se deja escrito en el campo para que
+        el usuario complete los argumentos, y si no, se manda tal cual. Los
+        callables abren un diálogo.
+
+        Hasta el 2026-08-01 acá había 16 comandos de los 29 que entiende el
+        firmware. Faltaban MEET —el experimento del paper—, todo el enjambre y
+        toda la configuración en vivo.
+        """
+        return [
+            ('Movimiento', [
+                ('Avanzar', 'MOVE|<mm>', 'MOVE|'),
+                ('Girar', 'TURN|<grados>', 'TURN|'),
+                ('Esperar', 'WAIT|<ms>', 'WAIT|'),
+                ('Random walk', 'RANDOMW|<ms>', 'RANDOMW|'),
+                ('Ir a punto', 'GT|<x>|<y>', 'GT|'),
+                ('Ir a global', 'GOTO.<robot> x y', self._dlgGoto),
+                ('Abortar nav', 'corta navegación y búsqueda', 'ABORT_NAV'),
+                ('Parar', 'vuelve a STOP', 'RESET'),
+            ]),
+            ('Enjambre', [
+                ('MEET', 'congregación sobre un punto, sin líder', self._dlgMeet),
+                ('Congregación', 'CONGREGATION.<líder>', self._dlgCongregacion),
+                ('Formación', 'línea, cuña o círculo', self._dlgFormacion),
+                ('Dispersar', 'DISPERSE|<mm de separación>', 'DISPERSE|'),
+                ('Cancelar congr.', '', 'CANCEL_CONGREGATION'),
+                ('Buscar objeto', 'SEARCH_OBJECT|<color>', 'SEARCH_OBJECT|'),
+                ('Leer color', 'lee el APDS9960 y reporta RGBC', 'COLOR_READ'),
+            ]),
+            ('Sensores', [
+                ('Máscaras IR', 'ignorar un sensor defectuoso', self._dlgMascara),
+                ('Umbral central', 'SENSOR_THRESHOLD|C|<0-255>', self._dlgUmbral),
+                ('Limpiar evasión', '', 'CLEAR_EVASION'),
+                ('Reset evasión', 'borra todo el rastro de evasión', 'RESET_EVASION'),
+                ('Autotest', 'motores e IMU en banco', 'SELFTEST'),
+                ('Estado', 'GET_STATUS', 'GET_STATUS'),
+                ('Yaw', 'GET_YAW', 'GET_YAW'),
+            ]),
+            ('Calibración', [
+                ('Config. nav', 'arena, ruedas, yaw, IR, parking', self._dlgNavConfig),
+                ('Leer PPR', 'GETPPR', 'GETPPR'),
+                ('Guardar PPR', 'SETPPR|<pulsos>[|SAVE]', 'SETPPR|'),
+                ('PID', 'PID|<kp>|<ki>|<kd>', 'PID|'),
+                ('Kalman PID', 'KFPID|<q>|<r>|<p>', 'KFPID|'),
+                ('EKF nav', 'navegar con el EKF en vez del ArUco', self._dlgEkfNav),
+                ('Calibrar', 'CALIBRATE.<robot>', self._dlgCalibrar),
+                ('Recalibrar origen', 'fija el origen con el marker 5', '__ORIGIN__'),
+            ]),
         ]
-        for label, cmd, direct in movButtons:
-            btn = QPushButton(label)
-            btn.setMaximumWidth(88)
-            if direct:
-                btn.clicked.connect(lambda _, c=cmd: self._quickSend(c))
+
+    def _makeButtonGrid(self, botones):
+        cont = QWidget()
+        rejilla = QGridLayout(cont)
+        rejilla.setContentsMargins(10, 10, 10, 10)
+        rejilla.setSpacing(6)
+        for i, (etiqueta, ayuda, accion) in enumerate(botones):
+            btn = QPushButton(etiqueta)
+            if ayuda:
+                btn.setToolTip(ayuda)
+            if etiqueta in ('Parar', 'Abortar nav'):
+                btn.setObjectName('peligro')
+            if callable(accion):
+                btn.clicked.connect(lambda _, f=accion: f())
+            elif accion.endswith('|'):
+                btn.clicked.connect(lambda _, c=accion: self._fillInput(c))
             else:
-                btn.clicked.connect(lambda _, c=cmd: self._fillInput(c))
-            row2.addWidget(btn)
-        row2.addStretch()
-        cmdBox.addLayout(row2)
+                btn.clicked.connect(lambda _, c=accion: self._quickSend(c))
+            rejilla.addWidget(btn, i // 4, i % 4)
+        rejilla.setRowStretch(rejilla.rowCount(), 1)
+        return cont
 
-        # Fila 3: sistema / config
-        row3 = QHBoxLayout()
-        row3.setSpacing(4)
-        sysButtons = [
-            ('STATUS',    'GET_STATUS',          True),
-            ('GET_YAW',   'GET_YAW',             True),
-            ('GETPPR',    'GETPPR',              True),
-            ('PID',       'PID|',               False),
-            ('CONGR',     'CONGREGATION|',      False),
-            ('CANCEL_C',  'CANCEL_CONGREGATION', True),
-            ('RESET',     'RESET',               True),
-            ('ORIGIN [o]','__ORIGIN__',          True),
-        ]
-        for label, cmd, direct in sysButtons:
-            btn = QPushButton(label)
-            btn.setMaximumWidth(88)
-            if direct:
-                btn.clicked.connect(lambda _, c=cmd: self._quickSend(c))
-            else:
-                btn.clicked.connect(lambda _, c=cmd: self._fillInput(c))
-            row3.addWidget(btn)
-        row3.addStretch()
-        cmdBox.addLayout(row3)
+    def _buildLog(self):
+        marco = QFrame()
+        marco.setObjectName('panel')
+        caja = QVBoxLayout(marco)
+        caja.setContentsMargins(10, 8, 10, 10)
+        caja.setSpacing(6)
 
-        vbox.addWidget(cmdFrame)
+        fila = QHBoxLayout()
+        titulo = QLabel('Mensajes')
+        titulo.setFont(QFont('', 10, QFont.Bold))
+        fila.addWidget(titulo)
+        fila.addStretch()
+        self._filtroDebug = QCheckBox('mostrar DEBUG')
+        self._filtroDebug.setChecked(True)
+        fila.addWidget(self._filtroDebug)
+        limpiar = QPushButton('Limpiar')
+        limpiar.clicked.connect(lambda: self._log.clear())
+        fila.addWidget(limpiar)
+        caja.addLayout(fila)
 
-        # ── log ──────────────────────────────────────────────────────────────
         self._log = QTextEdit()
         self._log.setReadOnly(True)
-        self._log.setFixedHeight(160)
+        self._log.setMinimumHeight(120)
         self._log.setFont(QFont('Monospace', 9))
-        vbox.addWidget(self._log)
+        caja.addWidget(self._log)
+        return marco
 
     @staticmethod
-    def _makeFrameLabel(placeholder: str) -> QLabel:
+    def _makeFrameLabel(placeholder):
         lbl = QLabel(placeholder)
         lbl.setAlignment(Qt.AlignCenter)
-        lbl.setMinimumSize(QSize(560, 315))
+        lbl.setMinimumSize(QSize(480, 270))
         lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        lbl.setStyleSheet('background:#111; color:#555; border:1px solid #333;')
+        lbl.setStyleSheet(f'background:#101216; color:{TENUE};'
+                          f'border:1px solid {BORDE}; border-radius:6px;')
         return lbl
 
-    # ── actualización de robots ──────────────────────────────────────────────
+    # ── panel de estado ──────────────────────────────────────────────────────
 
     def refreshRobots(self):
-        """Actualiza el dropdown con los robots actualmente registrados."""
+        """Repuebla el selector de destino con los robots registrados."""
         prev = self._robotCombo.currentText()
         self._robotCombo.clear()
         self._robotCombo.addItem('BROADCAST')
@@ -183,9 +366,83 @@ class AttaBotGUI(QMainWindow):
         if idx >= 0:
             self._robotCombo.setCurrentIndex(idx)
 
+    def _refreshStatus(self, force=False):
+        """Pide GET_STATUS y redibuja la tabla con lo último que llegó.
+
+        El pedido va por broadcast en vez de robot por robot: son N datagramas
+        contra uno, y a 2Hz con diez robots eso ya se nota en la misma red por la
+        que viajan las órdenes de navegación.
+        """
+        if not (force or self._autoChk.isChecked()):
+            return
+        try:
+            self.base.sendInstructionBroadcast(['GET_STATUS'])
+        except Exception:
+            pass                      # sin red todavía; la tabla igual se dibuja
+        self._drawStatus()
+
+    def _drawStatus(self):
+        robots = sorted(self.base.robots.items())
+        self._tabla.setRowCount(len(robots))
+        ahora = time.time()
+        for fila, (rid, robot) in enumerate(robots):
+            st = getattr(robot, 'status', {}) or {}
+            edad = ahora - getattr(robot, 'statusStamp', 0.0)
+            x, y, ang = robot.getPose()
+            visible = x != -1
+
+            deriva = '—'
+            if robot.ekfPose and visible:
+                dx = robot.ekfPose[0] - x
+                dy = robot.ekfPose[1] - y
+                deriva = f'{(dx * dx + dy * dy) ** 0.5:.0f} mm'
+
+            estado = st.get('State', '')
+            if estado.isdigit() and int(estado) < len(self.ESTADOS):
+                estado = self.ESTADOS[int(estado)]
+
+            valores = [
+                f'{rid} {robot.name}',
+                'sí' if visible else 'NO',
+                f'({x:.0f},{y:.0f}) {ang:.0f}°' if visible else '—',
+                estado,
+                'activa' if st.get('NAV') == '1' else '—',
+                st.get('Sensors', '—'),
+                st.get('Mask', '—'),
+                st.get('Yaw', '—'),
+                'ok' if st.get('IMU') == '1' else 'NO',
+                deriva,
+            ]
+            for celda, texto in enumerate(valores):
+                item = QTableWidgetItem(texto)
+                item.setTextAlignment(Qt.AlignCenter)
+                self._pintarCelda(item, celda, texto, st, edad)
+                self._tabla.setItem(fila, celda, item)
+
+    def _pintarCelda(self, item, celda, texto, st, edad):
+        """Color por celda: lo que está mal tiene que saltar sin leer.
+
+        Un robot sin STATUS reciente se atenúa entero en vez de mostrar datos
+        viejos como si fueran de ahora — que es el error que hace perder tiempo
+        cuando un robot se cae a mitad de una corrida.
+        """
+        if not st or edad > 6.0:
+            item.setForeground(QColor(TENUE))
+            return
+        if celda == 1 and texto == 'NO':
+            item.setForeground(QColor(ERROR))
+        elif celda == 5 and texto not in ('—', '0-0-0', 'L0-C0-R0'):
+            item.setForeground(QColor(ALERTA))
+        elif celda == 6 and texto not in ('—', 'L0-C0-R0'):
+            item.setForeground(QColor(ALERTA))
+        elif celda == 8:
+            item.setForeground(QColor(OK if texto == 'ok' else ERROR))
+        elif celda == 4 and texto == 'activa':
+            item.setForeground(QColor(ACENTO))
+
     # ── envío de comandos ────────────────────────────────────────────────────
 
-    def _selectedRobotId(self) -> str:
+    def _selectedRobotId(self):
         data = self._robotCombo.currentData()
         return data if data is not None else 'BROADCAST'
 
@@ -193,133 +450,199 @@ class AttaBotGUI(QMainWindow):
         cmd = self._cmdInput.text().strip()
         if not cmd:
             return
-        robot_id = self._selectedRobotId()
-        self._dispatch(robot_id, cmd)
+        self._dispatch(self._selectedRobotId(), cmd)
         if not self._cmdHistory or self._cmdHistory[0] != cmd:
             self._cmdHistory.insert(0, cmd)
         self._historyIdx = -1
         self._cmdInput.clear()
 
-    def _quickSend(self, cmd: str):
+    def _quickSend(self, cmd):
         if cmd == '__ORIGIN__':
             self.base.recalibrateOrigin()
             self.logSignal.emit('[ORIGIN] Origen recalibrado')
             return
-        self._fillInput(cmd)
-        self._send()
+        self._dispatch(self._selectedRobotId(), cmd)
 
-    def _fillInput(self, text: str):
+    def _fillInput(self, text):
         self._cmdInput.setText(text)
         self._cmdInput.setFocus()
         self._cmdInput.setCursorPosition(len(text))
 
-    def _dispatch(self, robot_id: str, instruction: str):
-        """Mismo comportamiento que inputInstruction() pero desde la GUI."""
-        label = f'{robot_id}.{instruction}'
-        self.logSignal.emit(f'<span style="color:#7af;"><b>&gt;&gt; {label}</b></span>')
+    def _dispatch(self, robotId, instruction):
+        """Delega en Base.dispatch(), el mismo despachador que usa la consola."""
+        self.logSignal.emit(
+            f'<span style="color:{ACENTO};"><b>&gt;&gt; {robotId}.{instruction}'
+            f'</b></span>')
+        try:
+            self.base.dispatch(robotId, instruction, log=self.logSignal.emit)
+        except Exception as e:
+            self.logSignal.emit(
+                f'<span style="color:{ERROR};">error: {e}</span>')
 
-        if robot_id == 'BROADCAST':
-            self.base.sendInstructionBroadcast([instruction])
+    # ── diálogos ─────────────────────────────────────────────────────────────
 
-        elif robot_id == 'CONGREGATION':
-            self.base.startCongregation(instruction)
+    def _pedirTexto(self, titulo, etiqueta, valor=''):
+        texto, ok = QInputDialog.getText(self, titulo, etiqueta, text=valor)
+        return texto.strip() if ok and texto.strip() else None
 
-        elif robot_id == 'GOTO':
-            # Formato: GOTO.robotID x y
-            parts = instruction.split()
-            if len(parts) == 3:
-                try:
-                    self.base.sendToGlobalPosition(parts[0], float(parts[1]), float(parts[2]))
-                except ValueError:
-                    self.logSignal.emit('GOTO: formato inválido — use robotID x y')
-            else:
-                self.logSignal.emit('GOTO: formato inválido — use robotID x y')
+    def _elegir(self, titulo, etiqueta, opciones):
+        op, ok = QInputDialog.getItem(self, titulo, etiqueta, opciones, 0, False)
+        return op if ok else None
 
-        elif robot_id == 'STATUS':
-            for rid, robot in self.base.robots.items():
-                x, y, angle = robot.getPose()
-                if x != -1:
-                    self.logSignal.emit(f'  {robot.name}: ({x:.1f},{y:.1f}) {angle:.1f}°')
-                else:
-                    self.logSignal.emit(f'  {robot.name}: no visible')
+    def _dlgMeet(self):
+        """MEET|x|y[|radio] — el experimento del paper.
 
-        elif robot_id in self.base.robots:
-            ip = self.base.robots[robot_id].IP
-            self.base.sendInstruction(ip, [instruction], False)
+        Se manda por broadcast siempre: la gracia de MEET es que los N robots
+        resuelven el mismo reparto de slots desde el mismo mensaje. Mandárselo a
+        uno solo no congrega nada.
+        """
+        punto = self._pedirTexto('MEET', 'Punto de encuentro  x y  (mm):', '2200 850')
+        if not punto:
+            return
+        partes = punto.split()
+        if len(partes) < 2:
+            self.logSignal.emit('MEET: hacen falta x e y')
+            return
+        radio = self._pedirTexto('MEET', 'Radio del anillo en mm (vacío = lo '
+                                         'calcula el firmware):')
+        cmd = f'MEET|{partes[0]}|{partes[1]}' + (f'|{radio}' if radio else '')
+        self._dispatch('BROADCAST', cmd)
 
-        else:
-            self.logSignal.emit(f'Robot "{robot_id}" no encontrado')
+    def _dlgCongregacion(self):
+        lider = self._pedirTexto('Congregación', 'ID del robot líder:')
+        if lider:
+            self._dispatch('CONGREGATION', lider)
 
-    # ── historial de comandos (↑ ↓) ──────────────────────────────────────────
+    def _dlgFormacion(self):
+        figura = self._elegir('Formación', 'Figura:', ['linea', 'cuna', 'circulo'])
+        if not figura:
+            return
+        resto = self._pedirTexto('Formación', 'ID del líder [espaciado en mm]:')
+        if resto:
+            self._dispatch('FORMATION', f'{figura} {resto}')
+
+    def _dlgGoto(self):
+        destino = self._pedirTexto('Ir a global', 'robotID  x  y :')
+        if destino:
+            self._dispatch('GOTO', destino)
+
+    def _dlgCalibrar(self):
+        robot = self._pedirTexto('Calibrar', 'ID del robot:')
+        if robot:
+            self._dispatch('CALIBRATE', robot)
+
+    def _dlgMascara(self):
+        """SENSOR_MASK|<L|C|R>|<0|1> — ignorar un sensor.
+
+        Se usa seguido y a mano: Atta_1 tiene el infrarrojo derecho fantasma, así
+        que en cada sesión de lab hay que enmascararlo antes de navegar.
+        """
+        sensor = self._elegir('Máscaras IR', 'Sensor:',
+                              ['L — izquierdo', 'C — central', 'R — derecho'])
+        if not sensor:
+            return
+        accion = self._elegir('Máscaras IR', f'¿Qué hago con {sensor[0]}?',
+                              ['ignorar (1)', 'volver a usar (0)'])
+        if accion:
+            self._quickSend(f'SENSOR_MASK|{sensor[0]}|{"1" if "ignorar" in accion else "0"}')
+
+    def _dlgUmbral(self):
+        valor = self._pedirTexto(
+            'Umbral del IR central',
+            'Proximidad 0-255 (mayor = detecta más cerca):')
+        if not valor:
+            return
+        guardar = self._elegir('Umbral del IR central', '¿Persistir en NVS?',
+                               ['solo por ahora', 'guardar'])
+        sufijo = '|SAVE' if guardar == 'guardar' else ''
+        self._quickSend(f'SENSOR_THRESHOLD|C|{valor}{sufijo}')
+
+    def _dlgEkfNav(self):
+        op = self._elegir('EKF nav', 'Fuente de pose para navegar:',
+                          ['ArUco crudo (0)', 'EKF fusionado (1)'])
+        if op:
+            self._quickSend(f'EKF_NAV|{"1" if "EKF" in op else "0"}')
+
+    def _dlgNavConfig(self):
+        """NAV_CONFIG|<clave>|<valor>[|SAVE] — configuración en vivo.
+
+        Las claves están puestas a mano y no leídas del firmware, así que si allá
+        se agrega una, acá hay que agregarla. Es la lista de NAV_CONFIG de
+        comandos.ino.
+        """
+        claves = ['ARENA — ancho alto (mm)', 'WHEEL_DIST — media distancia entre ruedas',
+                  'YAW_SCALE — escala del gyro', 'IR_RANGE — alcance del IR (mm)',
+                  'PARKING_DIST — radio de congregación (mm)']
+        elegida = self._elegir('Configuración de navegación', 'Parámetro:', claves)
+        if not elegida:
+            return
+        clave = elegida.split(' —')[0]
+        valor = self._pedirTexto('Configuración de navegación',
+                                 f'Valor para {clave}:')
+        if not valor:
+            return
+        guardar = self._elegir('Configuración de navegación', '¿Persistir en NVS?',
+                               ['solo por ahora', 'guardar'])
+        valor = valor.replace(' ', '|')          # ARENA lleva dos números
+        sufijo = '|SAVE' if guardar == 'guardar' else ''
+        self._quickSend(f'NAV_CONFIG|{clave}|{valor}{sufijo}')
+
+    # ── historial del campo de comandos ──────────────────────────────────────
 
     def eventFilter(self, obj, event):
         from PyQt5.QtCore import QEvent
-        from PyQt5.QtGui import QKeyEvent
         if obj is self._cmdInput and event.type() == QEvent.KeyPress:
             key = event.key()
             if key == Qt.Key_Up and self._cmdHistory:
-                self._historyIdx = min(self._historyIdx + 1, len(self._cmdHistory) - 1)
+                self._historyIdx = min(self._historyIdx + 1,
+                                       len(self._cmdHistory) - 1)
                 self._cmdInput.setText(self._cmdHistory[self._historyIdx])
                 return True
             if key == Qt.Key_Down:
                 self._historyIdx = max(self._historyIdx - 1, -1)
                 self._cmdInput.setText(
-                    self._cmdHistory[self._historyIdx] if self._historyIdx >= 0 else ''
-                )
+                    self._cmdHistory[self._historyIdx]
+                    if self._historyIdx >= 0 else '')
                 return True
         return super().eventFilter(obj, event)
 
-    # ── slots de signals ─────────────────────────────────────────────────────
+    # ── slots ────────────────────────────────────────────────────────────────
 
     @pyqtSlot(object, object)
     def _onFrame(self, cam_frame, results_frame):
         if cam_frame is not None:
             self._camLabel.setPixmap(
-                self._npToPixmap(cam_frame, self._camLabel.size())
-            )
+                self._npToPixmap(cam_frame, self._camLabel.size()))
         if results_frame is not None:
             self._mapLabel.setPixmap(
-                self._npToPixmap(results_frame, self._mapLabel.size())
-            )
+                self._npToPixmap(results_frame, self._mapLabel.size()))
 
     @pyqtSlot(str)
-    def _onLog(self, msg: str):
+    def _onLog(self, msg):
+        if 'DEBUG' in msg and not self._filtroDebug.isChecked():
+            return
         self._log.append(msg)
-        self._log.verticalScrollBar().setValue(
-            self._log.verticalScrollBar().maximum()
-        )
-
-    # ── conversión numpy → QPixmap ────────────────────────────────────────────
+        barra = self._log.verticalScrollBar()
+        barra.setValue(barra.maximum())
 
     @staticmethod
-    def _npToPixmap(frame: np.ndarray, target: QSize) -> QPixmap:
+    def _npToPixmap(frame, target):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         qimg = QImage(rgb.tobytes(), w, h, ch * w, QImage.Format_RGB888)
         return QPixmap.fromImage(qimg).scaled(
-            target, Qt.KeepAspectRatio, Qt.SmoothTransformation
-        )
+            target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Punto de entrada con GUI
-# ─────────────────────────────────────────────────────────────────────────────
 
 def launch(base_instance):
-    """
-    Arranca la aplicación PyQt5 para AttaBot.
-
-    - Pregunta la cantidad de robots con un diálogo.
-    - Inicia el procesamiento de cámara en hilo de fondo.
-    - Corre el event loop de Qt en el hilo principal.
-    """
+    """Arranca la aplicación: pregunta cuántos robots, lanza la cámara en un
+    hilo de fondo y corre el event loop de Qt en el principal."""
     import threading
 
     app = QApplication.instance() or QApplication(sys.argv)
 
     numRobots, ok = QInputDialog.getInt(
-        None, 'AttaBot', 'Cantidad de robots en la prueba:', 1, 1, 10
-    )
+        None, 'AttaBot', 'Cantidad de robots en la prueba:', 1, 1, 12)
     if not ok:
         return
 
@@ -330,15 +653,14 @@ def launch(base_instance):
     base_instance.gui = gui
     gui.show()
 
-    cam_thread = threading.Thread(target=base_instance.cameraProcessing, daemon=True)
+    cam_thread = threading.Thread(target=base_instance.cameraProcessing,
+                                  daemon=True)
     cam_thread.start()
 
     sys.exit(app.exec_())
 
 
 if __name__ == '__main__':
-    import sys
-    import os
-    sys.path.insert(0, os.path.dirname(__file__))
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from AttaBot_Base import base
     launch(base)

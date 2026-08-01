@@ -125,6 +125,9 @@ class Robot(object):
         # deriva antes de decidir si se le confía la navegación.
         self.ekfPose = None               # (x, y, angle) o None si nunca llegó
         self.ekfStamp = 0.0               # time.time() de la última recepción
+        # Último GET_STATUS parseado a {clave: valor}, para el panel de la GUI.
+        self.status = {}
+        self.statusStamp = 0.0
         self.initRobot(configRobot)
 
 
@@ -1915,6 +1918,20 @@ class Base(object):
                         except ValueError:
                             pass
 
+                elif command == 'STATUS':
+                    # Respuesta a GET_STATUS: campos 'clave:valor' separados por
+                    # '|'. Se guardan crudos en el robot para que la GUI arme su
+                    # panel sin volver a parsear. Antes esta respuesta caía al log
+                    # como una línea de 300 caracteres que había que leer a ojo.
+                    if robotFound:
+                        estado = {}
+                        for campo in parts[1:]:
+                            if ':' in campo:
+                                k, v = campo.split(':', 1)
+                                estado[k] = v
+                        self.robots[id].status = estado
+                        self.robots[id].statusStamp = time.time()
+
                 elif command == 'COLOR_QUERY' and self.simMode:
                     # APDS virtual: el supervisor de Webots conoce los colores
                     # del mundo y responde COLOR_RESPONSE directo al robot
@@ -2506,50 +2523,66 @@ class Base(object):
                 print("Formato inválido. Use 'robotId.instrucción'")
                 continue
 
-            self.warnIfOutsideFov(instruction)
-
-            if robotId == 'BROADCAST':
-                self.sendInstructionBroadcast([instruction])
-            elif robotId in self.robots:
-                robotIP = self.robots[robotId].IP
-                self.sendInstruction(robotIP, [instruction], True)
-            elif robotId == 'CONGREGATION':
-                self.startCongregation(instruction)
-            elif robotId == 'FORMATION':
-                self.startFormation(instruction)
-            elif robotId == 'CALIBRATE':
-                self.startCalibration(instruction)
-            elif robotId == 'OCCLUDE':
-                # Solo sim: tapa la cámara virtual n segundos (OCCLUDE.10)
-                if self.simMode:
-                    self.simVision.sendControl(f'OCCLUDE.{instruction}')
-                    print(f'Cámara sim ocluida por {instruction}s')
-                else:
-                    print('OCCLUDE solo existe en modo --sim')
-            elif robotId == 'GOTO':
-                parts = instruction.split()
-                if len(parts) == 3:
-                    targetRobotID = parts[0]
-                    targetX = float(parts[1])
-                    targetY = float(parts[2])
-                    self.sendToGlobalPosition(targetRobotID, targetX, targetY)
-                else:
-                    print("Formato: GOTO.robotID x y")
-            elif robotId == 'STATUS':
-                print(f"Detecciones ArUco activas: {list(self.currentArucoDetections.keys())}")
-                for rid, robot in self.robots.items():
-                    x, y, angle = robot.getPose()
-                    if x != -1:
-                        print(f"  Robot {rid} ({robot.name}): x={x}, y={y}, angle={angle}°")
-                    else:
-                        print(f"  Robot {rid} ({robot.name}): no visible")
-                if self.congregationActive:
-                    print(f"Congregación activa. Líder: {self.leaderID}")
-                    print(f"Completa: {self.isCongregationComplete()}")
-            else:
-                print(f"Robot ID '{robotId}' no encontrado.")
+            self.dispatch(robotId, instruction)
 
         self.threadInputAlive = False
+
+    def dispatch(self, robotId, instruction, log=print):
+        """Ejecuta un 'robotId.instrucción' venga de donde venga.
+
+        La consola y la GUI comparten este método a propósito. Antes cada una
+        tenía su propia cadena de if/elif sobre el mismo formato, y la de la GUI
+        ya se había quedado atrás: entendía BROADCAST, CONGREGATION, GOTO y
+        STATUS, pero no FORMATION, CALIBRATE ni OCCLUDE. Nadie lo notaba porque
+        quien usa la GUI termina tecleando el comando crudo.
+
+        `log` es lo único que cambia entre las dos caras: la consola imprime y la
+        GUI emite una señal hacia su panel de mensajes.
+        """
+        self.warnIfOutsideFov(instruction)
+
+        if robotId == 'BROADCAST':
+            self.sendInstructionBroadcast([instruction])
+        elif robotId in self.robots:
+            self.sendInstruction(self.robots[robotId].IP, [instruction], True)
+        elif robotId == 'CONGREGATION':
+            self.startCongregation(instruction)
+        elif robotId == 'FORMATION':
+            self.startFormation(instruction)
+        elif robotId == 'CALIBRATE':
+            self.startCalibration(instruction)
+        elif robotId == 'OCCLUDE':
+            # Solo sim: tapa la cámara virtual n segundos (OCCLUDE.10)
+            if self.simMode:
+                self.simVision.sendControl(f'OCCLUDE.{instruction}')
+                log(f'Cámara sim ocluida por {instruction}s')
+            else:
+                log('OCCLUDE solo existe en modo --sim')
+        elif robotId == 'GOTO':
+            parts = instruction.split()
+            if len(parts) == 3:
+                try:
+                    self.sendToGlobalPosition(parts[0], float(parts[1]),
+                                              float(parts[2]))
+                except ValueError:
+                    log('Formato: GOTO.robotID x y')
+            else:
+                log('Formato: GOTO.robotID x y')
+        elif robotId == 'STATUS':
+            log(f'Detecciones ArUco activas: '
+                f'{list(self.currentArucoDetections.keys())}')
+            for rid, robot in self.robots.items():
+                x, y, angle = robot.getPose()
+                if x != -1:
+                    log(f'  Robot {rid} ({robot.name}): '
+                        f'x={x:.1f}, y={y:.1f}, angle={angle:.1f}°')
+                else:
+                    log(f'  Robot {rid} ({robot.name}): no visible')
+            if self.congregationActive:
+                log(f'Congregación activa. Líder: {self.leaderID}')
+                log(f'Completa: {self.isCongregationComplete()}')
+        else:
+            log(f"Robot ID '{robotId}' no encontrado.")
 
 
 # =============================================================================
