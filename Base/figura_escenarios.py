@@ -40,7 +40,7 @@ OBST, STRUCT, EDGE = '#e8a33d', '#9a9a96', '#4a4a48'
 WALL, INK, INK2 = '#2f5aa8', '#0b0b0b', '#5b5c60'
 
 
-def limpia_lab(obs, escenario, arena):
+def limpia_lab(obs, nominal, arena):
     """Descarta artefactos de detección y devuelve (x, y) con tamaño nominal.
 
     Primero descarta lo que cae fuera de la arena en x (una caja no puede estar
@@ -61,7 +61,15 @@ def limpia_lab(obs, escenario, arena):
         col.setdefault(round(x / 250) * 250, []).append((x, y))
     if len(col) > 1:
         col = {k: v for k, v in col.items() if len(v) > 1} or col
-    return sorted((p for v in col.values() for p in v), key=lambda p: (p[0], p[1]))
+    pts = sorted((p for v in col.values() for p in v), key=lambda p: (p[0], p[1]))
+
+    # Las cajas contra la pared salen medidas FUERA de la arena: la cámara ve
+    # menos que la arena completa, así que en los bordes la homografía
+    # extrapola y el paralaje empuja el centro hacia afuera. Físicamente no
+    # pueden salirse, de modo que se acotan a quedar completas adentro.
+    bw, bh = nominal
+    return [(min(max(x, bw / 2), W - bw / 2),
+             min(max(y, bh / 2), H - bh / 2)) for x, y in pts]
 
 
 def panel(ax, arena, cajas, estructurales, target, titulo, hueco=None):
@@ -94,8 +102,10 @@ def gap_medido(cajas, lado_transversal):
     ys = sorted(max(col.values(), key=len))
     if len(ys) < 2:
         return None
-    seps = [ys[i + 1] - ys[i] for i in range(len(ys) - 1)]
-    return (sum(seps) / len(seps) - lado_transversal) / D_ROBOT
+    seps = sorted(ys[i + 1] - ys[i] for i in range(len(ys) - 1))
+    # mediana, no media: una caja de la punta mal ubicada no debe mover el hueco
+    med = seps[len(seps) // 2] if len(seps) % 2 else (seps[len(seps) // 2 - 1] + seps[len(seps) // 2]) / 2
+    return (med - lado_transversal) / D_ROBOT
 
 
 def figura_lab():
@@ -105,7 +115,7 @@ def figura_lab():
     fig, axes = plt.subplots(2, 2, figsize=(6.6, 5.4))
     for ax, sc in zip(axes.ravel(), ORDER):
         w, h = NOMINAL['G' if 'BosqueG' in sc else 'D']
-        pts = limpia_lab(geo[sc]['obstaculos'], sc, arena)
+        pts = limpia_lab(geo[sc]['obstaculos'], (w, h), arena)
         cajas = [(x, y, w, h) for x, y in pts]
         panel(ax, arena, cajas, [], target, ETIQ[sc], gap_medido(pts, h))
     fig.suptitle('Obstacle configurations, physical arena '
