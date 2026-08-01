@@ -26,6 +26,9 @@ Base/Logs/
 sim_output_*.png
 Base/markers_svg/
 
+# Figuras que deja analyze_logs.py --plot (se regeneran desde los logs)
+Base/congreg_*.png
+
 # Videos de la campana de simulacion: 1.8GB, no van al repo
 Base/simulacion_31-07/Videos/
 

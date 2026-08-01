@@ -3,6 +3,7 @@
 
     python figuras_paper.py            # lab, sim y la comparación
     python figuras_paper.py sim
+    python figuras_paper.py paper      # las del artículo, a ~/Documents/AttaBot-Paper
 
 Por dataset salen cuatro: reparto de fases por corrida, trayectorias sobre la
 geometría real, compactación en el tiempo y boxplots de resumen. Se generan con
@@ -29,6 +30,8 @@ OUT = os.path.join(BASE, 'analisis_30-07')
 PKG_SIM = os.path.join(BASE, 'simulacion_31-07')
 SIM_PLAN = os.path.expanduser(
     '~/Documents/AttaBot-Sim/tools/plan_topologia_sim.json')
+# El paper vive fuera del repo (es de varios autores y va por Overleaf)
+PAPER = os.path.expanduser('~/Documents/AttaBot-Paper')
 
 ORDER = ['SinObs', 'BosqueD_D2', 'BosqueD_D4', 'BosqueG_D2', 'BosqueG_D4']
 # Paleta categórica validada (slots 1-5, en orden adyacente)
@@ -190,8 +193,7 @@ def fig_trayectorias(ds, runs, paper=False):
                      fontsize=9, color=INK)
     if paper:
         fig.tight_layout()
-        out = os.path.join(BASE, '..', 'Docs', 'paper', 'nuevo paper',
-                           f'trajectories_{ds["slug"]}.pdf')
+        out = os.path.join(PAPER, f'trajectories_{ds["slug"]}.pdf')
         fig.savefig(out, bbox_inches='tight')
         print(' ', os.path.normpath(out))
         return
@@ -302,20 +304,6 @@ def fig_comparacion():
     fig.savefig(f'{OUT}/fig_lab_vs_sim.png', dpi=150)
 
 
-if __name__ == '__main__':
-    for a in (sys.argv[1:] or ['lab', 'sim', 'comparacion']):
-        if a == 'comparacion':
-            fig_comparacion()
-            print('  fig_lab_vs_sim.png')
-            continue
-        ds = dataset(a)
-        fig_fases(ds, load(ds))
-        fig_trayectorias(ds, load(ds))
-        fig_compactacion(ds, load(ds))
-        fig_resumen(ds)
-        print(f'  fig_*_{ds["slug"]}.png — {ds["nombre"]}')
-
-
 # ── Figura de resultados con la estructura del paper ────────────────────────
 # Tres paneles, las mismas tres metricas y el mismo orden de escenarios que las
 # figuras del laboratorio, para que las dos se lean en paralelo.
@@ -371,7 +359,26 @@ def fig_paper(ds):
             s.set(visible=True, color='black', linewidth=.8)
         ax.tick_params(colors='black', labelcolor='black')
     fig.tight_layout()
-    out = os.path.join(BASE, '..', 'Docs', 'paper', 'nuevo paper',
-                       f'results_{ds["slug"]}.pdf')
+    out = os.path.join(PAPER, f'results_{ds["slug"]}.pdf')
     fig.savefig(out, bbox_inches='tight')
     print(' ', os.path.normpath(out))
+
+
+if __name__ == '__main__':
+    for a in (sys.argv[1:] or ['lab', 'sim', 'comparacion']):
+        if a == 'comparacion':
+            fig_comparacion()
+            print('  fig_lab_vs_sim.png')
+            continue
+        if a == 'paper':                # las dos que se pegan en el artículo
+            for d in ('lab', 'sim'):
+                ds = dataset(d)
+                fig_paper(ds)
+                fig_trayectorias(ds, load(ds), paper=True)
+            continue
+        ds = dataset(a)
+        fig_fases(ds, load(ds))
+        fig_trayectorias(ds, load(ds))
+        fig_compactacion(ds, load(ds))
+        fig_resumen(ds)
+        print(f'  fig_*_{ds["slug"]}.png — {ds["nombre"]}')

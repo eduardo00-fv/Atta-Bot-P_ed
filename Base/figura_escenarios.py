@@ -23,7 +23,8 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-PAPER = os.path.join(BASE, '..', 'Docs', 'paper', 'nuevo paper')
+# El paper vive fuera del repo (es de varios autores y va por Overleaf)
+PAPER = os.path.expanduser('~/Documents/AttaBot-Paper')
 D_ROBOT = 105.0
 
 # Tamaño nominal de las cajas, en mm. El delgado es 0.74 y el grueso 2.12 veces
