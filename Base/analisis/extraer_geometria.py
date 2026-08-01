@@ -5,6 +5,7 @@ Calibra píxel→mm con los propios robots (sus markers ArUco están en el video
 su posición en mm está en el PositionLog), y después detecta las cajas de cartón
 por color contra el fondo blanco de la arena.
 """
+import os
 import collections
 import csv
 import sys
@@ -12,7 +13,9 @@ import sys
 import cv2
 import numpy as np
 
-BASE = '/home/thrain/Documents/Atta-Bot-P_ed/Base'
+# Los scripts viven en un subdirectorio, asi que la carpeta Base — donde estan
+# los logs, los paquetes de datos y configSystem.json — es la de arriba.
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ARENA_W, ARENA_H = 2400.0, 1750.0
 CAM_PANEL_PX = 675   # alto del panel de camara dentro del frame compuesto
 

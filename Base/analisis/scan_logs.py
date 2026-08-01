@@ -10,8 +10,29 @@ import os
 import re
 from collections import defaultdict, Counter
 
-BASE = '/home/thrain/Documents/Atta-Bot-P_ed/Base'
-KNOWN_IDS = {'0', '1', '2', '3', '4'}   # 0=origen; 1-4 robots (enjambre de 4)
+# Los scripts viven en un subdirectorio, asi que la carpeta Base — donde estan
+# los logs, los paquetes de datos y configSystem.json — es la de arriba.
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 0 = marker de origen; 1..11 los robots (MAX_NEIGHBORS del firmware + 1). Con
+# el tope viejo de 4, la campana de simulacion de 10 robots reportaba seis
+# 'markers fantasma' con 54 mil detecciones cada uno, que eran robots legitimos.
+KNOWN_IDS = {str(i) for i in range(12)}
+
+
+def etiqueta(ruta):
+    """Como agrupar un log en la salida.
+
+    Los de sesion se llaman Console_Log_SIM_31-07_16-20_Robots_10.csv y ahi la
+    fecha es el campo util. Los del dataset del paper se renombraron al nombre
+    del escenario (SinObs_ALin.csv), que tiene menos campos y ninguna fecha:
+    tomar a ciegas el tercero reventaba con IndexError y el escaner no corria
+    contra el dataset, que es justo donde interesa mirar.
+    """
+    partes = os.path.basename(ruta).rsplit('.', 1)[0].split('_')
+    for p in partes:
+        if re.fullmatch(r'\d{2}-\d{2}', p):
+            return p
+    return partes[0]
 
 # ── ConsoleLogs ──────────────────────────────────────────────────────────────
 con_events = defaultdict(Counter)      # fecha → contador de eventos
@@ -19,7 +40,7 @@ ghost = defaultdict(Counter)           # (robot, patrón IR) → count por fecha
 oddities = []
 
 for f in sorted(glob.glob(f'{BASE}/ConsoleLogs/*.csv')):
-    fecha = os.path.basename(f).split('_')[2]  # DD-MM
+    fecha = etiqueta(f)
     try:
         rows = list(csv.reader(open(f, errors='replace')))
     except Exception as e:
@@ -58,7 +79,7 @@ teleport_worst = []
 jitter = defaultdict(list)             # id → stds de ventanas quietas
 
 for f in sorted(glob.glob(f'{BASE}/PositionLogs/*.csv')):
-    fecha = os.path.basename(f).split('_')[2]
+    fecha = etiqueta(f)
     per_id = defaultdict(list)
     try:
         with open(f, errors='replace') as fh:

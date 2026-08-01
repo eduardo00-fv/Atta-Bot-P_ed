@@ -22,7 +22,9 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+# Los scripts viven en un subdirectorio, asi que la carpeta Base — donde estan
+# los logs, los paquetes de datos y configSystem.json — es la de arriba.
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # El paper vive fuera del repo (es de varios autores y va por Overleaf)
 PAPER = os.path.expanduser('~/Documents/AttaBot-Paper')
 D_ROBOT = 105.0

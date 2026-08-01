@@ -105,6 +105,6 @@ apertura está en el límite de lo navegable.
 ## Cómo se regenera
 
 ```
-python analyze_logs.py --campaign simulacion_31-07/manifiesto.csv --radius 900
-python figuras_paper.py sim
+python analisis/analyze_logs.py --campaign simulacion_31-07/manifiesto.csv --radius 900
+python analisis/figuras_paper.py sim
 ```

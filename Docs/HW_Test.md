@@ -11,8 +11,8 @@ robot no conecta o "dejó de andar" y no se puede diagnosticar por UDP.
 | Situación | Herramienta |
 |---|---|
 | El robot **no conecta** o no responde | **HW_Test.ino** (este) |
-| El robot conecta y querés no desflashear | `ir_check.py --motors` (comando `SELFTEST`) |
-| Los IR disparan solos / no detectan | `ir_check.py --pot C` · `--monitor` |
+| El robot conecta y querés no desflashear | `herramientas/ir_check.py --motors` (comando `SELFTEST`) |
+| Los IR disparan solos / no detectan | `herramientas/ir_check.py --pot C` · `--monitor` |
 | Los giros salen cortos o largos | `CALIBRATE.<id>` desde la consola de la base |
 
 ## Uso

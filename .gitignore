@@ -47,3 +47,7 @@ Base/analisis_30-07.zip
 
 # Salida de arduino-cli (el .bin se regenera con: python3 OTA.py --build)
 Controller/AttaBot/build/
+
+# Salida de analyze_logs.py --campaign (se regenera desde el manifiesto)
+Base/campana_runs.csv
+Base/campana_robots.csv

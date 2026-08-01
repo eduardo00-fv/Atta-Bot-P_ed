@@ -30,7 +30,8 @@ import os
 import argparse
 import numpy as np
 
-LOGDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "PositionLogs")
+LOGDIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "PositionLogs")
 
 
 def latest_log():

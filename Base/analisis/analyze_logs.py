@@ -45,7 +45,9 @@ import math
 import os
 import re
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Los scripts viven en un subdirectorio, asi que la carpeta Base — donde estan
+# los logs, los paquetes de datos y configSystem.json — es la de arriba.
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 POS_DIR = os.path.join(BASE_DIR, 'PositionLogs')
 CON_DIR = os.path.join(BASE_DIR, 'ConsoleLogs')
 

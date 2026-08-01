@@ -45,7 +45,7 @@ import time
 from collections import deque
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CONFIG = os.path.join(HERE, 'configSystem.json')
+CONFIG = os.path.join(os.path.dirname(HERE), 'configSystem.json')
 
 # Canal → (letra de máscara, etiqueta) — mismo mapeo que analyze_logs.py
 CHANNELS = [('L', 'IZQ'), ('C', 'CEN'), ('R', 'DER')]

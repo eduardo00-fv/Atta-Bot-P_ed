@@ -25,7 +25,7 @@ El sistema ahora detecta automáticamente:
 
 ### 3. **Script de Diagnóstico**
 
-Creado `Base/check_system.py` para verificar:
+Creado `Base/herramientas/check_system.py` para verificar:
 - Cámaras disponibles
 - Interfaces de red
 - Puertos UDP
@@ -64,7 +64,7 @@ ls -l /dev/video*
 
 ```bash
 cd Base
-python3 check_system.py
+python3 herramientas/check_system.py
 ```
 
 **Ejemplo de salida esperada:**
@@ -123,7 +123,7 @@ newgrp video
 
 **Solución 3**: Probar índice diferente
 ```bash
-python3 check_system.py  # Te dirá qué índices están disponibles
+python3 herramientas/check_system.py  # Te dirá qué índices están disponibles
 ```
 
 ---
@@ -224,7 +224,7 @@ sudo tcpdump -i wlan0 udp port 6060
 ### 1. Verificar Cámara
 ```bash
 cd Base
-python3 check_system.py
+python3 herramientas/check_system.py
 ```
 
 ### 2. Probar Captura de Video
@@ -303,7 +303,7 @@ Si sigues teniendo problemas:
 
 1. Ejecuta el diagnóstico completo:
    ```bash
-   python3 Base/check_system.py > diagnostico.txt
+   python3 Base/herramientas/check_system.py > diagnostico.txt
    ```
 
 2. Revisa los logs con más detalle ejecutando con Python en modo verbose:

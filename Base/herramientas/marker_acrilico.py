@@ -48,7 +48,8 @@ import argparse
 import cv2
 import numpy as np
 
-OUTDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "markers_svg")
+OUTDIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "markers_svg")
 MODULES = 6  # DICT_4X4: 4x4 datos + 1 módulo de borde negro por lado
 
 
