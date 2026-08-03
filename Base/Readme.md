@@ -33,7 +33,6 @@ los escribe.
 | `figura_escenarios.py` | planta de los escenarios, laboratorio y simulación |
 | `extraer_geometria.py` | mide la geometría real desde los videos cenitales |
 | `scan_logs.py` | escáner de anomalías sobre todos los logs |
-| `pagina_revision.py` | página HTML para revisar una sesión |
 | `campana_lab_30-07.csv` | manifiesto de la campaña del laboratorio |
 
 Se corren desde `Base/`, no desde adentro de `analisis/`:
