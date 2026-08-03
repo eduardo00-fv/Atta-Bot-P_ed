@@ -90,6 +90,48 @@ QSplitter::handle {{ background: {BORDE}; }}
 """
 
 
+# ── Lo que la GUI necesita saber del firmware ────────────────────────────────
+# Se lee del código del controlador en vez de copiarse a mano. Copiarlo ya salió
+# mal dos veces: la lista de estados quedó en otro orden que el enum y el panel
+# mostraba TURN donde el robot decía MOVE. Si el firmware cambia, esto lo sigue
+# solo; si no se puede leer, es preferible quedarse sin nombres que inventarlos.
+FIRMWARE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        '..', 'Controller', 'AttaBot')
+
+
+def _leerEnumEstados():
+    """Nombres de RobotState en el orden del enum, o [] si no se puede leer.
+
+    Devolver [] no es un fallo silencioso: el panel entonces muestra el número
+    crudo que mandó el robot, que es información correcta aunque menos legible.
+    """
+    import re
+    try:
+        with open(os.path.join(FIRMWARE, 'utils.h'), encoding='utf-8') as f:
+            cuerpo = re.search(r'enum\s+RobotState\s*\{(.*?)\}', f.read(),
+                               re.S).group(1)
+    except (OSError, AttributeError):
+        return []
+    cuerpo = re.sub(r'//.*|/\*.*?\*/', '', cuerpo, flags=re.S)
+    return [t.split('=')[0].strip() for t in cuerpo.split(',') if t.strip()]
+
+
+def _leerClavesNavConfig():
+    """Claves que acepta NAV_CONFIG, leídas del handler de comandos.ino."""
+    import re
+    try:
+        with open(os.path.join(FIRMWARE, 'comandos.ino'), encoding='utf-8') as f:
+            cuerpo = re.search(r'void\s+HandleNavConfig\s*\(.*?\n\}',
+                               f.read(), re.S).group(0)
+    except (OSError, AttributeError):
+        return []
+    vistas = []
+    for c in re.findall(r'arguments\[1\]\s*==\s*"([A-Z_]+)"', cuerpo):
+        if c not in vistas:
+            vistas.append(c)
+    return vistas
+
+
 class AttaBotGUI(QMainWindow):
     """Ventana principal de control.
 
@@ -107,11 +149,7 @@ class AttaBotGUI(QMainWindow):
         ('Yaw', 'Yaw'), ('IMU', 'IMU'), ('Deriva EKF', None),
     ]
 
-    # Nombres de los estados de la FSM, en el orden del enum RobotState del
-    # firmware. Si se agrega un estado allá, hay que agregarlo acá.
-    ESTADOS = ['WAIT', 'MOVE', 'TURN', 'RANDOM_WALK', 'REVERSE', 'STOP',
-               'READ_INSTR', 'MSG_BASE', 'IDENT_OBS', 'REQ_POS',
-               'ACTIVE_EVAS', 'RESUME_EVAS', 'SEARCH_APPR']
+    ESTADOS = _leerEnumEstados()
 
     def __init__(self, base):
         super().__init__()
@@ -283,7 +321,8 @@ class AttaBotGUI(QMainWindow):
                 ('Yaw', 'GET_YAW', 'GET_YAW'),
             ]),
             ('Calibración', [
-                ('Config. nav', 'arena, ruedas, yaw, IR, parking', self._dlgNavConfig),
+                ('Config. nav', 'arena, ruedas, yaw, parking, umbrales',
+                 self._dlgNavConfig),
                 ('Leer PPR', 'GETPPR', 'GETPPR'),
                 ('Guardar PPR', 'SETPPR|<pulsos>[|SAVE]', 'SETPPR|'),
                 ('PID', 'PID|<kp>|<ki>|<kd>', 'PID|'),
@@ -562,28 +601,55 @@ class AttaBotGUI(QMainWindow):
         if op:
             self._quickSend(f'EKF_NAV|{"1" if "EKF" in op else "0"}')
 
-    def _dlgNavConfig(self):
-        """NAV_CONFIG|<clave>|<valor>[|SAVE] — configuración en vivo.
+    # Qué significa cada clave y en qué rango la acepta el firmware. Los rangos
+    # importan: fuera de rango el robot descarta el valor EN SILENCIO, sin
+    # contestar nada, así que la única defensa es mostrarlos al escribir.
+    NAV_CONFIG_AYUDA = {
+        'SEGMENT_DIST':      ('largo del tramo de avance', '50–400 mm'),
+        'ARRIVAL_THRESHOLD': ('cuándo se da por llegado', '5–200 mm'),
+        'PARKING_DIST':      ('radio de congregación', '150–600 mm'),
+        'WHEEL_DIST':        ('media distancia entre ruedas', '20–100 mm'),
+        'REALIGN':           ('error de rumbo que dispara recorrección', '1–90°'),
+        'GOAL_DEADBAND':     ('zona muerta alrededor de la meta', '0–300 mm'),
+        'ARENA':             ('límites del escenario: ancho alto', '>100 mm c/u'),
+        'YAW_SCALE':         ('escala del gyro', '0.9–1.1'),
+    }
 
-        Las claves están puestas a mano y no leídas del firmware, así que si allá
-        se agrega una, acá hay que agregarla. Es la lista de NAV_CONFIG de
-        comandos.ino.
-        """
-        claves = ['ARENA — ancho alto (mm)', 'WHEEL_DIST — media distancia entre ruedas',
-                  'YAW_SCALE — escala del gyro', 'IR_RANGE — alcance del IR (mm)',
-                  'PARKING_DIST — radio de congregación (mm)']
-        elegida = self._elegir('Configuración de navegación', 'Parámetro:', claves)
+    # Único parámetro que el firmware escribe en NVS: a los demás el sufijo SAVE
+    # les entra por un oído y les sale por el otro.
+    NAV_CONFIG_PERSISTE = {'YAW_SCALE'}
+
+    def _dlgNavConfig(self):
+        """NAV_CONFIG|<clave>|<valor>[|SAVE] — configuración en vivo."""
+        claves = _leerClavesNavConfig()
+        if not claves:
+            self.logSignal.emit(
+                f'<span style="color:{ERROR};">no se pudo leer comandos.ino; '
+                f'escribí el NAV_CONFIG a mano</span>')
+            return
+        etiquetas = []
+        for c in claves:
+            desc, rango = self.NAV_CONFIG_AYUDA.get(c, ('', ''))
+            etiquetas.append(f'{c} — {desc} ({rango})' if desc else c)
+        elegida = self._elegir('Configuración de navegación', 'Parámetro:',
+                               etiquetas)
         if not elegida:
             return
-        clave = elegida.split(' —')[0]
+        clave = elegida.split(' —')[0].strip()
+        _, rango = self.NAV_CONFIG_AYUDA.get(clave, ('', ''))
+        pregunta = f'Valor para {clave}'
         valor = self._pedirTexto('Configuración de navegación',
-                                 f'Valor para {clave}:')
+                                 f'{pregunta} [{rango}]:' if rango
+                                 else f'{pregunta}:')
         if not valor:
             return
-        guardar = self._elegir('Configuración de navegación', '¿Persistir en NVS?',
-                               ['solo por ahora', 'guardar'])
-        valor = valor.replace(' ', '|')          # ARENA lleva dos números
-        sufijo = '|SAVE' if guardar == 'guardar' else ''
+        sufijo = ''
+        if clave in self.NAV_CONFIG_PERSISTE:
+            guardar = self._elegir('Configuración de navegación',
+                                   '¿Persistir en NVS?',
+                                   ['solo por ahora', 'guardar'])
+            sufijo = '|SAVE' if guardar == 'guardar' else ''
+        valor = '|'.join(valor.split())          # ARENA lleva dos números
         self._quickSend(f'NAV_CONFIG|{clave}|{valor}{sufijo}')
 
     # ── historial del campo de comandos ──────────────────────────────────────
