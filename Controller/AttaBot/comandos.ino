@@ -94,6 +94,7 @@ void HandleConfig(const std::array<String, 6> &arguments) {
     disperse.Reset();
     nav.Reset();
     ekf.Reset();
+    blindNavSteps = 0;
     state = STOP;
     SendMessage(robots["Base"], "CONFIG|RECEIVED");
     debugUdp = 0;
@@ -383,6 +384,7 @@ void HandleMeet(const std::array<String, 6> &arguments) {
   congregation.poseFresh = false;
   nav.Reset();
   ekf.Reset();
+  blindNavSteps = 0;
   instructionList.clear();
 
   MessageDebugf("DEBUG: -1, ID: %s, MEET en (%.0f,%.0f), slot %d/%d, anillo %.0fmm",
@@ -498,6 +500,7 @@ void HandleNavigationTarget(const std::array<String, 6> &arguments) {
   // Re-anclar el EKF al empezar: entre comandos sigue integrando odometría a
   // ciegas y puede arrancar la navegación con metros de deriva acumulada.
   ekf.Reset();
+  blindNavSteps = 0;
   instructionList.clear();
 
   fsmInstruction[0] = REQUEST_POSITION;

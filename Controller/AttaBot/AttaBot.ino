@@ -228,8 +228,9 @@ float leaderSmX[LEADER_SMOOTH_N], leaderSmY[LEADER_SMOOTH_N];
 float leaderSmS[LEADER_SMOOTH_N], leaderSmC[LEADER_SMOOTH_N];
 int   leaderSmCount = 0, leaderSmIdx = 0;
 
-// Estado de los tres subsistemas de enjambre. El EKF es observador pasivo: la
-// navegación sigue corriendo sobre robotPose salvo que se encienda EKF_NAV.
+// Estado de los tres subsistemas de enjambre. Mientras la cámara conteste, la
+// navegación corre sobre robotPose; el EKF es el respaldo que la mantiene viva
+// cuando deja de contestar, y pasa a ser la fuente primaria con EKF_NAV.
 DisperseState disperse;
 EKFState ekf;
 SearchState search;
@@ -256,6 +257,16 @@ const unsigned long imuReadInterval = 20;
 // forma de verlo era polear GET_STATUS a mano. 2Hz alcanza para medir deriva.
 unsigned long lastEkfReport = 0;
 const unsigned long ekfReportInterval = 500;
+
+// Navegación a ciegas: cuando la cámara no contesta el REQUEST_POSITION, el
+// robot sigue con la pose del EKF en vez de abandonar la navegación. Se limita
+// por dos lados porque la odometría sola se degrada rápido: un tope de pasos
+// seguidos sin ver la cámara, y un tope de incertidumbre del propio filtro. Al
+// pasarse cualquiera de los dos el robot se detiene y avisa, que es lo honesto;
+// lo que no puede pasar es lo de antes, quedarse quieto al primer timeout.
+int blindNavSteps = 0;
+const int BLIND_NAV_MAX_STEPS = 8;
+const float BLIND_NAV_MAX_SIGMA = 250.0f;
 
 // Variables de control de movimiento
 unsigned long currentMillis = millis();

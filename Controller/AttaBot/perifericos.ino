@@ -1,9 +1,10 @@
 // Perifericos de a bordo: LED RGB de estado, IMU ICM-20948 y el EKF que
 // fusiona sus lecturas con los encoders.
 //
-// El EKF corre como observador pasivo: reporta su pose a la Base para poder
-// medir cuanto deriva contra el ArUco, pero no controla la navegacion salvo
-// que se encienda EKF_NAV.
+// El EKF reporta su pose a la Base para poder medir cuanto deriva contra el
+// ArUco. Con la camara contestando no controla la navegacion, salvo que se
+// encienda EKF_NAV; cuando deja de contestar es la pose de respaldo con la que
+// el robot sigue navegando (StateRequestPosition).
 //
 // Arduino concatena todos los .ino de la carpeta en una sola unidad de
 // traduccion — primero AttaBot.ino, despues el resto en orden alfabetico — asi

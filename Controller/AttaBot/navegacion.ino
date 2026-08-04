@@ -254,7 +254,8 @@ void UpdateCongregationGoal(float leaderX, float leaderY, float leaderAngle) {
 // Ejecuta un paso de navegación hacia (nav.goalX, nav.goalY): calcula el ángulo
 // al objetivo, le aplica bias reactivo si hay obstáculo en los sensores IR y
 // encola TURN+WAIT+MOVE+WAIT+REQUEST_POSITION. Se llama desde el handler de
-// POSITION_RESPONSE cuando nav.isActive.
+// POSITION_RESPONSE cuando nav.isActive, y desde StateRequestPosition cuando la
+// cámara no contestó y se sigue con la pose del EKF.
 //
 // La fuente de pose depende de EKF_NAV: con EKF_NAV|1 se navega con el estado
 // fusionado (encoders+gyro+ArUco) en vez del ArUco crudo, porque el rumbo del

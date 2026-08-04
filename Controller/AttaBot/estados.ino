@@ -330,7 +330,8 @@ void StateIdentifyObstacle() {
 
 // Le pide la pose a la Base y espera el POSITION_RESPONSE para dar el siguiente
 // paso de navegacion. Sin IP de base aborta, y si la respuesta no llega a
-// tiempo reintenta, porque un paquete UDP perdido no puede colgar la corrida.
+// tiempo cae a la pose del EKF y sigue navegando a ciegas, porque perder de
+// vista el marcador un rato no puede abortar la corrida entera.
 void StateRequestPosition() {
   if (robots.find("Base") == robots.end() ||
       robots["Base"] == IPAddress(0, 0, 0, 0)) {
@@ -350,9 +351,61 @@ void StateRequestPosition() {
   }
 
   if (congregation.HasTimedOut()) {
-    MessageDebugf("DEBUG: -1, ID: %s, Timeout en REQUEST_POSITION",
-                  robotID.c_str());
     congregation.CompleteRequest();
+
+    // La cámara no contestó: seguir con la estimación propia mientras el filtro
+    // esté sano y su incertidumbre siga siendo utilizable. Es lo que evita que
+    // una oclusión de dos segundos deje al robot plantado el resto de la prueba.
+    if (ekf.initialized && ekf.IsHealthy() &&
+        blindNavSteps < BLIND_NAV_MAX_STEPS &&
+        ekf.PosSigma() < BLIND_NAV_MAX_SIGMA) {
+      blindNavSteps++;
+      robotPose.x = ekf.x;
+      robotPose.y = ekf.y;
+      robotPose.angle = ekf.AngleDeg();
+      congregation.poseFresh = true;
+
+      char buffer[110];
+      snprintf(buffer, sizeof(buffer),
+               "BLIND_NAV|%d|%d|%.0f|%.0f|%.0f|%.0f", blindNavSteps,
+               BLIND_NAV_MAX_STEPS, robotPose.x, robotPose.y, robotPose.angle,
+               ekf.PosSigma());
+      SendMessage(robots["Base"], buffer);
+      MessageDebugf("DEBUG: -1, ID: %s, Timeout de cámara — navegando con EKF "
+                    "(%d/%d, σ=%.0fmm)",
+                    robotID.c_str(), blindNavSteps, BLIND_NAV_MAX_STEPS,
+                    ekf.PosSigma());
+
+      // Mismo encadenado que HandlePositionResponse cuando sí llega la pose:
+      // recalcular el slot, dar el paso de navegación y recién ahí pasar a
+      // consumir las instrucciones que ese paso dejó en la lista.
+      if (congregation.hasGlobalTarget && !congregation.isLeader) {
+        UpdateCongregationGoal(congregation.globalTargetX,
+                               congregation.globalTargetY, 0.0f);
+      }
+      if (nav.isActive) {
+        ReactiveNavStep();
+      } else if (nav.pendingInit) {
+        nav.pendingInit = false;
+        nav.Start(nav.goalX, nav.goalY);
+        ReactiveNavStep();
+      }
+      state = READ_INSTRUCTION;
+      instructionValue = 0;
+      return;
+    }
+
+    // Se agotó el respaldo: detenerse y decir por qué, en vez de seguir a ciegas
+    // con una estimación en la que ya no se puede confiar.
+    char buffer[120];
+    snprintf(buffer, sizeof(buffer),
+             "WARNING: nav detenida sin pose. EKF %s, pasos a ciegas %d/%d, "
+             "σ=%.0fmm",
+             (ekf.initialized && ekf.IsHealthy()) ? "sano" : "no disponible",
+             blindNavSteps, BLIND_NAV_MAX_STEPS,
+             ekf.initialized ? ekf.PosSigma() : 0.0f);
+    SendMessage(robots["Base"], buffer);
+    MessageDebugf("DEBUG: -1, ID: %s, %s", robotID.c_str(), buffer);
     state = WAIT;
     instructionValue = 500;
     return;
@@ -363,6 +416,7 @@ void StateRequestPosition() {
                   robotID.c_str());
     congregation.CompleteRequest();
     congregation.positionReceived = false;
+    blindNavSteps = 0;
 
     // nav activo: obstáculo ya en obstacles struct, ReactiveNavStep lo procesará
     state = READ_INSTRUCTION;

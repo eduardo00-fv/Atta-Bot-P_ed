@@ -25,6 +25,7 @@ void EkfTick() {
   static bool yawInit = false;
   static float prevYaw = 0;
   static float prevAvgPulses = 0;
+  static unsigned long prevResetEpoch = 0;
 
   if (!yawInit) {
     prevYaw = yaw;
@@ -37,15 +38,24 @@ void EkfTick() {
   if (dYaw < -180.0f) dYaw += 360.0f;
   prevYaw = yaw;
 
-  // Δ distancia solo cuando las ruedas avanzan de verdad: en TURN los contadores
-  // suben pero el desplazamiento neto es ~0. Un delta negativo significa que
-  // ResetPID reinició los contadores, y ahí el acumulado vale por sí solo.
+  // Los encoders son de cuadratura CON SIGNO (la ISR suma o resta segun la
+  // transicion), asi que el delta de pulsos ya trae la direccion: retroceder da
+  // un delta negativo y hay que respetarlo tal cual. La unica discontinuidad
+  // real es ResetPID() poniendo los contadores en cero, y eso se detecta con el
+  // epoch, no por el signo. Inferirlo del signo hacia que cada tick de un
+  // REVERSE re-sumara el acumulado entero — y con el factor -1 encima, el
+  // retroceso entraba como avance: ~400mm fantasma por evasion.
   float avg = (movement.pastLeftPulseCount + movement.pastRightPulseCount) / 2.0f;
+  if (movement.resetEpoch != prevResetEpoch) {
+    prevResetEpoch = movement.resetEpoch;
+    prevAvgPulses = 0.0f;
+  }
+
+  // En TURN las ruedas giran en sentidos opuestos: el promedio ya da ~0, pero se
+  // descarta explicitamente para que el ruido del giro no entre como traslacion.
   float d = 0.0f;
   if (state == MOVE || state == REVERSE) {
-    float dAvg = avg - prevAvgPulses;
-    if (dAvg < 0) dAvg = avg;
-    d = dAvg * millimetersPerPulse * (state == REVERSE ? -1.0f : 1.0f);
+    d = (avg - prevAvgPulses) * millimetersPerPulse;
   }
   prevAvgPulses = avg;
 

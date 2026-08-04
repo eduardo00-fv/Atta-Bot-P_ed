@@ -499,7 +499,11 @@ struct MovementMetrics {
     float currentRightSpeed = 0.0;
     unsigned long previousMillis = 0;
     unsigned long steadyStatePreviousMillis = 0;
-    
+    // Sube en cada Reset(). Quien integre los contadores (EkfTick) necesita
+    // distinguir "los pusieron en cero" de "el robot retrocedió": las dos cosas
+    // hacen bajar el conteo, y confundirlas rompía la odometría del EKF.
+    unsigned long resetEpoch = 0;
+
     void Reset() {
         leftPulseCount = 0;
         rightPulseCount = 0;
@@ -507,6 +511,7 @@ struct MovementMetrics {
         pastRightPulseCount = 0;
         currentLeftSpeed = 0.0;
         currentRightSpeed = 0.0;
+        resetEpoch++;
     }
     
     float GetAverageSpeed() {
@@ -666,14 +671,20 @@ struct ReactiveNav {
 
 /***************************************************************************************
  * EKF descentralizado — estado [x, y, θ] en el marco de la cámara/ArUco.
- * Port 1:1 de sim/ekf_sim.py (validado en sim 2026-07-04: 36mm de error medio
- * con 25% de oclusión vs 53mm de odometría pura; termina GT a ciegas).
  *
- * predict(d, dθ): propaga con odometría — d en mm de encoders, dθ en grados
+ * Es la pose de respaldo del robot: mientras la cámara conteste manda el ArUco,
+ * y cuando deja de contestar la navegación sigue con esta estimación en vez de
+ * quedarse parada esperando (ver StateRequestPosition).
+ *
+ * Predict(d, dθ): propaga con odometría — d en mm de encoders, dθ en grados
  *   del gyro (ya escalado con yawScale). Llamar cada tick de lectura de IMU.
- * updateAruco(x, y, θ): corrige con la pose ArUco de POSITION_RESPONSE.
- *   La primera llamada inicializa el filtro. Devuelve la innovación de
- *   posición (mm) — qué tan lejos venía la predicción de la medición.
+ *   d viene firmado: negativo al retroceder.
+ * UpdateAruco(x, y, θ): corrige con la pose ArUco de POSITION_RESPONSE.
+ *   La primera llamada inicializa el filtro. Descarta mediciones que no pasan
+ *   el gate de Mahalanobis y se re-ancla si las rechaza MAX_GATE_REJECTS veces
+ *   seguidas. Devuelve la innovación de posición (mm) — qué tan lejos venía la
+ *   predicción de la medición.
+ * IsHealthy() / PosSigma(): hay que consultarlos antes de navegar a ciegas.
  *
  * θ interno en radianes; grados solo en las fronteras.
  ***************************************************************************************/
@@ -683,14 +694,23 @@ static inline void Mat3Mult(const float A[3][3], const float B[3][3], float R[3]
             R[i][j] = A[i][0] * B[0][j] + A[i][1] * B[1][j] + A[i][2] * B[2][j];
 }
 
-static inline void Mat3Inverse(const float A[3][3], float R[3][3]) {
+// Inversa de 3x3 por cofactores. Devuelve false si la matriz es singular o el
+// resultado no es finito, en vez de dividir por cero: sin este cortocircuito un
+// determinante degenerado metia NaN en P y el filtro quedaba muerto para siempre
+// (190 muestras EKF_POSE|nan de las corridas del 30-07).
+static inline bool Mat3Inverse(const float A[3][3], float R[3][3]) {
     float a = A[0][0], b = A[0][1], c = A[0][2];
     float d = A[1][0], e = A[1][1], f = A[1][2];
     float g = A[2][0], h = A[2][1], i = A[2][2];
     float det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    if (!isfinite(det) || fabsf(det) < 1e-9f) return false;
     R[0][0] = (e * i - f * h) / det; R[0][1] = (c * h - b * i) / det; R[0][2] = (b * f - c * e) / det;
     R[1][0] = (f * g - d * i) / det; R[1][1] = (a * i - c * g) / det; R[1][2] = (c * d - a * f) / det;
     R[2][0] = (d * h - e * g) / det; R[2][1] = (b * g - a * h) / det; R[2][2] = (a * e - b * d) / det;
+    for (int r = 0; r < 3; r++)
+        for (int cc = 0; cc < 3; cc++)
+            if (!isfinite(R[r][cc])) return false;
+    return true;
 }
 
 struct EKFState {
@@ -699,13 +719,30 @@ struct EKFState {
     float th = 0;         // rad
     float P[3][3] = {{0}};
 
-    // Ruido — mismos valores que sim/ekf_sim.py; calibrar en lab (Bloque A)
-    static constexpr float R_POS_SIGMA   = 30.0f;   // mm — jitter ArUco
-    static constexpr float R_ANG_SIGMA   = 2.0f;    // grados — jitter ArUco
-    static constexpr float Q_DIST_FRAC   = 0.02f;   // fracción de d por tick
-    static constexpr float Q_DIST_FLOOR  = 0.1f;    // mm por tick
-    static constexpr float Q_ANG_DRIFT   = 0.05f;   // grados por tick
-    static constexpr float Q_ANG_SCALE   = 0.005f;  // fracción de |dθ|
+    // R medido sobre los logs del 30-07 con el robot quieto (n=281 muestras):
+    // el jitter del ArUco es 4.4mm RMS y 7.5mm p95, no los 30mm que se traían de
+    // la sim. Con R inflado el filtro ignoraba la cámara — la corrección se comía
+    // el 21% del error y no alcanzaba a compensar la deriva. Los outliers gruesos
+    // NO se cubren inflando R: para eso está el gate de Mahalanobis de
+    // UpdateAruco, que además sabe re-anclarse.
+    // Q es provisional: la deriva de odometría medida en los logs viejos está
+    // contaminada por el bug del REVERSE, así que hay que re-medirla con
+    // `analyze_logs.py --ekf` sobre una sesión ya con el fix.
+    static constexpr float R_POS_SIGMA   = 8.0f;    // mm — jitter ArUco medido
+    static constexpr float R_ANG_SIGMA   = 4.0f;    // grados — jitter ArUco medido
+    static constexpr float Q_DIST_FRAC   = 0.08f;   // fracción de d por tick
+    static constexpr float Q_DIST_FLOOR  = 0.5f;    // mm por tick
+    static constexpr float Q_ANG_DRIFT   = 0.15f;   // grados por tick
+    static constexpr float Q_ANG_SCALE   = 0.02f;   // fracción de |dθ|
+
+    // Gate de rechazo: una medición cuya innovación no cabe en la incertidumbre
+    // declarada (distancia de Mahalanobis, 3 g.d.l.) se descarta como misread de
+    // la cámara. Pero tras MAX_GATE_REJECTS seguidos el que está mal es el
+    // filtro, no la cámara, y se re-ancla: sin esa salida el gate se convierte
+    // en la trampa que ya conocemos de max_pose_jump, ignorando para siempre.
+    static constexpr float GATE_CHI2      = 25.0f;
+    static constexpr int   MAX_GATE_REJECTS = 3;
+    int gateRejects = 0;
 
     static float WrapRad(float a) {
         while (a >  PI) a -= 2.0f * PI;
@@ -720,6 +757,7 @@ struct EKFState {
     // estado a 78m de la realidad, con y=-4289mm fuera de la arena.
     void Reset() {
         initialized = false;
+        gateRejects = 0;
     }
 
     void Init(float px, float py, float angleDeg) {
@@ -729,6 +767,7 @@ struct EKFState {
         P[0][0] = P[1][1] = R_POS_SIGMA * R_POS_SIGMA;
         P[2][2] = (R_ANG_SIGMA * DEG_TO_RAD) * (R_ANG_SIGMA * DEG_TO_RAD);
         initialized = true;
+        gateRejects = 0;
     }
 
     void Predict(float d, float dthDeg) {
@@ -754,11 +793,12 @@ struct EKFState {
     }
 
     float UpdateAruco(float zx, float zy, float zthDeg) {
-        if (!initialized) {
+        if (!initialized || !IsHealthy()) {
             Init(zx, zy, zthDeg);
             return 0.0f;
         }
         float nu[3] = {zx - x, zy - y, WrapRad(zthDeg * DEG_TO_RAD - th)};
+        float innov = sqrtf(nu[0] * nu[0] + nu[1] * nu[1]);
         float S[3][3];
         for (int i = 0; i < 3; i++)
             for (int j = 0; j < 3; j++) S[i][j] = P[i][j];
@@ -767,7 +807,22 @@ struct EKFState {
         S[2][2] += (R_ANG_SIGMA * DEG_TO_RAD) * (R_ANG_SIGMA * DEG_TO_RAD);
 
         float Sinv[3][3], K[3][3];
-        Mat3Inverse(S, Sinv);
+        if (!Mat3Inverse(S, Sinv)) {
+            Init(zx, zy, zthDeg);
+            return innov;
+        }
+
+        float md2 = 0.0f;
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++) md2 += nu[i] * Sinv[i][j] * nu[j];
+        if (md2 > GATE_CHI2) {
+            gateRejects++;
+            if (gateRejects < MAX_GATE_REJECTS) return innov;
+            Init(zx, zy, zthDeg);
+            return innov;
+        }
+        gateRejects = 0;
+
         Mat3Mult(P, Sinv, K);   // H = I → K = P·S⁻¹
 
         x  += K[0][0] * nu[0] + K[0][1] * nu[1] + K[0][2] * nu[2];
@@ -779,10 +834,32 @@ struct EKFState {
             for (int j = 0; j < 3; j++)
                 IK[i][j] = (i == j ? 1.0f : 0.0f) - K[i][j];
         Mat3Mult(IK, P, newP);
+        // Simetrizar: (I-K)·P acumula asimetría en float de 32 bits y una P
+        // asimétrica es la que termina dando determinantes degenerados.
         for (int i = 0; i < 3; i++)
-            for (int j = 0; j < 3; j++) P[i][j] = newP[i][j];
+            for (int j = 0; j < 3; j++)
+                P[i][j] = 0.5f * (newP[i][j] + newP[j][i]);
 
-        return sqrtf(nu[0] * nu[0] + nu[1] * nu[1]);
+        if (!IsHealthy()) Init(zx, zy, zthDeg);
+        return innov;
+    }
+
+    // El estado sirve para navegar: ni NaN ni infinitos, y con una covarianza
+    // que no se disparó. Quien vaya a usar la pose a ciegas tiene que preguntar
+    // esto antes — un EKF enfermo manda al robot a cualquier lado con confianza.
+    bool IsHealthy() const {
+        if (!isfinite(x) || !isfinite(y) || !isfinite(th)) return false;
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+                if (!isfinite(P[i][j])) return false;
+        return P[0][0] >= 0.0f && P[1][1] >= 0.0f && P[2][2] >= 0.0f;
+    }
+
+    // Desviación estándar de la posición estimada, en mm. Es la medida de cuánto
+    // vale la pena confiarle la navegación mientras la cámara no responde.
+    float PosSigma() const {
+        float v = P[0][0] + P[1][1];
+        return (v > 0.0f && isfinite(v)) ? sqrtf(v) : 0.0f;
     }
 
     float AngleDeg() const {
