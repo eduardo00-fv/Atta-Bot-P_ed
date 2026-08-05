@@ -48,6 +48,87 @@ _ROBOT_COLORS_BGR = [
 ]
 
 
+# Telemetría de alta frecuencia: no son comandos del operador y taparían el
+# ConsoleLog. POSE sale por robot y por cuadro (hasta 20Hz), POSITION_RESPONSE
+# por cada pedido del robot, y LEADER_POSITION la retransmite la Base a 4Hz en
+# simulación. Ver Base.logCommand.
+_NO_LOG_CMD = frozenset(('POSE', 'POSITION_RESPONSE', 'LEADER_POSITION',
+                         'NEIGHBOR_POSITIONS'))
+
+
+# =============================================================================
+# VOCABULARIO DE COMANDOS
+# =============================================================================
+# Fuente ÚNICA para el despachador, el autocompletado y la ayuda. Antes cada
+# cara tenía su propia lista y se desincronizaban: la GUI entendía BROADCAST,
+# CONGREGATION, GOTO y STATUS pero no FORMATION, CALIBRATE ni OCCLUDE durante
+# meses. Agregar un comando acá lo hace aparecer en los tres lugares a la vez.
+#
+# Gramática:  DESTINO.VERBO|arg|arg
+#   BASE.<verbo>       la Base ejecuta algo (orquesta, consulta, calibra)
+#   <id>.<verbo>       se envía tal cual por UDP a ese robot
+#   BROADCAST.<verbo>  se envía tal cual a todos
+#
+# La separación por DESTINO no es cosmética: CONGREGATION, FORMATION, GOTO y GT
+# existen TAMBIÉN como comandos del firmware, así que '1.CONGREGATION' sería
+# ambiguo (¿lo orquesta la base o se lo mando crudo al robot?). Con BASE. no hay
+# colisión posible.
+
+# Comandos que viajan al robot. Se excluyen a propósito los de telemetría y los
+# que van en sentido robot→base (POSE, CHECK_OBSTACLE, MESSAGE_BASE...): no son
+# cosas que un operador escriba.
+_ROBOT_CMDS = {
+    'MOVE':             'mm',
+    'TURN':             'grados',
+    'GT':               'x|y',
+    'GOTO':             'x|y',
+    'POSITIONGT':       'x|y',
+    'BUG2':             'x|y',
+    'RANDOMW':          '[segmento_mm]',
+    'MEET':             'x|y[|radio]',
+    'CONGREGATION':     'slot|x|y',
+    'FORMATION':        'figura|liderID|idx|n|eje',
+    'DISPERSE':         '[separacion_mm]',
+    'CANCEL_CONGREGATION': '',
+    'ABORT_NAV':        '',
+    'SEARCH_OBJECT':    '',
+    'COLOR_READ':       '',
+    'RESET':            '',
+    'WAIT':             'ms',
+    'GET_STATUS':       '',
+    'GET_YAW':          '',
+    'GETPPR':           '',
+    'SETPPR':           'valor|TEMP|SAVE',
+    'PID':              'kp|ki|kd[|SAVE]',
+    'KFPID':            'q|r',
+    'NAV_CONFIG':       'clave|valor[|SAVE]',
+    'SENSOR_MASK':      'L|C|R|0o1',
+    'SENSOR_THRESHOLD': 'valor',
+    'SELFTEST':         '[pwm]',
+    'EKF_NAV':          '0|1',
+    'CLEAR_EVASION':    '',
+    'RESET_EVASION':    '',
+    'CONFIG':           'SAVE|id',
+    'SEND_COUNT_MESSAGE': '',
+}
+
+# Comandos que ejecuta la Base. El id del robot es un ARGUMENTO, no el destino.
+_BASE_CMDS = {
+    'STATUS':       '',
+    'CALIBRATE':    'robotID',
+    'CONGREGATION': 'liderID[|espaciado_mm]',
+    'FORMATION':    'linea|cuna|circulo|liderID[|espaciado_mm]',
+    'GOTO':         'robotID|x|y',
+    'OCCLUDE':      'segundos   (solo --sim)',
+    'HELP':         '[verbo]',
+}
+
+# Formas viejas verbo-primero, para no romper la memoria muscular ni la GUI.
+# Mapean a la forma canónica y avisan una vez por comando.
+_LEGACY_VERBS = frozenset(('STATUS', 'CALIBRATE', 'CONGREGATION', 'FORMATION',
+                           'GOTO', 'OCCLUDE'))
+
+
 def videoWriter(frameResolution, numRobots, pathVideo, processInterval, frameQueue):
     """
     Graba un video en el disco con los cuadros que llegan a través de una cola.
@@ -385,6 +466,9 @@ class Base(object):
         self.distance = []
         self.sock = None
         self.baseIP = ''
+        # Verbos de la gramática vieja ya avisados: el recordatorio sale una vez
+        # por verbo y no en cada comando, que sería ruido en medio de una corrida.
+        self._legacyWarned = set()
         self.broadcastIP = ''
         self.port = int
         self.threadInputAlive = True
@@ -395,6 +479,10 @@ class Base(object):
         self._timeLogFile = self._timeLogWriter = None
         self._positionLogFile = self._positionLogWriter = None
         self._consoleLogFile = self._consoleLogWriter = None
+        # El ConsoleLog es el único que se escribe desde varios hilos: lo que
+        # llega por UDP y, desde que se loguean los comandos, también lo que
+        # mandan la GUI, la consola y la rutina de calibración.
+        self._consoleLogLock = threading.Lock()
         self.cameraResolution = []
         self.newCameraMatriz = None
         self.roi = None
@@ -1230,12 +1318,22 @@ class Base(object):
         width, height = map(int, configuration['camera_resolution'].split('x'))
         self.cameraResolution = (height, width)
 
-        self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # evita acumulación de frames viejos
+        # Buffer de 2 y no de 1: decodificar el MJPEG cuesta ~20ms y con un solo
+        # buffer el driver no tenía dónde poner el cuadro que llegaba mientras
+        # tanto, así que lo tiraba. Medido 2026-08-05 en bucle apretado: con
+        # buffer=1 read() da 62.7ms (15.9 FPS), con buffer=2 da 32.3ms (30.9).
+        # Sigue siendo chico a propósito, para no acumular cuadros viejos.
+        self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 2)
         # MJPEG permite 1080p @ 30 FPS por USB; sin esto V4L2 usa YUYV (~5 FPS)
         self.camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
         self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self.camera.set(cv2.CAP_PROP_FPS, 30)
+        # 20 y no 30: el lazo solo procesa un cuadro cada frame_processing_interval,
+        # así que a 30 FPS se decodificaban 30 por segundo para usar 15 y tirar el
+        # resto. A 20 el período de la cámara (50ms) queda justo arriba de la
+        # compuerta (45ms) y se procesa CADA cuadro que llega. La C920 soporta
+        # 20.000 fps exactos a 1280x720 MJPG.
+        self.camera.set(cv2.CAP_PROP_FPS, 20)
         # Óptica FIJA. Los tres automáticos de la C920 sabotean el ArUco y
         # ninguno sobrevive a desconectar el USB, así que se fijan en cada
         # arranque (medido 2026-07-28 con markers de bajo contraste):
@@ -1780,8 +1878,41 @@ class Base(object):
 
     def addConcoleLog(self, timeLog, id, name, message):
         """Agrega una entrada al registro de la consola UDP."""
-        self._consoleLogWriter.writerow([timeLog, id, name, message])
-        self._consoleLogFile.flush()
+        with self._consoleLogLock:
+            self._consoleLogWriter.writerow([timeLog, id, name, message])
+            self._consoleLogFile.flush()
+
+
+    def logCommand(self, dest, instruction):
+        """
+        Registra en el ConsoleLog un comando que la Base ENVÍA.
+
+        Hasta ahora el log solo tenía lo que decían los robots, así que las fases
+        de una corrida había que inferirlas: analyze_logs deduce el arranque del
+        MEET por el primer REQUEST_POSITION, porque durante el random walk el
+        robot nunca pide su pose. El proxy funciona, pero con el comando en el
+        log la fase se SABE en vez de deducirse, y encima queda registrado qué se
+        mandó y a quién — hoy eso solo vive en la terminal del operador.
+
+        Las filas llevan el prefijo `CMD|`, que ningún consumidor existente mira:
+        analyze_logs filtra por `CHECK_OBSTACLE`, por 'soy líder' y por
+        `REQUEST_POSITION` exacto, y scan_logs por patrones de texto del robot.
+        Así los logs nuevos se siguen leyendo con el código de siempre.
+
+        Parámetros:
+        - dest (str): IP del robot destino, o 'BROADCAST'. Si no corresponde a
+          ningún robot conocido la fila va con idrobot -1, igual que hace
+          readUdpConnection con los peers que no reconoce.
+        - instruction (str): el comando tal cual salió por el socket.
+        """
+        if self._consoleLogWriter is None:
+            return      # la corrida todavía no arrancó: no hay log ni startTime
+        if instruction.split('|')[0] in _NO_LOG_CMD:
+            return
+        robot = next((r for r in self.robots.values() if r.IP == dest), None)
+        rid, name = (robot.id, robot.name) if robot else ('-1', dest)
+        self.addConcoleLog(round(time.time() - self.startTime, 3), rid, name,
+                           f'CMD|{instruction}')
 
 
     # =========================================================================
@@ -1835,10 +1966,12 @@ class Base(object):
                 for robot in self.robots.values():
                     if robot.IP:
                         self.sock.sendto(instruction.encode(), self._robotAddr(robot.IP))
+                self.logCommand('BROADCAST', instruction)
                 print(f"(Broadcast sim) Mensaje enviado: {instruction}")
             return
         for instruction in instructions:
             self.sock.sendto(instruction.encode(), (self.broadcastIP, self.port))
+            self.logCommand('BROADCAST', instruction)
             print(f"(Broadcast) Mensaje enviado: {instruction}")
 
 
@@ -1867,6 +2000,7 @@ class Base(object):
         try:
             for instruction in instructions:
                 self.sock.sendto(instruction.encode(), self._robotAddr(ip))
+                self.logCommand(ip, instruction)
                 if printing:
                     # El barrido para resolver el nombre estaba fuera del if y se
                     # descartaba: el loop de posiciones manda con printing=False.
@@ -2174,10 +2308,15 @@ class Base(object):
                 oy -= k * spacing * math.sin(rad)
             return ox, oy
 
-        # Validar que TODOS los slots caigan dentro del área visible (con
-        # margen para staging+robot). El frame define la arena: px × mm/px.
-        maxX = self.cameraResolution[1] * self.mmPixel
-        maxY = self.cameraResolution[0] * self.mmPixel
+        # Validar que TODOS los slots caigan dentro de la ARENA (con margen para
+        # staging+robot). Antes el límite era cameraResolution × mmPixel, que no
+        # es ni la arena ni el FOV: es la escala del mapa de display. En el lab
+        # daba 2170x1221mm contra una arena de 2400x1750, así que el techo caía
+        # en y=971 — apenas por encima del centro (y=875) — y CUALQUIER slot
+        # colocado más arriba que un líder centrado se rechazaba. La pose real
+        # sale de solvePnP, no de esa escala: hay robots medidos en y=1594.
+        # Mismo error que en GT el 2026-07-29; ver arenaMm().
+        maxX, maxY = self.arenaMm()
         inset = 250.0
 
         def fits(axisDeg):
@@ -2541,37 +2680,93 @@ class Base(object):
             self._calib = None
 
 
+    def _completer(self, texto, estado):
+        """Autocompletado por TAB, sensible a en qué parte del comando estás.
+
+        readline parte la línea por sus delimitadores; acá se los quitamos todos
+        (delims = '') para recibir la línea entera y decidir según tenga punto o
+        no. Sin eso, el '.' y el '|' cortan el token y las opciones salen mal.
+        """
+        linea = readline.get_line_buffer().lstrip()
+        if '.' not in linea:
+            destinos = sorted(self.robots) + ['BROADCAST.', 'BASE.']
+            opciones = [d if d.endswith('.') else d + '.'
+                        for d in destinos if d.startswith(texto)]
+        else:
+            destino, resto = linea.split('.', 1)
+            tabla = _BASE_CMDS if destino.upper() == 'BASE' else _ROBOT_CMDS
+            if '|' in resto:
+                # Ya está en los argumentos: no hay nada que completar, pero se
+                # muestra la forma esperada como recordatorio.
+                verbo = resto.split('|', 1)[0].upper()
+                if verbo in tabla and estado == 0:
+                    sys.stdout.write(f'\n  {verbo}|{tabla[verbo]}\n')
+                    sys.stdout.flush()
+                    readline.redisplay()
+                return None
+            prefijo = resto.upper()
+            opciones = [destino + '.' + v for v in sorted(tabla)
+                        if v.startswith(prefijo)]
+        return opciones[estado] if estado < len(opciones) else None
+
+
+    def _setupReadline(self):
+        """Completado por TAB + historial que sobrevive entre corridas."""
+        self._histPath = os.path.join(os.path.expanduser('~'),
+                                      '.attabot_history')
+        try:
+            readline.read_history_file(self._histPath)
+        except (OSError, PermissionError):
+            pass                      # primera corrida: todavía no existe
+        readline.set_history_length(1000)
+        readline.set_completer(self._completer)
+        readline.set_completer_delims('')     # la línea entera es el token
+        readline.parse_and_bind('tab: complete')
+
+
     @runOnThread
     def inputInstruction(self):
         """
         Maneja la entrada de instrucciones desde la consola en tiempo real.
 
-        Formato: 'robotId.instrucción' o comandos especiales:
-            BROADCAST.instrucción
-            BROADCAST.MEET|x|y[|radio]  (congregación sobre un punto, sin líder;
-                                         radio 150-600mm, por defecto lo calcula
-                                         el firmware según cuántos robots hay)
-            CONGREGATION.leaderID
-            GOTO.robotID x y
-            STATUS.(cualquier cosa)
-            BREAK
+        Gramática: DESTINO.VERBO|arg|arg
+            BASE.<verbo>       lo ejecuta la Base (BASE.HELP los lista)
+            <id>.<verbo>       se envía a ese robot     — 1.MOVE|500
+            BROADCAST.<verbo>  se envía a todos         — BROADCAST.DISPERSE|600
+            BREAK              termina la corrida
+
+        TAB autocompleta destinos y verbos. Las formas viejas verbo-primero
+        (CALIBRATE.1, GOTO.1 x y) siguen aceptándose con un aviso.
         """
+        self._setupReadline()
         while True:
             try:
-                instructionRaw = input('').strip()
+                instructionRaw = input('> ').strip()
             except EOFError:
                 break   # stdin cerrado (proceso lanzado sin consola) = BREAK
+            if not instructionRaw:
+                continue
             if instructionRaw == 'BREAK':
                 break
+            # 'HELP' suelto es lo que uno teclea cuando no se acuerda de nada,
+            # y es justo el momento en que exigirle el prefijo es más inútil.
+            if instructionRaw.upper().split('|')[0] == 'HELP':
+                self._dispatchBase(instructionRaw, print)
+                continue
 
             try:
                 robotId, instruction = map(str.strip, instructionRaw.split('.', 1))
             except ValueError:
-                print("Formato inválido. Use 'robotId.instrucción'")
+                print(f"Formato: DESTINO.VERBO|args  (ej. 1.MOVE|500). "
+                      f"HELP lista todo.")
                 continue
 
             self.dispatch(robotId, instruction)
 
+        try:
+            readline.write_history_file(self._histPath)
+        except (OSError, PermissionError):
+            pass
         self.threadInputAlive = False
 
     def dispatch(self, robotId, instruction, log=print):
@@ -2586,36 +2781,53 @@ class Base(object):
         `log` es lo único que cambia entre las dos caras: la consola imprime y la
         GUI emite una señal hacia su panel de mensajes.
         """
-        self.warnIfOutsideFov(instruction)
+        robotId, instruction = self._normalizeCommand(robotId, instruction, log)
 
-        if robotId == 'BROADCAST':
+        if robotId == 'BASE':
+            self._dispatchBase(instruction, log)
+        elif robotId == 'BROADCAST':
+            self.warnIfOutsideFov(instruction)
             self.sendInstructionBroadcast([instruction])
         elif robotId in self.robots:
+            self.warnIfOutsideFov(instruction)
             self.sendInstruction(self.robots[robotId].IP, [instruction], True)
-        elif robotId == 'CONGREGATION':
-            self.startCongregation(instruction)
-        elif robotId == 'FORMATION':
-            self.startFormation(instruction)
-        elif robotId == 'CALIBRATE':
-            self.startCalibration(instruction)
-        elif robotId == 'OCCLUDE':
-            # Solo sim: tapa la cámara virtual n segundos (OCCLUDE.10)
-            if self.simMode:
-                self.simVision.sendControl(f'OCCLUDE.{instruction}')
-                log(f'Cámara sim ocluida por {instruction}s')
-            else:
-                log('OCCLUDE solo existe en modo --sim')
-        elif robotId == 'GOTO':
-            parts = instruction.split()
-            if len(parts) == 3:
-                try:
-                    self.sendToGlobalPosition(parts[0], float(parts[1]),
-                                              float(parts[2]))
-                except ValueError:
-                    log('Formato: GOTO.robotID x y')
-            else:
-                log('Formato: GOTO.robotID x y')
-        elif robotId == 'STATUS':
+        else:
+            log(f"Destino '{robotId}' desconocido. Usá el id de un robot "
+                f"({', '.join(sorted(self.robots))}), BROADCAST o BASE. "
+                f"Probá BASE.HELP")
+
+
+    def _normalizeCommand(self, target, instruction, log):
+        """Traduce las formas viejas verbo-primero a la gramática DESTINO.VERBO.
+
+        'CALIBRATE.1' y 'GOTO.1 1200 850' ponían el VERBO donde ahora va el
+        DESTINO. Se aceptan igual para no romper la memoria muscular a mitad de
+        sesión, pero avisan una vez por verbo y traducen a la forma canónica.
+        """
+        if target in self.robots or target not in _LEGACY_VERBS:
+            return target, instruction
+
+        args = '' if target == 'STATUS' else instruction.strip()
+        canonico = target + ('|' + '|'.join(args.split()) if args else '')
+        if target not in self._legacyWarned:
+            self._legacyWarned.add(target)
+            log(f"⚠ '{target}.{instruction}' es la forma vieja — ahora se "
+                f"escribe 'BASE.{canonico}'. Sigue andando por ahora.")
+        return 'BASE', canonico
+
+
+    def _dispatchBase(self, instruction, log):
+        """Comandos que ejecuta la Base (no viajan por UDP tal cual)."""
+        parts = [p.strip() for p in instruction.split('|')]
+        verbo, args = parts[0].upper(), [p for p in parts[1:] if p != '']
+
+        def formato():
+            log(f'Formato: BASE.{verbo}|{_BASE_CMDS.get(verbo, "")}')
+
+        if verbo == 'HELP':
+            self._printHelp(args[0].upper() if args else None, log)
+
+        elif verbo == 'STATUS':
             log(f'Detecciones ArUco activas: '
                 f'{list(self.currentArucoDetections.keys())}')
             for rid, robot in self.robots.items():
@@ -2628,8 +2840,75 @@ class Base(object):
             if self.congregationActive:
                 log(f'Congregación activa. Líder: {self.leaderID}')
                 log(f'Completa: {self.isCongregationComplete()}')
+
+        elif verbo == 'CALIBRATE':
+            if len(args) != 1:
+                return formato()
+            self.startCalibration(args[0])
+
+        elif verbo == 'CONGREGATION':
+            if not args:
+                return formato()
+            try:
+                if len(args) > 1:
+                    self.startCongregation(args[0], float(args[1]))
+                else:
+                    self.startCongregation(args[0])
+            except ValueError:
+                formato()
+
+        elif verbo == 'FORMATION':
+            # startFormation sigue parseando por espacios; se traduce acá para
+            # que el vocabulario del operador sea uniforme con '|'.
+            if len(args) < 2:
+                return formato()
+            self.startFormation(' '.join(args))
+
+        elif verbo == 'GOTO':
+            if len(args) != 3:
+                return formato()
+            try:
+                self.sendToGlobalPosition(args[0], float(args[1]), float(args[2]))
+            except ValueError:
+                formato()
+
+        elif verbo == 'OCCLUDE':
+            if not self.simMode:
+                return log('OCCLUDE solo existe en modo --sim')
+            if not args:
+                return formato()
+            self.simVision.sendControl(f'OCCLUDE.{args[0]}')
+            log(f'Cámara sim ocluida por {args[0]}s')
+
         else:
-            log(f"Robot ID '{robotId}' no encontrado.")
+            log(f"BASE no conoce '{verbo}'. Probá BASE.HELP")
+
+
+    def _printHelp(self, verbo, log):
+        """Ayuda desde el mismo vocabulario que alimenta el autocompletado."""
+        if verbo:
+            if verbo in _BASE_CMDS:
+                log(f'BASE.{verbo}|{_BASE_CMDS[verbo]}')
+            elif verbo in _ROBOT_CMDS:
+                log(f'<id>.{verbo}|{_ROBOT_CMDS[verbo]}      '
+                    f'(o BROADCAST.{verbo}|...)')
+            else:
+                log(f"No conozco '{verbo}'.")
+            return
+
+        log('Gramática:  DESTINO.VERBO|arg|arg')
+        log('  BASE.<verbo>       lo ejecuta la Base')
+        log('  <id>.<verbo>       se envía a ese robot')
+        log('  BROADCAST.<verbo>  se envía a todos')
+        log(f'\nDestinos: {", ".join(sorted(self.robots))}, BROADCAST, BASE')
+        log('\nDe la Base:')
+        for k, v in sorted(_BASE_CMDS.items()):
+            log(f'  BASE.{k}' + (f'|{v}' if v else ''))
+        log(f'\nA los robots ({len(_ROBOT_CMDS)}):')
+        nombres = sorted(_ROBOT_CMDS)
+        for i in range(0, len(nombres), 4):
+            log('  ' + '  '.join(f'{n:<20}' for n in nombres[i:i + 4]).rstrip())
+        log('\nDetalle de uno:  BASE.HELP|MOVE')
 
 
 # =============================================================================
@@ -2650,6 +2929,13 @@ def main():
     En modo sim: iniciar la base ANTES que Webots (la base toma el puerto 6060
     y base_camera.py, al encontrarlo ocupado, entra en modo solo-cámara).
     """
+    # Las rutas del programa son relativas (configSystem.json y los directorios
+    # Videos/PositionLogs/ConsoleLogs/Logs), asi que la base solo corria desde
+    # Base/. Anclarlas al directorio del script deja lanzarla desde cualquier
+    # lado: sin esto, correrla desde la raiz del repo no fallaba al escribir sino
+    # que os.makedirs creaba los directorios ahi y desparramaba la corrida.
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
     configurationFilePath = 'configSystem.json'
     base.simMode = '--sim' in sys.argv
     if base.simMode:

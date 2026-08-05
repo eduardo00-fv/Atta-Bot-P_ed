@@ -6,7 +6,7 @@
                 "path_cameraMatrix": "cameraMatrix.txt",
                 "path_distance": "dist.txt",
                 "mmPixel": "39/23",
-                "frame_processing_interval": 0.05,
+                "frame_processing_interval": 0.045,
                 "marker_size_mm": 100,
                 "origin_x_mm": -1257.7,
                 "origin_y_mm": -341.6,
@@ -41,10 +41,10 @@
                 "mm_per_px": 2.0
         },
         "udp_communication": {
-                "base_ip": "192.168.1.100",
+                "base_ip": "192.168.1.119",
                 "broadcast_ip": "192.168.1.255",
                 "port": 6060,
-                "network_interface": "enp3s0"
+                "network_interface": "wlan0"
         },
         "general": {
                 "debug_enable": true,

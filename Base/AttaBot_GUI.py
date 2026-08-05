@@ -546,10 +546,14 @@ class AttaBotGUI(QMainWindow):
         cmd = f'MEET|{partes[0]}|{partes[1]}' + (f'|{radio}' if radio else '')
         self._dispatch('BROADCAST', cmd)
 
+    # Los cuatro de abajo van por BASE.<verbo>: son cosas que ORQUESTA la base,
+    # no mensajes que se reenvíen tal cual a un robot. Ver la tabla _BASE_CMDS
+    # de AttaBot_Base, que es la misma que alimenta el autocompletado y la ayuda.
+
     def _dlgCongregacion(self):
         lider = self._pedirTexto('Congregación', 'ID del robot líder:')
         if lider:
-            self._dispatch('CONGREGATION', lider)
+            self._dispatch('BASE', f'CONGREGATION|{"|".join(lider.split())}')
 
     def _dlgFormacion(self):
         figura = self._elegir('Formación', 'Figura:', ['linea', 'cuna', 'circulo'])
@@ -557,17 +561,17 @@ class AttaBotGUI(QMainWindow):
             return
         resto = self._pedirTexto('Formación', 'ID del líder [espaciado en mm]:')
         if resto:
-            self._dispatch('FORMATION', f'{figura} {resto}')
+            self._dispatch('BASE', f'FORMATION|{figura}|{"|".join(resto.split())}')
 
     def _dlgGoto(self):
         destino = self._pedirTexto('Ir a global', 'robotID  x  y :')
         if destino:
-            self._dispatch('GOTO', destino)
+            self._dispatch('BASE', f'GOTO|{"|".join(destino.split())}')
 
     def _dlgCalibrar(self):
         robot = self._pedirTexto('Calibrar', 'ID del robot:')
         if robot:
-            self._dispatch('CALIBRATE', robot)
+            self._dispatch('BASE', f'CALIBRATE|{robot.strip()}')
 
     def _dlgMascara(self):
         """SENSOR_MASK|<L|C|R>|<0|1> — ignorar un sensor.
@@ -710,6 +714,11 @@ def launch(base_instance):
         None, 'AttaBot', 'Cantidad de robots en la prueba:', 1, 1, 12)
     if not ok:
         return
+
+    # Mismo anclaje que AttaBot_Base.main(): las rutas del programa son
+    # relativas (configSystem.json y los directorios Videos/PositionLogs/
+    # ConsoleLogs/Logs), así que sin esto la GUI solo arranca desde Base/.
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
     base_instance.numRobots = numRobots
     base_instance.readConfigFile('configSystem.json')
