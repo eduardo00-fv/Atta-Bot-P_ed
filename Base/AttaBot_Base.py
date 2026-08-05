@@ -1,6 +1,6 @@
 import os
 os.environ['QT_QPA_PLATFORM'] = 'xcb'  # forzar xcb — cv2 no tiene plugin wayland
-import cv2, json, math, re, sys, time, socket, threading, csv, multiprocessing, threading, platform
+import cv2, json, math, re, sys, time, socket, threading, csv, queue, platform
 import numpy as np
 import readline
 from datetime import datetime
@@ -48,22 +48,26 @@ _ROBOT_COLORS_BGR = [
 ]
 
 
-def videoWriter(frameResolution, numRobots, pathVideo, processInterval, queue, debugResolution):
+def videoWriter(frameResolution, numRobots, pathVideo, processInterval, frameQueue):
     """
-    Graba un video en el disco utilizando los cuadros de video que llegan a través de una cola,
-    mostrando además el video en una ventana.
+    Graba un video en el disco con los cuadros que llegan a través de una cola.
 
-    Este proceso lee pares de fotogramas de `queue`, une los fotogramas en uno solo y
-    los guarda en un archivo AVI con un nombre específico que incluye la cantidad de robots y la fecha y hora actuales.
-    También muestra el video en pantalla.
+    Lee pares de fotogramas de `frameQueue`, los une en uno solo y los guarda en un
+    archivo AVI cuyo nombre incluye la cantidad de robots y la fecha y hora actuales.
+
+    Corre en un HILO, no en un proceso. La codificación XVID libera el GIL (medido:
+    el trabajo Python del hilo principal no se degrada con el grabador a full, 0.98x),
+    así que un hilo hace el mismo trabajo sin pagar el pickling de dos frames BGR por
+    cuadro — 5.5 MB en lab y 16 MB en sim, que eran 4.4 y 10.9 ms de la ventana de
+    procesamiento. A cambio, quien encola debe pasar frames que no vaya a mutar
+    después (ver addFrame).
 
     Parámetros:
-    frameResolution (tuple): Resolución original de los fotogramas de entrada (ancho, alto).
+    frameResolution (tuple): Resolución original de los fotogramas de entrada (alto, ancho).
     numRobots (int): Número de robots, usado para el nombre del archivo de video.
     pathVideo (str): Directorio donde se guardará el video generado.
     processInterval (float): Intervalo de procesamiento en segundos para calcular los FPS.
-    queue (Queue): Cola que contiene los fotogramas a grabar, en formato `(frame, resultsFrame)`.
-    debugResolution (tuple): Resolución para mostrar el video de depuración (ancho, alto).
+    frameQueue (queue.Queue): Cola de fotogramas `[frame, resultsFrame]`; None termina.
 
     Retorna:
     None
@@ -77,7 +81,7 @@ def videoWriter(frameResolution, numRobots, pathVideo, processInterval, queue, d
     video = cv2.VideoWriter(pathVideo, fourcc, fps, resolution)
 
     while True:
-        frames = queue.get()
+        frames = frameQueue.get()
 
         if frames is None:
             break
@@ -387,11 +391,15 @@ class Base(object):
         self.pathVideo = ''
         self.pathPositionLogs = ''
         self.pathConsolelog = ''
+        # Handles de los CSV, vivos mientras dura la corrida (ver _openCsvLog)
+        self._timeLogFile = self._timeLogWriter = None
+        self._positionLogFile = self._positionLogWriter = None
+        self._consoleLogFile = self._consoleLogWriter = None
         self.cameraResolution = []
         self.newCameraMatriz = None
         self.roi = None
         self.frameQueue = None
-        self.videoProcess = multiprocessing.Process()
+        self.videoThread = threading.Thread()
         self.congregationActive = False
         self.leaderID = None
         self.robotPositions = {}
@@ -399,9 +407,10 @@ class Base(object):
         self.arucoDetector = None
         self.markerSizeMm = 80.0          # valor por defecto, sobreescrito desde JSON
         self.currentArucoDetections = {}    # raw: {robot_id: (x_mm, y_mm, angle_deg)}
-        self._smoothedArucoDetections = {} # EMA-suavizado, solo para enviar posiciones al robot
-        self._arucoEma = {}               # estado interno del EMA
-        self.arucoEmaAlpha = 0.4          # peso del frame nuevo (0=sin cambio, 1=sin suavizado)
+        # Última salida cruda de detectMarkers, para que drawArucoDebug dibuje sin
+        # volver a detectar sobre el mismo frame (ver detectArucoMarkers).
+        self._lastCorners = ()
+        self._lastIds = None
         self.bigCircleRadius = 10         # radio visual en el resultsFrame (px)
         self.cellSizeMm = 50.0            # tamaño de celda del mapa de cobertura en mm
         self.coverageGrid = None          # grilla de cobertura: -1=libre, else robot_id
@@ -421,6 +430,8 @@ class Base(object):
         self.logTag = ''                  # 'SIM_' en los nombres de log de sim
         # --- Enjambre: broadcast periódico de posiciones (dispersión/flocking) ---
         self._lastNeighborCast = 0.0
+        # Throttle del aviso de envío fallido (ver sendInstruction)
+        self._lastSendErrorLog = 0.0
 
 
     def arenaMm(self):
@@ -538,6 +549,11 @@ class Base(object):
         # Detección a resolución completa: a 2.5m de altura el marker de 80mm ocupa
         # solo ~47px — a media resolución baja a ~24px (3.9px/celda), límite de fallo.
         corners, ids, _ = self.arucoDetector.detectMarkers(gray)
+        # detectMarkers cuesta 18ms de los 50 que dura la ventana de procesamiento,
+        # y drawArucoDebug lo repetía sobre este mismo frame — con debug_enable en
+        # true (la config del lab) eso era el 36% del presupuesto gastado dos veces.
+        # Se guarda el resultado para que el dibujo lo reuse en vez de re-detectar.
+        self._lastCorners, self._lastIds = corners, ids
 
         detectedPoses = {}
 
@@ -617,14 +633,19 @@ class Base(object):
         Muestra los ejes de coordenadas de cada marker y su ID.
         Solo se llama cuando self.debug está activado.
 
+        Reusa la detección que acaba de hacer detectArucoMarkers sobre este mismo
+        frame (processFrame llama a una y después a la otra, sin leer la cámara en
+        el medio), en vez de volver a correr detectMarkers. El solvePnP de acá sí
+        se repite a propósito: son 0.09ms para 4 markers y guardarse los rvec/tvec
+        sería estado extra para no ahorrar nada medible.
+
         Parámetros:
         - frame (ndarray): Frame BGR donde dibujar las anotaciones.
 
         Retorna:
         - ndarray: Frame anotado.
         """
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        corners, ids, _ = self.arucoDetector.detectMarkers(gray)
+        corners, ids = self._lastCorners, self._lastIds
 
         if ids is not None:
             cv2.aruco.drawDetectedMarkers(frame, corners, ids)
@@ -1286,26 +1307,6 @@ class Base(object):
     # PROCESAMIENTO DE FRAMES
     # =========================================================================
 
-    def _applyArucoEma(self, raw):
-        alpha = self.arucoEmaAlpha
-        smoothed = {}
-        for rid, (x, y, angle) in raw.items():
-            if rid not in self._arucoEma:
-                self._arucoEma[rid] = (x, y, angle)
-            ex, ey, ea = self._arucoEma[rid]
-            nx = alpha * x + (1 - alpha) * ex
-            ny = alpha * y + (1 - alpha) * ey
-            # ángulo: EMA sobre diferencia normalizada para evitar salto 0/360
-            diff = ((angle - ea) + 180) % 360 - 180
-            na = (ea + alpha * diff) % 360
-            self._arucoEma[rid] = (nx, ny, na)
-            smoothed[rid] = (round(nx, 1), round(ny, 1), round(na, 1))
-        # limpiar EMA de markers que dejaron de verse
-        for rid in list(self._arucoEma):
-            if rid not in raw:
-                del self._arucoEma[rid]
-        return smoothed
-
     def cameraCorrection(self, frame):
         """
         Desdistorsiona y recorta la imagen de la cámara.
@@ -1315,13 +1316,9 @@ class Base(object):
 
         Returns:
         - frame (ndarray): Imagen corregida en formato BGR.
-        - frameGray (ndarray): Imagen en escala de grises (para uso interno).
         """
         x, y, w, h = self.roi
-        frame = cv2.remap(frame, self.map1, self.map2, cv2.INTER_LINEAR)[y:y+h, x:x+w]
-        frameGray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        return frame, frameGray
+        return cv2.remap(frame, self.map1, self.map2, cv2.INTER_LINEAR)[y:y+h, x:x+w]
 
 
     def processFrame(self, frame):
@@ -1337,26 +1334,22 @@ class Base(object):
 
         Retorna:
         - frame (ndarray): Frame corregido por distorsión en BGR.
-        - frameGray (ndarray): Frame en escala de grises.
         """
         if self.simMode:
             # Las detecciones vienen del feed CAM (ya en mm/grados del lab)
-            frameGray = None
             raw = self.simVision.snapshot()
         else:
-            frame, frameGray = self.cameraCorrection(frame)
+            frame = self.cameraCorrection(frame)
             raw = self.detectArucoMarkers(frame)
 
-        # Detección ArUco — raw para desplazamiento/setup, suavizado para navegación
         self.currentArucoDetections = raw
-        self._smoothedArucoDetections = self._applyArucoEma(raw)
 
         if self.debug:
             self.cameraDebug(frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 self.debug = 'off'
 
-        return frame, frameGray
+        return frame
 
 
     def cameraDebug(self, frame):
@@ -1440,13 +1433,13 @@ class Base(object):
             if time.time() - lastProcessedTime < self.processInterval or not isValidFrame:
                 isValidFrame = True
                 if (self.debug == 'off' or not self.threadInputAlive or
-                        not self.videoProcess.is_alive()) and executed:
+                        not self.videoThread.is_alive()) and executed:
                     self.cleanup()
                     break
                 continue
 
             lastProcessedTime = time.time()
-            frame, frameGray = self.processFrame(frame)
+            frame = self.processFrame(frame)
 
             if len(foundRobots) < self.numRobots:
                 foundRobots, _ = self.searchRobotsAruco(self.robotsConfig)
@@ -1575,17 +1568,16 @@ class Base(object):
         for gy in range(0, h, self.cellPx):
             cv2.line(resultsFrame, (0, gy), (w - 1, gy), (220, 220, 220), 1)
 
-        self.frameQueue = multiprocessing.Queue()
+        self.frameQueue = queue.Queue()
         args = (
             resolution,
             self.numRobots,
             self.pathVideo,
             self.processInterval,
-            self.frameQueue,
-            self.debugResolution
+            self.frameQueue
         )
-        self.videoProcess = multiprocessing.Process(target=videoWriter, args=args)
-        self.videoProcess.start()
+        self.videoThread = threading.Thread(target=videoWriter, args=args, daemon=True)
+        self.videoThread.start()
         self.startTime = time.time()
         self.createPositionLog()
         self.createTimeLog()
@@ -1654,11 +1646,15 @@ class Base(object):
             self.camera.release()
 
         if self.frameQueue is not None:
+            # El centinela va al final de la cola: el grabador termina de escribir
+            # lo que quede pendiente y recién ahí suelta el archivo. Antes se
+            # drenaba la cola después de encolarlo, con lo que el drenaje podía
+            # comerse el propio centinela y dejar el .avi sin cerrar.
             self.frameQueue.put(None)
-            time.sleep(0.2)
-            while not self.frameQueue.empty():
-                self.frameQueue.get()
-            self.frameQueue.close()
+            self.videoThread.join(timeout=10.0)
+            if self.videoThread.is_alive():
+                print('⚠ el grabador de video no terminó en 10s — '
+                      'el .avi puede quedar truncado')
 
         try:
             cv2.destroyAllWindows()
@@ -1679,16 +1675,47 @@ class Base(object):
         # un número que cambia en la 3a cifra cada frame no se puede leer.
         cv2.putText(frame, f'Time: {timeLog:.1f} s', (2, 26),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 200, 200), 1, cv2.LINE_AA)
-        # Enviar a la GUI si está disponible; siempre encolar para grabación en disco
+        # El grabador ya no es un proceso, así que no recibe una copia implícita
+        # por pickle: comparte memoria con este loop. `resultsFrame` es el ÚNICO
+        # que se muta en el sitio (el mapa de cobertura se va pintando encima
+        # frame a frame), así que hay que congelarlo o el video mostraría la
+        # cobertura del momento de codificar, no la del cuadro. `frame` es un
+        # arreglo nuevo en cada iteración y no hace falta copiarlo.
+        # La copia se comparte con la GUI: _npToPixmap convierte y copia de
+        # inmediato, nunca se queda con el arreglo.
+        mapSnapshot = resultsFrame.copy()
         if self.gui is not None:
-            self.gui.frameSignal.emit(frame.copy(), resultsFrame.copy())
+            self.gui.frameSignal.emit(frame.copy(), mapSnapshot)
         if self.frameQueue is not None:
-            self.frameQueue.put([frame, resultsFrame])
+            self.frameQueue.put([frame, mapSnapshot])
 
 
     # =========================================================================
     # LOGGING
     # =========================================================================
+
+    def _openCsvLog(self, path, header):
+        """
+        Abre un CSV de log, escribe su cabecera y deja el handle vivo.
+
+        Los tres logs se escriben fila a fila desde el loop de cámara o desde el
+        hilo de UDP, y abrir y cerrar el archivo en cada fila costaba 25µs contra
+        los 5µs de escribir sobre un handle ya abierto: con 10 robots eran 0.25ms
+        de cada ventana de 50ms gastados en syscalls.
+
+        Se hace flush() por fila para que la durabilidad no cambie — igual que
+        antes, los datos quedan en manos del sistema operativo apenas se escriben
+        y una corrida interrumpida conserva todo lo logueado hasta ese instante.
+        Por eso tampoco se cierran los handles en cleanup(): no habría nada que
+        salvar, y el hilo de UDP sigue vivo y podría escribir sobre un archivo ya
+        cerrado. Los cierra el sistema al terminar el proceso.
+        """
+        f = open(path, 'w', newline='')
+        writer = csv.writer(f)
+        writer.writerow(header)
+        f.flush()
+        return f, writer
+
 
     def createTimeLog(self):
         """Crea un archivo CSV de registro de tiempos de procesamiento."""
@@ -1696,16 +1723,14 @@ class Base(object):
         logName = f'Time_Log_{currentTime}_Robots_{self.numRobots}.csv'
         os.makedirs('Logs', exist_ok=True)
         self.pathTimeLogs = os.path.join('Logs', logName)
-        header = ['time', 'processingTime']
-        with open(self.pathTimeLogs, 'w', newline='') as f:
-            csv.writer(f).writerow(header)
+        self._timeLogFile, self._timeLogWriter = self._openCsvLog(
+            self.pathTimeLogs, ['time', 'processingTime'])
 
 
     def addTimeLog(self, timeLog, processingTime):
         """Agrega una entrada al registro de tiempo de procesamiento."""
-        row = [timeLog, processingTime]
-        with open(self.pathTimeLogs, 'a', newline='') as f:
-            csv.writer(f).writerow(row)
+        self._timeLogWriter.writerow([timeLog, processingTime])
+        self._timeLogFile.flush()
 
 
     def createPositionLog(self):
@@ -1719,8 +1744,8 @@ class Base(object):
         header = ['time', 'idrobot', 'robot', 'x', 'y', 'angle',
                   'linearDisplacement', 'angularDisplacement',
                   'ekf_x', 'ekf_y', 'ekf_angle', 'ekf_age_ms']
-        with open(self.pathPositionLogs, 'w', newline='') as f:
-            csv.writer(f).writerow(header)
+        self._positionLogFile, self._positionLogWriter = self._openCsvLog(
+            self.pathPositionLogs, header)
 
 
     def addPositionLog(self, timeLog, id, name, position, displacement, robot=None):
@@ -1739,8 +1764,8 @@ class Base(object):
             row += [*(f'{v:.1f}' for v in robot.ekfPose), f'{ageMs:.0f}']
         else:
             row += ['', '', '', '']
-        with open(self.pathPositionLogs, 'a', newline='') as f:
-            csv.writer(f).writerow(row)
+        self._positionLogWriter.writerow(row)
+        self._positionLogFile.flush()
 
 
     def createConcoleLog(self):
@@ -1749,15 +1774,14 @@ class Base(object):
         logName = f'Console_Log_{self.logTag}{currentTime}_Robots_{self.numRobots}.csv'
         self.pathConsolelog = os.path.join(self.pathConsolelog, logName)
         header = ['time', 'idrobot', 'robot', 'message']
-        with open(self.pathConsolelog, 'w', newline='') as f:
-            csv.writer(f).writerow(header)
+        self._consoleLogFile, self._consoleLogWriter = self._openCsvLog(
+            self.pathConsolelog, header)
 
 
     def addConcoleLog(self, timeLog, id, name, message):
         """Agrega una entrada al registro de la consola UDP."""
-        row = [timeLog, id, name, message]
-        with open(self.pathConsolelog, 'a', newline='') as f:
-            csv.writer(f).writerow(row)
+        self._consoleLogWriter.writerow([timeLog, id, name, message])
+        self._consoleLogFile.flush()
 
 
     # =========================================================================
@@ -1818,21 +1842,44 @@ class Base(object):
             print(f"(Broadcast) Mensaje enviado: {instruction}")
 
 
-    @runOnThread
     def sendInstruction(self, ip, instructions, printing):
         """
         Envía instrucciones a un robot específico por IP (o 'ip:puerto' en sim).
+
+        Es SÍNCRONO. Antes cada llamada arrancaba un hilo, y con el loop de
+        posiciones mandando una POSE por robot por cuadro eso eran 80-200 hilos
+        por segundo, a 109µs cada uno, para un sendto de 30 bytes por UDP que no
+        bloquea. El orden de llegada no era el motivo: medido, 400 envíos
+        consecutivos llegaban los 400 en orden con hilos y sin ellos.
+
+        Lo único que el hilo aportaba de verdad era aislar al llamador de un
+        OSError — robot apagado, interfaz caída —, y eso no es hipotético: sin
+        aislamiento, un envío fallido dentro de sendPositions se lleva puesto el
+        loop de cámara y termina la corrida. De eso se encarga ahora el except de
+        acá, que además deja un mensaje legible en vez del traceback de un hilo
+        muerto.
 
         Parámetros:
         - ip (str): Dirección IP del robot.
         - instructions (list): Lista de instrucciones a enviar.
         - printing (bool): Si True, imprime confirmación en consola.
         """
-        for instruction in instructions:
-            self.sock.sendto(instruction.encode(), self._robotAddr(ip))
-            name = next((robot.name for robot in self.robots.values() if robot.IP == ip), ip)
-            if printing:
-                self.log(f'Mensaje enviado a {name}: {instruction}')
+        try:
+            for instruction in instructions:
+                self.sock.sendto(instruction.encode(), self._robotAddr(ip))
+                if printing:
+                    # El barrido para resolver el nombre estaba fuera del if y se
+                    # descartaba: el loop de posiciones manda con printing=False.
+                    name = next((robot.name for robot in self.robots.values()
+                                 if robot.IP == ip), ip)
+                    self.log(f'Mensaje enviado a {name}: {instruction}')
+        except OSError as e:
+            # Un robot caído se reintenta a la cadencia del loop de posiciones,
+            # así que sin throttle esto son ~20 líneas por segundo por robot.
+            now = time.time()
+            if now - self._lastSendErrorLog >= 2.0:
+                self._lastSendErrorLog = now
+                self.log(f'⚠ no se pudo enviar a {ip}: {e} [log 1/2s]')
 
 
     @runOnThread
