@@ -55,6 +55,13 @@ RE_GT_START = re.compile(r'GT iniciado: goal=\((-?[\d.]+),(-?[\d.]+)\)')
 RE_ARRIVED = re.compile(r'NAV: llegó a \((-?[\d.]+),(-?[\d.]+)\)')
 IDLE_GAP_S = 8.0     # sin REQUEST_POSITION por este tiempo = run nuevo (fallback)
 
+# Comandos de la Base que cierran el random walk y abren la fase de agrupación.
+# Aparecen en el ConsoleLog como filas `CMD|<comando>|...` (ver
+# Base.logCommand); en logs anteriores a 2026-08-05 no existen y el arranque se
+# infiere. MEET congrega sobre un punto, CONGREGATION sobre un líder y FORMATION
+# sobre una figura, pero para separar fases los tres marcan el mismo borde.
+MEET_CMDS = frozenset(('MEET', 'CONGREGATION', 'FORMATION'))
+
 # Calibración IR: bitmap del firmware = 4·IZQ + 2·CEN + 1·DER (IZQ/DER = IR de
 # pin33/pin27; CEN = proximidad APDS9960). Máscara: SENSOR_MASK|L|C|R|0/1.
 IR_BITS = ((4, 'IZQ'), (2, 'CEN'), (1, 'DER'))
@@ -320,14 +327,17 @@ def detect_phases(tracks, events, bin_s=1.0, move_mm=40.0, gap_s=8.0,
     """Separa la corrida en RANDOM WALK → tiempo muerto → MEET (congregación).
 
     El protocolo del lab es: la base manda RANDOMW, los robots caminan, se
-    quedan quietos, y el operador manda el MEET A MANO. La base no loguea los
-    comandos que envía, así que las tres fases se infieren:
+    quedan quietos, y el operador manda el MEET A MANO.
 
-      - `meet_start`: primer REQUEST_POSITION de cualquier robot. Durante el
+      - `meet_start`: si el ConsoleLog trae el comando de la Base (filas `CMD|`,
+        logs desde 2026-08-05) se usa ese instante y la fase se SABE. Si no, se
+        infiere con el primer REQUEST_POSITION de cualquier robot: durante el
         random walk el robot nunca pide su pose y durante el MEET la pide
         continuamente, así que el borde es limpio (verificado en las 15 corridas
         del 30-07). Sin ConsoleLog se cae al valle de quietud más largo, que es
         el mismo instante pero con ±1 bin de incertidumbre.
+        El dataset del paper es anterior al logueo de comandos, así que todo lo
+        ya medido salió y sigue saliendo por el camino inferido.
       - `rw_end`: último bin con movimiento ANTES de meet_start.
       - `dead_s`: rw_end → meet_start. Es el tiempo del OPERADOR, no del
         experimento: incluirlo en la duración de la corrida (que es lo que da
@@ -346,10 +356,17 @@ def detect_phases(tracks, events, bin_s=1.0, move_mm=40.0, gap_s=8.0,
     active = {k: any(f.get(k) for f in flags.values()) for k in all_bins}
 
     meet_start, source = None, None
+    # Preferido: el comando que mandó la Base, si quedó logueado.
     for t, _rid, msg in events:
-        if msg.strip() == 'REQUEST_POSITION':
-            meet_start, source = t, 'REQUEST_POSITION'
+        parts = msg.strip().split('|')
+        if parts[0] == 'CMD' and len(parts) > 1 and parts[1] in MEET_CMDS:
+            meet_start, source = t, f'CMD|{parts[1]}'
             break
+    if meet_start is None:
+        for t, _rid, msg in events:
+            if msg.strip() == 'REQUEST_POSITION':
+                meet_start, source = t, 'REQUEST_POSITION'
+                break
     if meet_start is None:
         # Fallback sin consola: el hueco de quietud más largo que no sea el
         # arranque ni el final del log.
