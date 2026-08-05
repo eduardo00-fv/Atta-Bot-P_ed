@@ -153,6 +153,9 @@ def figura_sim():
 if __name__ == '__main__':
     plt.rcParams.update({'font.size': 9, 'text.color': INK,
                          'figure.facecolor': 'white',
-                         'axes.facecolor': 'white'})
+                         'axes.facecolor': 'white',
+                         # Type 3 (el defecto) no pasa el validador del
+                         # congreso; la 42 embebe TrueType sin cambiar el trazo.
+                         'pdf.fonttype': 42, 'ps.fonttype': 42})
     figura_lab()
     figura_sim()

@@ -46,7 +46,11 @@ INK, INK2, GRID = '#0b0b0b', '#52514e', '#e6e5e1'
 plt.rcParams.update({'font.size': 9, 'axes.edgecolor': GRID,
                      'axes.labelcolor': INK2, 'xtick.color': INK2,
                      'ytick.color': INK2, 'text.color': INK,
-                     'figure.facecolor': 'white', 'axes.facecolor': 'white'})
+                     'figure.facecolor': 'white', 'axes.facecolor': 'white',
+                     # El PDF por omisión sale con fuentes Type 3, que el
+                     # validador del congreso rechaza; la 42 las embebe como
+                     # TrueType sin mover un solo glifo de sitio.
+                     'pdf.fonttype': 42, 'ps.fonttype': 42})
 
 
 # ── Descriptores de dataset ─────────────────────────────────────────────────
