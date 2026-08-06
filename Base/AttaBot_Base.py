@@ -2354,7 +2354,14 @@ class Base(object):
         rad = math.radians(lang)
 
         def slotOffset(shape, idx, axisDeg):
-            """Réplica de formation_slot del robot — para validar límites."""
+            """Réplica de formation_slot del robot — para validar límites.
+
+            Vale para linea y cuna, que el firmware calcula con esta misma
+            fórmula. NO vale para circulo: allá el firmware usa
+            SafeRingSlotAngle, que agranda el radio hasta 2.5x y confina los
+            slots al arco más largo libre de paredes. Por eso el círculo no se
+            valida con esto (ver más abajo).
+            """
             if shape == 'circulo':
                 ang = 2 * math.pi * idx / max(1, n)
                 return spacing * math.cos(ang), spacing * math.sin(ang)
@@ -2378,32 +2385,68 @@ class Base(object):
         maxX, maxY = self.arenaMm()
         inset = 250.0
 
-        def fits(axisDeg):
+        def culpables(axisDeg):
+            """Slots que se salen, con cuánto se pasan. Vacío = cabe."""
+            fuera = []
             for idx in range(n):
                 ox, oy = slotOffset(shape, idx, axisDeg)
-                if not (inset <= lx + ox <= maxX - inset and
-                        inset <= ly + oy <= maxY - inset):
-                    return False
-            return True
+                sx, sy = lx + ox, ly + oy
+                exceso = max(inset - sx, sx - (maxX - inset),
+                             inset - sy, sy - (maxY - inset))
+                if exceso > 0:
+                    fuera.append((idx, sx, sy, exceso))
+            return fuera
 
         axis = 0.0
-        if not fits(0.0):
-            if shape == 'linea' and fits(90.0):
+        if shape == 'circulo':
+            # El círculo NO se rechaza. SafeRingSlotAngle ya garantiza en el
+            # firmware que ningún slot toque la pared: agranda el radio hasta
+            # 2.5x y reparte los slots en el arco libre más largo, con su propio
+            # margen de 200mm. Validarlo acá contra un anillo plano de radio
+            # nominal solo producía rechazos falsos — negaba círculos que el
+            # robot habría colocado bien. Se avisa, eso sí, porque el radio real
+            # puede terminar siendo bastante mayor que el pedido.
+            aprietan = culpables(0.0)
+            if aprietan:
+                print(f'ℹ El anillo de {spacing:.0f}mm no entra entero donde '
+                      f'está el líder ({lx:.0f},{ly:.0f}): el firmware va a '
+                      f'agrandar el radio o juntar los slots en el arco libre.')
+        else:
+            fuera = culpables(0.0)
+            if fuera and shape == 'linea' and not culpables(90.0):
                 axis = 90.0
                 print('⚠ La fila perpendicular no cabe — usando el eje del '
                       'heading del líder (columna)')
-            else:
-                print(f'✗ La formación {shape} no cabe donde está el líder '
-                      f'({lx:.0f},{ly:.0f}) — movelo lejos de los bordes')
+            elif fuera:
+                # Decir QUÉ slot falla y por cuánto. Sin esto, un rechazo por
+                # 9mm (pasó el 2026-08-05) es indistinguible de uno por medio
+                # metro, y no hay forma de saber cuánto mover al líder.
+                print(f'✗ La formación {shape} no cabe con el líder en '
+                      f'({lx:.0f},{ly:.0f}). Arena {maxX:.0f}x{maxY:.0f}mm, '
+                      f'margen {inset:.0f}mm:')
+                for idx, sx, sy, exceso in fuera:
+                    print(f'    slot {idx} caería en ({sx:.0f},{sy:.0f}) — '
+                          f'se pasa {exceso:.0f}mm')
+                print(f'  Movelo al menos {max(f[3] for f in fuera):.0f}mm '
+                      f'hacia el centro.')
                 return
 
         pa = rad + math.pi / 2 + math.radians(axis)
         px, py = math.cos(pa), math.sin(pa)   # eje efectivo de la fila
 
+        # Los invisibles van al FINAL, no al medio. Antes devolvían 0.0, que es
+        # una coordenada lateral perfectamente válida: un robot que la cámara no
+        # veía se colaba entre los visibles y les corría el slot a todos. La
+        # asignación anti-cruce se degradaba en silencio justo cuando más falta
+        # hacía. Ahora los visibles se reparten sus slots correctamente y los
+        # invisibles ocupan los que sobran, en orden de id (determinista).
+        invisibles = [rid for rid in followers
+                      if self.robots[rid].getPose()[0] == -1]
+
         def followerKey(rid):
             fx, fy, _ = self.robots[rid].getPose()
             if fx == -1:
-                return 0.0
+                return float('inf')
             if shape == 'circulo':
                 return math.atan2(fy - ly, fx - lx) % (2 * math.pi)
             return (fx - lx) * px + (fy - ly) * py
@@ -2415,6 +2458,11 @@ class Base(object):
 
         rankedFollowers = sorted(followers, key=followerKey)
         rankedSlots = sorted(range(n), key=slotKey)
+
+        if invisibles:
+            nombres = ', '.join(self.robots[r].name for r in invisibles)
+            print(f'⚠ {nombres} sin marker visible: se les asigna el slot que '
+                  f'sobra, no el más cercano. Pueden cruzarse con los demás.')
 
         self.congregationActive = True
         self.leaderID = leaderID

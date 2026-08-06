@@ -187,11 +187,20 @@ BASE.FORMATION|cuna|1|400
 BASE.FORMATION|circulo|1|350
 ```
 
-**Poné el líder cerca del centro.** La Base valida que *todos* los slots caigan
-dentro de la arena y rechaza la formación entera si uno se sale. Con 3
-seguidores y 300mm de espaciado, la fila necesita ±600mm libres a los costados.
-Si la fila perpendicular no entra, cae sola a la columna sobre el rumbo del
-líder y avisa.
+**Poné el líder cerca del centro.** Para `linea` y `cuna`, la Base valida que
+*todos* los slots caigan dentro de la arena; si uno se sale te dice **cuál y por
+cuántos mm**, y cuánto mover al líder. Con 3 seguidores y 300mm de espaciado la
+fila necesita ±600mm libres a los costados; si la perpendicular no entra, cae
+sola a la columna sobre el rumbo del líder y avisa.
+
+**El `circulo` no se rechaza nunca.** Ahí el firmware usa `SafeRingSlotAngle`,
+que agranda el radio hasta 2.5× y reparte los slots en el arco libre más largo
+con su propio margen de pared. La Base solo avisa si el anillo nominal no entra
+—porque el radio real puede terminar bastante mayor que el pedido— pero deja que
+el robot resuelva.
+
+Si a un seguidor no se le ve el marker, se le asigna **el slot que sobra** (no el
+más cercano) y la Base lo avisa: puede cruzarse con los demás en el camino.
 
 ---
 
