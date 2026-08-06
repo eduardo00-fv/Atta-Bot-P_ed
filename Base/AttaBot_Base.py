@@ -149,7 +149,8 @@ _CMD_GROUP = {
 }
 
 
-def videoWriter(frameResolution, numRobots, pathVideo, processInterval, frameQueue):
+def videoWriter(frameResolution, numRobots, pathVideo, processInterval, frameQueue,
+                captureFps=None):
     """
     Graba un video en el disco con los cuadros que llegan a través de una cola.
 
@@ -177,10 +178,22 @@ def videoWriter(frameResolution, numRobots, pathVideo, processInterval, frameQue
     videoName = f'Video_{currentTime}_Robots_{numRobots}.avi'
     pathVideo = os.path.join(pathVideo, videoName)
     resolution = (frameResolution[1], frameResolution[0] * 2)
-    fps = 1 / processInterval - 1
+
+    # El ritmo real del video es el de la CÁMARA: con la compuerta de
+    # frame_processing_interval por debajo del período de captura, se procesa y
+    # se graba exactamente un cuadro por cada cuadro que entrega la cámara.
+    #
+    # La fórmula vieja era '1/processInterval - 1', un número que no salía de
+    # ningún lado: con el intervalo en 0.045 declaraba 21.2 fps contra 19.6
+    # reales — 8% de error, o 45 segundos de desfase a los 9 minutos de corrida.
+    # De ahí venía la regla de "ubicar los instantes por número de cuadro y no
+    # por el reloj del reproductor".
+    fps = float(captureFps) if captureFps else 1.0 / processInterval
     fourcc = cv2.VideoWriter_fourcc(*'XVID')
     video = cv2.VideoWriter(pathVideo, fourcc, fps, resolution)
 
+    escritos = 0
+    primero = None
     while True:
         frames = frameQueue.get()
 
@@ -192,8 +205,26 @@ def videoWriter(frameResolution, numRobots, pathVideo, processInterval, frameQue
         # Solo grabación — el display lo maneja la GUI o el proceso principal
         results = cv2.vconcat([frame, resultsFrame])
         video.write(results)
+        if primero is None:
+            primero = time.time()
+        escritos += 1
 
     video.release()
+
+    # Ningún fps constante puede ser exacto: un cuadro que la cámara pierde
+    # tampoco queda en el video, así que el archivo dura menos que la corrida.
+    # Por eso se reporta el ritmo medido — es el factor con el que corregir si
+    # hace falta cruzar el reloj del reproductor con el de los logs. El sello de
+    # tiempo impreso sobre cada cuadro sigue siendo la referencia exacta.
+    if escritos >= 2 and primero is not None:
+        transcurrido = time.time() - primero
+        real = escritos / transcurrido if transcurrido > 0 else fps
+        print(f'✓ Video: {escritos} cuadros, {real:.2f} fps reales '
+              f'(declarado {fps:.2f})')
+        if abs(real - fps) > 0.05 * fps:
+            print(f'  ⚠ se va a reproducir {100 * (fps / real - 1):+.0f}% de '
+                  f'velocidad — para ubicar un instante usá el reloj impreso '
+                  f'en el cuadro, no el del reproductor')
 
 
 # =============================================================================
@@ -476,6 +507,9 @@ class Base(object):
         self.numRobots = int
         self.debug = False
         self.camera = None
+        # FPS que la cámara declara tras negociar el formato. Es el ritmo real
+        # al que se graba el video; None en sim, donde no hay cámara.
+        self.captureFps = None
         self.cameraIndex = None
         self.cameraBackend = None
         self.debugResolution = tuple
@@ -1385,6 +1419,9 @@ class Base(object):
         actual_w   = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h   = int(self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
         print(f'✓ Cámara: {actual_w}x{actual_h} @ {actual_fps:.0f} FPS')
+        # Ritmo con el que se declara el .avi: es el de la cámara, no el de la
+        # compuerta de procesamiento. Ver videoWriter.
+        self.captureFps = actual_fps if actual_fps and actual_fps > 1 else None
 
         # Drena frames iniciales corruptos (MJPEG tarda ~30 frames en estabilizarse)
         print('  Calentando cámara...', end='', flush=True)
@@ -1692,7 +1729,8 @@ class Base(object):
             self.numRobots,
             self.pathVideo,
             self.processInterval,
-            self.frameQueue
+            self.frameQueue,
+            self.captureFps,
         )
         self.videoThread = threading.Thread(target=videoWriter, args=args, daemon=True)
         self.videoThread.start()
