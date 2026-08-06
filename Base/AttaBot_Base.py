@@ -118,7 +118,9 @@ _BASE_CMDS = {
     'CALIBRATE':    'robotID',
     'CONGREGATION': 'liderID[|espaciado_mm]',
     'FORMATION':    'linea|cuna|circulo|liderID[|espaciado_mm]',
-    'GOTO':         'robotID|x|y',
+    # GOTO salió el 2026-08-05: 'BASE.GOTO|1|1200|850' era exactamente
+    # '1.GT|1200|850' más un print, y con el campo de comandos aceptando destino
+    # explícito ya no aportaba nada.
     'OCCLUDE':      'segundos   (solo --sim)',
     'HELP':         '[verbo]',
 }
@@ -126,7 +128,7 @@ _BASE_CMDS = {
 # Formas viejas verbo-primero, para no romper la memoria muscular ni la GUI.
 # Mapean a la forma canónica y avisan una vez por comando.
 _LEGACY_VERBS = frozenset(('STATUS', 'CALIBRATE', 'CONGREGATION', 'FORMATION',
-                           'GOTO', 'OCCLUDE'))
+                           'OCCLUDE'))
 
 # Agrupación de _ROBOT_CMDS para las pestañas de la GUI. Es metadata de
 # PRESENTACIÓN, no otra lista de comandos: la GUI recorre _ROBOT_CMDS y consulta
@@ -2391,27 +2393,6 @@ class Base(object):
               f'{n} seguidor(es)')
 
 
-    def sendToGlobalPosition(self, robotID, targetX, targetY):
-        """
-        Envía un robot a una posición global específica.
-
-        Parámetros:
-        - robotID (str): ID del robot.
-        - targetX (float): Coordenada X objetivo en mm.
-        - targetY (float): Coordenada Y objetivo en mm.
-        """
-        if robotID not in self.robots:
-            print(f"Error: Robot {robotID} no encontrado")
-            return
-
-        robot = self.robots[robotID]
-        # GT y no POSITIONGT: eran el mismo handler del firmware, y ahora solo
-        # existe GT. Esto es un atajo sobre '<id>.GT|x|y', nada más.
-        instruction = f'GT|{targetX}|{targetY}'
-        self.sendInstruction(robot.IP, [instruction], True)
-        print(f"Robot {robot.name} enviado a posición: x={targetX}, y={targetY}")
-
-
     def updateRobotPosition(self, robotID, x, y, angle):
         """
         Actualiza la posición de un robot en el registro interno.
@@ -2808,14 +2789,34 @@ class Base(object):
             self._dispatchBase(instruction, log)
         elif robotId == 'BROADCAST':
             self.warnIfOutsideFov(instruction)
+            self._warnUnknownVerb(instruction, log)
             self.sendInstructionBroadcast([instruction])
         elif robotId in self.robots:
             self.warnIfOutsideFov(instruction)
+            self._warnUnknownVerb(instruction, log)
             self.sendInstruction(self.robots[robotId].IP, [instruction], True)
         else:
             log(f"Destino '{robotId}' desconocido. Usá el id de un robot "
                 f"({', '.join(sorted(self.robots))}), BROADCAST o BASE. "
                 f"Probá BASE.HELP")
+
+
+    def _warnUnknownVerb(self, instruction, log):
+        """Avisa antes de mandar un verbo que el firmware no va a reconocer.
+
+        El firmware descarta en SILENCIO lo que no entiende: no contesta nada, y
+        el robot simplemente no hace nada. Eso ya costó tiempo con un
+        'MVE1.MOVE1.MOVE|500' del 05-08 que parecía un robot colgado. Con GOTO,
+        POSITIONGT y BUG2 recién retirados, teclearlos por costumbre es
+        probable, así que conviene decirlo en vez de dejar el silencio.
+
+        Solo avisa: igual se envía, porque la tabla podría quedar corta frente a
+        un firmware más nuevo y bloquear no seria peor que el silencio.
+        """
+        verbo = instruction.split('|')[0].strip().upper()
+        if verbo and verbo not in _ROBOT_CMDS:
+            log(f"⚠ '{verbo}' no es un comando del firmware — se envía igual, "
+                f"pero el robot lo va a descartar sin avisar. BASE.HELP los lista.")
 
 
     def _normalizeCommand(self, target, instruction, log):
@@ -2884,14 +2885,6 @@ class Base(object):
             if len(args) < 2:
                 return formato()
             self.startFormation(' '.join(args))
-
-        elif verbo == 'GOTO':
-            if len(args) != 3:
-                return formato()
-            try:
-                self.sendToGlobalPosition(args[0], float(args[1]), float(args[2]))
-            except ValueError:
-                formato()
 
         elif verbo == 'OCCLUDE':
             if not self.simMode:

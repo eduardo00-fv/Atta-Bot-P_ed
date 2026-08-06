@@ -55,7 +55,6 @@ desaparecer; usá la forma nueva.
 | `BASE.HELP\|<verbo>` | detalle de uno |
 | `BASE.STATUS` | markers detectados y pose de cada robot |
 | `BASE.CALIBRATE\|<id>` | calibración guiada de yaw y PPR |
-| `BASE.GOTO\|<id>\|<x>\|<y>` | manda un robot a una posición global |
 | `BASE.CONGREGATION\|<líder>[\|<esp_mm>]` | congregación con líder (esp. 300) |
 | `BASE.FORMATION\|<figura>\|<líder>[\|<esp_mm>]` | formación geométrica |
 | `BASE.OCCLUDE\|<segundos>` | tapa la cámara virtual — **solo `--sim`** |
@@ -204,10 +203,19 @@ de hasta 2.7m. No confiarle la navegación hasta explicar esos episodios.
 Criterio: p95 bajo 50mm para navegar, hasta ~150mm sirve solo para puentear
 oclusiones cortas.
 
-**Un comando mal escrito se descarta en silencio.** El firmware no contesta si
-no reconoce el verbo. Si un robot "no obedece", buscá la fila `CMD|` en el
-ConsoleLog antes de sospechar del robot — ya pasó con un `CMD|MVE1.MOVE1.MOVE`
-que no hizo nada.
+**Un comando mal escrito se descarta en silencio** *en el robot*. El firmware no
+contesta si no reconoce el verbo. Ya pasó con un `CMD|MVE1.MOVE1.MOVE` que no
+hizo nada y parecía un robot colgado.
+
+Desde el 05-08 **la Base avisa antes de enviarlo**:
+
+```
+⚠ 'GOTO' no es un comando del firmware — se envía igual, pero el robot
+  lo va a descartar sin avisar. BASE.HELP los lista.
+```
+
+Solo avisa, no bloquea. Aun así, si un robot "no obedece", buscá su fila `CMD|`
+en el ConsoleLog antes de sospechar del hardware.
 
 **`SENSOR_MASK` usa 1 para IGNORAR**, no para activar. Es al revés de lo que
 parece.

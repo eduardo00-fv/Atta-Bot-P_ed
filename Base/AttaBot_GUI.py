@@ -309,7 +309,6 @@ class AttaBotGUI(QMainWindow):
             'BASE.CALIBRATE': self._dlgCalibrar,
             'BASE.CONGREGATION': self._dlgCongregacion,
             'BASE.FORMATION': self._dlgFormacion,
-            'BASE.GOTO': self._dlgGoto,
         }
 
         # Ayudas redactadas a mano, mejores que el hint corto de la tabla para
@@ -603,11 +602,6 @@ class AttaBotGUI(QMainWindow):
         resto = self._pedirTexto('Formación', 'ID del líder [espaciado en mm]:')
         if resto:
             self._dispatch('BASE', f'FORMATION|{figura}|{"|".join(resto.split())}')
-
-    def _dlgGoto(self):
-        destino = self._pedirTexto('Ir a global', 'robotID  x  y :')
-        if destino:
-            self._dispatch('BASE', f'GOTO|{"|".join(destino.split())}')
 
     def _dlgCalibrar(self):
         robot = self._pedirTexto('Calibrar', 'ID del robot:')
