@@ -24,10 +24,10 @@ DESTINO.VERBO|arg|arg
 
 Los argumentos van **siempre con `|`**, nunca con espacios.
 
-**Por qué `BASE.` y no el id del líder:** `CONGREGATION`, `FORMATION`, `GOTO` y
-`GT` existen *también* como comandos del firmware. `1.CONGREGATION` sería
-ambiguo — ¿lo orquesta la Base o se lo mando crudo al robot? Con `BASE.` no hay
-colisión posible.
+**Por qué `BASE.` y no el id del líder:** `CONGREGATION` y `FORMATION` existen
+*también* como comandos del firmware. `1.CONGREGATION` sería ambiguo — ¿lo
+orquesta la Base o se lo mando crudo al robot? Con `BASE.` no hay colisión
+posible.
 
 ### En la consola
 
@@ -41,9 +41,12 @@ colisión posible.
 
 ### Formas viejas
 
-`CALIBRATE.1`, `FORMATION.linea 1 300`, `GOTO.1 1200 850`, `STATUS.x` y
-`CONGREGATION.1` **siguen funcionando**, avisando una vez por verbo. Van a
-desaparecer; usá la forma nueva.
+`CALIBRATE.1`, `FORMATION.linea 1 300`, `STATUS.x` y `CONGREGATION.1`
+**siguen funcionando**, avisando una vez por verbo. Van a desaparecer; usá la
+forma nueva.
+
+`GOTO.1 1200 850` **ya no**: ese atajo era exactamente `1.GT|1200|850` con un
+mensaje de más, así que se retiró junto con los alias del firmware.
 
 ---
 
