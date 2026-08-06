@@ -229,6 +229,26 @@ void HandlePose(const std::array<String, 6> &arguments) {
   robotPose.y = newY;
   robotPose.angle = newAngle;
 
+  // EKF: corregir con CADA pose de la Base, no solo con POSITION_RESPONSE.
+  //
+  // Hasta 2026-08-05 la unica llamada a UpdateAruco estaba en
+  // HandlePositionResponse, que corre cuando el robot PIDE su posicion: medido
+  // en el lab del 05-08, cada 15-23s por robot. Entre medio el filtro integraba
+  // gyro+encoders a ciegas y el rumbo derivaba 60-120°, mientras la Base le
+  // mandaba una pose absoluta ~20 veces por segundo que se descartaba para el
+  // EKF. Eran unas 400 correcciones tiradas entre cada correccion real.
+  //
+  // El sintoma no se veia con los robots congregados (quietos, un rumbo viejo
+  // cuesta poco en posicion) y explotaba en RANDOMW, que es traslacion continua:
+  // p95 de 291mm durante MEET contra 2699mm durante la caminata aleatoria.
+  //
+  // Se llama DESPUES del filtro de saltos, asi que una pose rechazada por salto
+  // tampoco entra al EKF. Y UpdateAruco ya trae su compuerta de Mahalanobis, que
+  // descarta lo incoherente y re-inicializa tras MAX_GATE_REJECTS seguidos: dos
+  // capas de rechazo, no una. Sin inicializar, la primera llamada hace el Init,
+  // que es mejor que esperar al primer REQUEST_POSITION.
+  ekf.UpdateAruco(robotPose.x, robotPose.y, robotPose.angle);
+
   // Decentralizado: si este robot es el líder de congregación, difunde su
   // propia pose a los peers por WiFi (la Base es solo sensor de localización).
   // Un líder quieto solo hacía REQUEST_POSITION una vez → los seguidores se
