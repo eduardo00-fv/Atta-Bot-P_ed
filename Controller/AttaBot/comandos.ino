@@ -465,10 +465,16 @@ void HandleFormation(const std::array<String, 6> &arguments) {
   instructionList.push_back(fsmInstruction);
 }
 
-  // GT / GOTO / POSITIONGT / BUG2 — Navegación reactiva al objetivo
-  // ("BUG2" se acepta por compatibilidad; el algoritmo es ReactiveNav)
+  // GT — Navegación reactiva al objetivo
   // Uso: GT|x|y          — navega al objetivo
   //      GT|x|y|seg      — ídem con segmento personalizado (50–400mm)
+  //
+  // Hasta 2026-08-05 esto mismo respondía además a GOTO, POSITIONGT y BUG2.
+  // No eran variantes: los cuatro nombres caían en este handler y el nombre ni
+  // siquiera llegaba acá, así que elegir uno u otro no cambiaba nada. BUG2
+  // sobrevivía de cuando existió ese algoritmo, y se quedó como alias cuando se
+  // borró el código muerto. Cuatro formas de pedir lo mismo obligan a leer el
+  // firmware para descubrir que dan igual.
 void HandleNavigationTarget(const std::array<String, 6> &arguments) {
   float targetX = arguments[1].toFloat();
   float targetY = arguments[2].toFloat();
@@ -989,9 +995,7 @@ void ReadUdpPackets() {
   else if (command == "MEET") HandleMeet(arguments);
   else if (command == "CONGREGATION") HandleCongregation(arguments);
   else if (command == "FORMATION") HandleFormation(arguments);
-  else if (command == "GT" || command == "GOTO" || command == "POSITIONGT" ||
-           command == "BUG2")
-    HandleNavigationTarget(arguments);
+  else if (command == "GT") HandleNavigationTarget(arguments);
   else if (command == "POSITION_RESPONSE") HandlePositionResponse(arguments);
   else if (command == "LEADER_POSITION") HandleLeaderPosition(arguments);
   else if (command == "CANCEL_CONGREGATION") HandleCancelCongregation(arguments);

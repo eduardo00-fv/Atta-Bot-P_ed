@@ -80,10 +80,10 @@ _NO_LOG_CMD = frozenset(('POSE', 'POSITION_RESPONSE', 'LEADER_POSITION',
 _ROBOT_CMDS = {
     'MOVE':             'mm',
     'TURN':             'grados',
-    'GT':               'x|y',
-    'GOTO':             'x|y',
-    'POSITIONGT':       'x|y',
-    'BUG2':             'x|y',
+    # Un solo nombre para navegar a un punto. GOTO, POSITIONGT y BUG2 caían en
+    # el MISMO handler del firmware — no eran variantes, eran cuatro nombres
+    # para el mismo código, y había que leer el firmware para saberlo.
+    'GT':               'x|y[|segmento_mm]',
     'RANDOMW':          '[segmento_mm]',
     'MEET':             'x|y[|radio]',
     'CONGREGATION':     'slot|x|y',
@@ -135,8 +135,8 @@ _LEGACY_VERBS = frozenset(('STATUS', 'CALIBRATE', 'CONGREGATION', 'FORMATION',
 # que se ve a simple vista. Ese es justo el fallo que se quiere evitar: la GUI
 # llegó a mostrar 16 de 29 comandos porque tenía su propia lista escrita a mano.
 _CMD_GROUP = {
-    'Movimiento':  ('MOVE', 'TURN', 'WAIT', 'RESET', 'RANDOMW', 'ABORT_NAV'),
-    'Navegación':  ('GT', 'GOTO', 'POSITIONGT', 'BUG2'),
+    'Movimiento':  ('MOVE', 'TURN', 'WAIT', 'RESET'),
+    'Navegación':  ('GT', 'RANDOMW', 'ABORT_NAV'),
     'Enjambre':    ('MEET', 'DISPERSE', 'CONGREGATION', 'FORMATION',
                     'CANCEL_CONGREGATION', 'SEARCH_OBJECT', 'COLOR_READ'),
     'Sensores':    ('SENSOR_MASK', 'SENSOR_THRESHOLD', 'CLEAR_EVASION',
@@ -578,7 +578,7 @@ class Base(object):
         evita el diagnóstico equivocado de 'el robot se colgó'.
         """
         parts = instruction.split('|')
-        if parts[0] not in ('GT', 'GOTO', 'POSITIONGT', 'MEET') or len(parts) < 3:
+        if parts[0] not in ('GT', 'MEET') or len(parts) < 3:
             return
         try:
             x, y = float(parts[1]), float(parts[2])
@@ -2077,10 +2077,11 @@ class Base(object):
                 if command == 'REQUEST_POSITION':
                     if robotFound:
                         self.sendPositionToRobot(peer, id)
-                    if len(parts) >= 5 and parts[1] == 'BUG2':
-                        self.log(f'Solicitud GT {name}: {parts[2]} paso={parts[3]} dist={parts[4]}mm')
-                    else:
-                        self.log(f'Solicitud de posición de {name}')
+                    # El firmware manda 'REQUEST_POSITION' pelado (estados.ino).
+                    # Acá se parseaba además un 'REQUEST_POSITION|BUG2|...' que
+                    # ningún firmware emite desde que se borró ese algoritmo:
+                    # era una rama que no podía ejecutarse nunca.
+                    self.log(f'Solicitud de posición de {name}')
 
                 elif command == 'LEADER_POSITION':
                     if len(parts) >= 5:
@@ -2404,7 +2405,9 @@ class Base(object):
             return
 
         robot = self.robots[robotID]
-        instruction = f'POSITIONGT|{targetX}|{targetY}'
+        # GT y no POSITIONGT: eran el mismo handler del firmware, y ahora solo
+        # existe GT. Esto es un atajo sobre '<id>.GT|x|y', nada más.
+        instruction = f'GT|{targetX}|{targetY}'
         self.sendInstruction(robot.IP, [instruction], True)
         print(f"Robot {robot.name} enviado a posición: x={targetX}, y={targetY}")
 

@@ -82,12 +82,14 @@ Todos aceptan `<id>.` o `BROADCAST.`
 
 | comando | argumentos |
 |---|---|
-| `GT` | `<x>\|<y>` — navegación reactiva (la de siempre) |
-| `GOTO` | `<x>\|<y>` |
-| `POSITIONGT` | `<x>\|<y>` |
-| `BUG2` | `<x>\|<y>` |
+| `GT` | `<x>\|<y>[\|<segmento_mm>]` — navegación reactiva al punto |
 | `ABORT_NAV` | — cancela la navegación en curso |
 | `RANDOMW` | `[<segmento_mm>]` — caminata aleatoria |
+
+> Hasta el 05-08 había además `GOTO`, `POSITIONGT` y `BUG2`. **No eran
+> variantes**: los cuatro nombres caían en el mismo handler del firmware y el
+> nombre ni llegaba adentro, así que daba exactamente igual cuál usaras. Se
+> quedó `GT`.
 
 ### Enjambre
 
