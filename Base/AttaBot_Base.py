@@ -128,6 +128,24 @@ _BASE_CMDS = {
 _LEGACY_VERBS = frozenset(('STATUS', 'CALIBRATE', 'CONGREGATION', 'FORMATION',
                            'GOTO', 'OCCLUDE'))
 
+# Agrupación de _ROBOT_CMDS para las pestañas de la GUI. Es metadata de
+# PRESENTACIÓN, no otra lista de comandos: la GUI recorre _ROBOT_CMDS y consulta
+# acá a qué pestaña va cada uno. Lo que no figure cae en 'Otros', así que un
+# comando nuevo nunca desaparece de la interfaz — a lo sumo queda mal agrupado,
+# que se ve a simple vista. Ese es justo el fallo que se quiere evitar: la GUI
+# llegó a mostrar 16 de 29 comandos porque tenía su propia lista escrita a mano.
+_CMD_GROUP = {
+    'Movimiento':  ('MOVE', 'TURN', 'WAIT', 'RESET', 'RANDOMW', 'ABORT_NAV'),
+    'Navegación':  ('GT', 'GOTO', 'POSITIONGT', 'BUG2'),
+    'Enjambre':    ('MEET', 'DISPERSE', 'CONGREGATION', 'FORMATION',
+                    'CANCEL_CONGREGATION', 'SEARCH_OBJECT', 'COLOR_READ'),
+    'Sensores':    ('SENSOR_MASK', 'SENSOR_THRESHOLD', 'CLEAR_EVASION',
+                    'RESET_EVASION'),
+    'Calibración': ('GETPPR', 'SETPPR', 'PID', 'KFPID', 'NAV_CONFIG',
+                    'SELFTEST', 'EKF_NAV'),
+    'Diagnóstico': ('GET_STATUS', 'GET_YAW', 'CONFIG', 'SEND_COUNT_MESSAGE'),
+}
+
 
 def videoWriter(frameResolution, numRobots, pathVideo, processInterval, frameQueue):
     """

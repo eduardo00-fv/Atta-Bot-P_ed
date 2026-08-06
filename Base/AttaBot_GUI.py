@@ -281,57 +281,80 @@ class AttaBotGUI(QMainWindow):
         return marco
 
     def _gruposDeComandos(self):
-        """Los comandos agrupados por para qué sirven.
+        """Los comandos, GENERADOS desde el vocabulario de AttaBot_Base.
 
-        Cada botón es (etiqueta, ayuda, acción). La acción es un texto, y ahí
-        importa el sufijo: si termina en '|' se deja escrito en el campo para que
-        el usuario complete los argumentos, y si no, se manda tal cual. Los
-        callables abren un diálogo.
+        Los botones se llaman como el comando (MOVE, no 'Avanzar'): es lo que hay
+        que escribir en la consola, en el ConsoleLog y en Docs/comandos.md, así
+        que traducirlo obligaba a mantener un diccionario mental de más.
 
-        Hasta el 2026-08-01 acá había 16 comandos de los 29 que entiende el
-        firmware. Faltaban MEET, todo el enjambre y toda la configuración en vivo.
+        Recorre _ROBOT_CMDS y _BASE_CMDS, que son la MISMA fuente que usan el
+        despachador, el autocompletado y HELP. Antes esta lista estaba escrita a
+        mano y se quedaba atrás sola: llegó a mostrar 16 de 29 comandos, y
+        después 29 de 36. Generándola, eso no puede volver a pasar.
+
+        Cada botón es (etiqueta, ayuda, acción). Si la acción termina en '|' se
+        deja escrita en el campo para completar los argumentos; si no, se manda
+        tal cual. Los pocos comandos con un diálogo propio lo conservan.
         """
-        return [
-            ('Movimiento', [
-                ('Avanzar', 'MOVE|<mm>', 'MOVE|'),
-                ('Girar', 'TURN|<grados>', 'TURN|'),
-                ('Esperar', 'WAIT|<ms>', 'WAIT|'),
-                ('Random walk', 'RANDOMW|<ms>', 'RANDOMW|'),
-                ('Ir a punto', 'GT|<x>|<y>', 'GT|'),
-                ('Ir a global', 'GOTO.<robot> x y', self._dlgGoto),
-                ('Abortar nav', 'corta navegación y búsqueda', 'ABORT_NAV'),
-                ('Parar', 'vuelve a STOP', 'RESET'),
-            ]),
-            ('Enjambre', [
-                ('MEET', 'congregación sobre un punto, sin líder', self._dlgMeet),
-                ('Congregación', 'CONGREGATION.<líder>', self._dlgCongregacion),
-                ('Formación', 'línea, cuña o círculo', self._dlgFormacion),
-                ('Dispersar', 'DISPERSE|<mm de separación>', 'DISPERSE|'),
-                ('Cancelar congr.', '', 'CANCEL_CONGREGATION'),
-                ('Buscar objeto', 'SEARCH_OBJECT|<color>', 'SEARCH_OBJECT|'),
-                ('Leer color', 'lee el APDS9960 y reporta RGBC', 'COLOR_READ'),
-            ]),
-            ('Sensores', [
-                ('Máscaras IR', 'ignorar un sensor defectuoso', self._dlgMascara),
-                ('Umbral central', 'SENSOR_THRESHOLD|C|<0-255>', self._dlgUmbral),
-                ('Limpiar evasión', '', 'CLEAR_EVASION'),
-                ('Reset evasión', 'borra todo el rastro de evasión', 'RESET_EVASION'),
-                ('Autotest', 'motores e IMU en banco', 'SELFTEST'),
-                ('Estado', 'GET_STATUS', 'GET_STATUS'),
-                ('Yaw', 'GET_YAW', 'GET_YAW'),
-            ]),
-            ('Calibración', [
-                ('Config. nav', 'arena, ruedas, yaw, parking, umbrales',
-                 self._dlgNavConfig),
-                ('Leer PPR', 'GETPPR', 'GETPPR'),
-                ('Guardar PPR', 'SETPPR|<pulsos>[|SAVE]', 'SETPPR|'),
-                ('PID', 'PID|<kp>|<ki>|<kd>', 'PID|'),
-                ('Kalman PID', 'KFPID|<q>|<r>|<p>', 'KFPID|'),
-                ('EKF nav', 'navegar con el EKF en vez del ArUco', self._dlgEkfNav),
-                ('Calibrar', 'CALIBRATE.<robot>', self._dlgCalibrar),
-                ('Recalibrar origen', 'fija el origen con el marker 5', '__ORIGIN__'),
-            ]),
-        ]
+        # Import acá y no arriba: la GUI se puede cargar desde AttaBot_Base
+        # (launch()) y un import de módulo en la cabecera sería circular.
+        from AttaBot_Base import _ROBOT_CMDS, _BASE_CMDS, _CMD_GROUP
+
+        dialogos = {
+            'MEET': self._dlgMeet,
+            'SENSOR_MASK': self._dlgMascara,
+            'SENSOR_THRESHOLD': self._dlgUmbral,
+            'EKF_NAV': self._dlgEkfNav,
+            'NAV_CONFIG': self._dlgNavConfig,
+            'BASE.CALIBRATE': self._dlgCalibrar,
+            'BASE.CONGREGATION': self._dlgCongregacion,
+            'BASE.FORMATION': self._dlgFormacion,
+            'BASE.GOTO': self._dlgGoto,
+        }
+
+        # Ayudas redactadas a mano, mejores que el hint corto de la tabla para
+        # los comandos cuyo nombre no dice qué hacen. El resto usa el hint.
+        ayudas = {
+            'RESET': 'vuelve al estado STOP',
+            'ABORT_NAV': 'corta la navegación y la búsqueda en curso',
+            'COLOR_READ': 'lee el APDS9960 y reporta RGBC',
+            'SELFTEST': 'pulso de motor a lazo abierto, cuenta encoders',
+            'SENSOR_MASK': 'ignorar un sensor IR defectuoso (1 = ignorar)',
+            'CLEAR_EVASION': 'limpia el estado de evasión',
+            'RESET_EVASION': 'borra todo el rastro de evasión',
+            'NAV_CONFIG': 'arena, ruedas, yaw, parking, umbrales',
+            'EKF_NAV': 'navegar con el EKF en vez del ArUco (dejar en 0)',
+            'MEET': 'congregación sobre un punto, sin líder',
+            'CANCEL_CONGREGATION': 'corta congregación, formación o dispersión',
+            'SEND_COUNT_MESSAGE': 'contador de mensajes, para medir pérdida',
+        }
+
+        def boton(verbo, hint, prefijo=''):
+            nombre = prefijo + verbo
+            ayuda = ayudas.get(verbo) or (f'{nombre}|{hint}' if hint else nombre)
+            if nombre in dialogos:
+                return (nombre, ayuda, dialogos[nombre])
+            # Con argumentos se prellena el campo; sin argumentos se manda ya.
+            return (nombre, ayuda, f'{nombre}|' if hint else nombre)
+
+        grupos, ubicados = [], set()
+        for nombre, verbos in _CMD_GROUP.items():
+            presentes = [v for v in verbos if v in _ROBOT_CMDS]
+            ubicados.update(presentes)
+            grupos.append((nombre, [boton(v, _ROBOT_CMDS[v]) for v in presentes]))
+
+        # Red de seguridad: si alguien agrega un comando a _ROBOT_CMDS y olvida
+        # clasificarlo, aparece igual acá en vez de desaparecer de la interfaz.
+        sueltos = sorted(set(_ROBOT_CMDS) - ubicados)
+        if sueltos:
+            grupos.append(('Otros', [boton(v, _ROBOT_CMDS[v]) for v in sueltos]))
+
+        grupos.append(('Base', [boton(v, _BASE_CMDS[v], 'BASE.')
+                                for v in sorted(_BASE_CMDS) if v != 'HELP']
+                               + [('Recalibrar origen',
+                                   'fija el origen con el marker de referencia',
+                                   '__ORIGIN__')]))
+        return grupos
 
     def _makeButtonGrid(self, botones):
         cont = QWidget()
@@ -342,7 +365,9 @@ class AttaBotGUI(QMainWindow):
             btn = QPushButton(etiqueta)
             if ayuda:
                 btn.setToolTip(ayuda)
-            if etiqueta in ('Parar', 'Abortar nav'):
+            # Los botones que FRENAN al robot van en rojo. Se listan por nombre
+            # de comando, que es lo que ahora dice la etiqueta.
+            if etiqueta in ('RESET', 'ABORT_NAV', 'CANCEL_CONGREGATION'):
                 btn.setObjectName('peligro')
             if callable(accion):
                 btn.clicked.connect(lambda _, f=accion: f())
@@ -484,11 +509,26 @@ class AttaBotGUI(QMainWindow):
         data = self._robotCombo.currentData()
         return data if data is not None else 'BROADCAST'
 
+    def _separarDestino(self, texto):
+        """(destino, instrucción) — acepta la misma gramática que la consola.
+
+        Escribir 'BASE.STATUS' o '2.MOVE|500' en el campo hace lo que dice, en vez
+        de mandarle el texto entero al robot seleccionado. Sin esto, el botón
+        BASE.CALIBRATE prellenaba 'BASE.CALIBRATE|' y al enviar se lo mandaba
+        crudo al robot de la tabla, que no lo entiende.
+        """
+        if '.' in texto:
+            posible, resto = texto.split('.', 1)
+            if posible in ('BASE', 'BROADCAST') or posible in self.base.robots:
+                return posible, resto.strip()
+        return self._selectedRobotId(), texto
+
     def _send(self):
         cmd = self._cmdInput.text().strip()
         if not cmd:
             return
-        self._dispatch(self._selectedRobotId(), cmd)
+        destino, instruccion = self._separarDestino(cmd)
+        self._dispatch(destino, instruccion)
         if not self._cmdHistory or self._cmdHistory[0] != cmd:
             self._cmdHistory.insert(0, cmd)
         self._historyIdx = -1
@@ -499,7 +539,8 @@ class AttaBotGUI(QMainWindow):
             self.base.recalibrateOrigin()
             self.logSignal.emit('[ORIGIN] Origen recalibrado')
             return
-        self._dispatch(self._selectedRobotId(), cmd)
+        destino, instruccion = self._separarDestino(cmd)
+        self._dispatch(destino, instruccion)
 
     def _fillInput(self, text):
         self._cmdInput.setText(text)
