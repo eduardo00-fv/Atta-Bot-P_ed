@@ -16,6 +16,8 @@ Usa los comandos del firmware —
                   0..255 del APDS9960 central, la que se compara contra el umbral)
   SENSOR_MASK|L/C/R|0/1        → des/enmascara un canal (1 = ignorar).
   SENSOR_THRESHOLD|C|N[|SAVE]  → umbral del central (SAVE lo persiste en NVS).
+  COLOR_READ                   → responde  COLOR: R=n G=n B=n C=n  (RGBC crudo
+                                 del APDS9960, para calibrar MatchColor).
 
 IMPORTANTE — la base debe estar CERRADA:
   El robot responde siempre a  Base-IP:6060, así que este tool toma el puerto
@@ -31,6 +33,8 @@ Uso:
   python3 Base/ir_check.py --ip 192.168.1.101 --pot R   # tunear los pots del HW-488 derecho
   python3 Base/ir_check.py --ip 192.168.1.101 --pot C --apply  # umbral del central (guiado)
   python3 Base/ir_check.py --ip 192.168.1.101 --thr 25 --save  # fijar umbral a mano
+  python3 Base/ir_check.py --ip 192.168.1.101 --color   # calibrar COLOR (rojo vs azul)
+  python3 Base/ir_check.py --ip 192.168.1.101 --color rojo,verde,azul --samples 50
   python3 Base/ir_check.py                              # descubre por broadcast y usa el 1º
   python3 Base/ir_check.py --monitor --all             # monitor de todos los que respondan
 """
@@ -56,6 +60,18 @@ EVAD_RE = re.compile(r'Evading:(\d)')
 PROX_RE = re.compile(r'Prox:(-?\d+)')
 THR_RE = re.compile(r'Thr:(\d+)')
 MASK_RE = re.compile(r'Mask:L(\d)-C(\d)-R(\d)')
+# Respuesta de COLOR_READ (comandos.ino) — lectura RGBC cruda del APDS9960.
+COLOR_RE = re.compile(r'COLOR: R=(\d+) G=(\d+) B=(\d+) C=(\d+)')
+
+# Proximidad a la que el firmware se detiene a leer color (SEARCH_PROX_NEAR en
+# AttaBot.ino). Calibrar a otra distancia mide una lectura que el robot nunca va
+# a tomar, así que el modo --color guía hasta este valor antes de muestrear.
+SEARCH_PROX_NEAR = 180
+# Factor de MatchColor() (motores.ino): `r > g * 3 / 2 && r > b * 3 / 2`.
+FW_COLOR_K = 1.5
+# Guard de MatchColor(): con el canal claro por debajo de esto la proporción
+# entre canales no significa nada y la lectura se descarta.
+FW_CLEAR_MIN = 10
 
 
 def load_net():
@@ -506,6 +522,236 @@ def pot_calibrate(sock, target, port, channel):
               f'(n={tot}). Ideal: ~0% con frente libre, salto limpio al acercar.')
 
 
+# ── Modo calibración de COLOR (APDS9960 → SEARCH_OBJECT / percepción colectiva) ─
+def _match_color(target, r, g, b, c, k=FW_COLOR_K):
+    """Réplica de MatchColor() (motores.ino) para correr las lecturas medidas
+    contra la regla REAL del firmware sin tener que flashear ni adivinar.
+
+    El firmware compara en enteros (`g * 3 / 2` trunca), por eso el int()."""
+    if c < FW_CLEAR_MIN:
+        return False
+    own, others = _channels(target, r, g, b)
+    if own is None:
+        return False
+    return all(own > int(o * k) for o in others)
+
+
+def _channels(target, r, g, b):
+    """(canal propio, otros dos) para el color pedido, o (None, ()) si no existe."""
+    return {'rojo': (r, (g, b)),
+            'verde': (g, (r, b)),
+            'azul': (b, (r, g))}.get(target, (None, ()))
+
+
+def _discriminant(target, r, g, b):
+    """El k más grande con el que esta lectura todavía se clasificaría como
+    `target`. Comparable directo contra el 1.5 del firmware: si da 3.2, la
+    lectura pasa con holgura; si da 1.1, el firmware la rechaza."""
+    own, others = _channels(target, r, g, b)
+    worst = max(others) if others else 0
+    if own is None:
+        return 0.0
+    return own / worst if worst else float('inf')
+
+
+def _position_with_prox(sock, target, port, prompt, secs):
+    """Cuenta regresiva mostrando la proximidad EN VIVO.
+
+    A diferencia de _countdown, acá la distancia es parte de la medición: el
+    firmware solo lee color con readProximity() >= SEARCH_PROX_NEAR, así que
+    conviene ver el número mientras se acomoda el objeto."""
+    print(prompt)
+    prox = None
+    t0 = time.time()
+    last_poll = 0.0
+    while time.time() - t0 < secs:
+        now = time.time()
+        if now - last_poll >= 0.1:
+            send(sock, target, port, 'GET_STATUS')
+            last_poll = now
+        try:
+            data, _ = sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+        st = parse_status(data.decode(errors='replace'))
+        if st and st['prox'] is not None:
+            prox = st['prox']
+        ptxt = str(prox) if prox is not None else '?'
+        marca = '✓ en rango' if (prox or 0) >= SEARCH_PROX_NEAR else '… acercá  '
+        left = secs - (time.time() - t0)
+        print(f'\r  prox={ptxt:>4} (objetivo ≥{SEARCH_PROX_NEAR}) {marca}  '
+              f'empieza en {left:3.0f}s', end='', flush=True)
+    print('\n  … muestreando')
+    return prox
+
+
+def _sample_color(sock, target, port, n, label):
+    """Dispara COLOR_READ hasta juntar n lecturas RGBC.
+
+    Request/response en vez de sondeo libre como _sample_prox: HandleColorRead
+    bloquea hasta 300ms esperando colorDataReady, así que mandar más rápido no
+    produce más datos. Devuelve None si el robot dice que no tiene el sensor."""
+    vals = []
+    deadline = time.time() + n * 1.5 + 5
+    while len(vals) < n and time.time() < deadline:
+        send(sock, target, port, 'COLOR_READ')
+        t1 = time.time()
+        while time.time() - t1 < 1.0:
+            try:
+                data, _ = sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            msg = data.decode(errors='replace')
+            if 'COLOR_READ: APDS9960 no disponible' in msg:
+                print()
+                return None
+            m = COLOR_RE.search(msg)
+            if m:
+                vals.append(tuple(int(g) for g in m.groups()))
+                break
+        if vals:
+            r, g, b, c = vals[-1]
+            print(f'\r  {label} R={r:5d} G={g:5d} B={b:5d} C={c:5d}  '
+                  f'(n={len(vals)}/{n})', end='', flush=True)
+    print()
+    return vals
+
+
+def color_calibrate(sock, target, port, classes, samples, countdown):
+    """Mide RGBC por clase de objeto y evalúa si MatchColor() los separa.
+
+    El objetivo NO es solo ver números: es correr las lecturas reales contra la
+    regla del firmware y sacar la matriz de confusión. Los umbrales de
+    MatchColor son "de primera pasada" por su propio comentario, y la luz
+    despareja de la arena se confundiría con heterogeneidad entre robots."""
+    print('\n═══ Calibración de color (APDS9960) ═══')
+    print('Se mide UN robot. El color solo es confiable a la MISMA distancia a la')
+    print(f'que el robot se detiene a leer (prox ≥ {SEARCH_PROX_NEAR}); la cuenta')
+    print('regresiva muestra la proximidad en vivo para acomodar el objeto ahí.')
+    print(f'Clases: {", ".join(classes)} + FONDO (lo que ve sin objeto).\n')
+    set_masks(sock, target, port, {'C': 0})
+    drain(sock)
+
+    data = {}
+    for name in classes:
+        _position_with_prox(
+            sock, target, port,
+            f'\nPASO · {name.upper()} — poné el objeto {name} frente al sensor.',
+            countdown)
+        drain(sock)
+        vals = _sample_color(sock, target, port, samples, f'{name.upper():6s}')
+        if vals is None:
+            sys.exit('✗ El robot responde «APDS9960 no disponible»: el sensor no\n'
+                     '  arrancó. Revisá el cableado I²C — el escaneo del setup debe\n'
+                     '  ver la dirección 0x39.')
+        if not vals:
+            sys.exit(f'✗ Sin respuestas COLOR: para {name}. ¿Firmware sin COLOR_READ?\n'
+                     '  Flasheá (OTA) el AttaBot.ino actual y reintentá.')
+        data[name] = vals
+
+    # FONDO no es un extra: en la arena la mayoría de las lecturas NO son de un
+    # objeto de color, así que el falso positivo contra el fondo es el error que
+    # más muestras contamina.
+    _position_with_prox(
+        sock, target, port,
+        '\nPASO · FONDO — despejá el frente (o poné el piso/pared de la arena).',
+        countdown)
+    drain(sock)
+    fondo = _sample_color(sock, target, port, samples, 'FONDO ')
+    _color_report(data, fondo or [], classes)
+
+
+def _color_report(data, fondo, classes):
+    print('\n═══ Lecturas ═══')
+    for name in classes:
+        vals = data[name]
+        med = [_pct([v[i] for v in vals], 0.5) for i in range(4)]
+        disc = sorted(_discriminant(name, *v[:3]) for v in vals)
+        print(f'  {name.upper():6s} n={len(vals):3d}  mediana '
+              f'R={med[0]:5d} G={med[1]:5d} B={med[2]:5d} C={med[3]:5d}')
+        print(f'         k que la clasifica: peor={disc[0]:.2f}  '
+              f'mediana={_pct(disc, 0.5):.2f}')
+    if fondo:
+        med = [_pct([v[i] for v in fondo], 0.5) for i in range(4)]
+        print(f'  FONDO  n={len(fondo):3d}  mediana '
+              f'R={med[0]:5d} G={med[1]:5d} B={med[2]:5d} C={med[3]:5d}')
+
+    todas = [v for vals in data.values() for v in vals] + list(fondo)
+    oscuras = sum(1 for v in todas if v[3] < FW_CLEAR_MIN)
+    if oscuras:
+        print(f'\n  ⚠ {oscuras}/{len(todas)} lecturas con C < {FW_CLEAR_MIN}: el firmware '
+              'las descarta por\n    oscuras. Más luz sobre la arena o el objeto más cerca.')
+    if any(v[3] >= 65535 for v in todas):
+        print('\n  ⚠ Canal claro SATURADO (65535): bajá la ganancia o la luz, las '
+              'proporciones\n    entre canales dejan de ser fiables al tope de escala.')
+
+    # La prueba que importa: qué haría el firmware TAL CUAL está hoy.
+    print(f'\n═══ Regla actual del firmware (MatchColor, k={FW_COLOR_K}) ═══')
+    rows = [(n, data[n]) for n in classes] + ([('fondo', fondo)] if fondo else [])
+    hdr = '  '.join(f'{c:>7s}' for c in classes)
+    print(f'  {"real":7s} → {hdr}  {"ninguno":>7s}  {"ambos":>6s}')
+    ok = tot = 0
+    for name, vals in rows:
+        counts = {c: 0 for c in classes}
+        none = both = 0
+        for r, g, b, c in vals:
+            hits = [cl for cl in classes if _match_color(cl, r, g, b, c)]
+            if len(hits) > 1:
+                both += 1
+            elif hits:
+                counts[hits[0]] += 1
+            else:
+                none += 1
+            tot += 1
+            # El fondo acierta cuando NO dispara ninguna clase.
+            if hits == [name] or (name == 'fondo' and not hits):
+                ok += 1
+        cells = '  '.join(f'{counts[c]:7d}' for c in classes)
+        print(f'  {name:7s} → {cells}  {none:7d}  {both:6d}')
+    print(f'  → {ok}/{tot} correctas ({ok / max(tot, 1) * 100:.0f}%)')
+
+    # Rango de k viable por clase: por encima del cruce (rechaza a las demás) y
+    # por debajo del peor propio (acepta a las suyas).
+    print('\n═══ Veredicto por clase ═══')
+    # Solo las lecturas que pasan el guard de oscuridad: en las que no lo pasan
+    # el firmware nunca llega a comparar canales, así que meterlas acá haría
+    # recomendar un k para muestras que se descartan igual.
+    validas = {n: [v for v in data[n] if v[3] >= FW_CLEAR_MIN] for n in classes}
+    fondo_ok = [v for v in fondo if v[3] >= FW_CLEAR_MIN]
+    for name in classes:
+        vals = validas[name]
+        if not vals:
+            print(f'  {name.upper():6s}: ✗ las {len(data[name])} lecturas se descartan '
+                  f'por C < {FW_CLEAR_MIN} (muy oscuro).\n          El color ni se llega '
+                  'a evaluar: subí la luz o acercá el objeto.')
+            continue
+        descartadas = len(data[name]) - len(vals)
+        nota = f'  ({descartadas} descartadas por oscuras)' if descartadas else ''
+        peor = min(_discriminant(name, *v[:3]) for v in vals)
+        ajenas = [v for m in classes if m != name for v in validas[m]] + fondo_ok
+        cruce = max((_discriminant(name, *v[:3]) for v in ajenas), default=0.0)
+        if cruce >= peor:
+            print(f'  {name.upper():6s}: ✗ NO SEPARABLE — alguna lectura ajena '
+                  f'({cruce:.2f}) parece más\n          {name} que la peor propia '
+                  f'({peor:.2f}). Ningún k arregla esto: cambiá\n          el objeto, '
+                  'la luz, o clasificá por proporción normalizada.')
+            continue
+        rec = (cruce + peor) / 2
+        if cruce < FW_COLOR_K < peor:
+            print(f'  {name.upper():6s}: ✓ separable — k válido en ({cruce:.2f}, '
+                  f'{peor:.2f}); el {FW_COLOR_K} del firmware cae adentro.{nota}')
+        else:
+            lado = 'muy bajo (deja pasar ajenas)' if FW_COLOR_K <= cruce else \
+                   'muy alto (rechaza propias)'
+            print(f'  {name.upper():6s}: ⚠ separable pero el {FW_COLOR_K} del firmware es '
+                  f'{lado}.\n          k válido en ({cruce:.2f}, {peor:.2f}) → '
+                  f'recomendado {rec:.2f}{nota}')
+
+    print('\n  El k vive en MatchColor() (Base→firmware: motores.ino). Hoy es una\n'
+          '  constante de compilación: cambiarlo exige reflashear, no hay comando\n'
+          '  que lo persista como SENSOR_THRESHOLD hace con la proximidad.')
+
+
 def motors(sock, target, port, pct):
     """Diagnóstico de tracción: lanza SELFTEST y traduce el resultado.
 
@@ -588,6 +834,12 @@ def main():
     ap.add_argument('--pot', metavar='CANAL',
                     help='tuneo en vivo de UN canal (L/R = pots HW-488; '
                          'C = calibración guiada del umbral del APDS)')
+    ap.add_argument('--color', nargs='?', const='rojo,azul', metavar='CLASES',
+                    help='calibración guiada de COLOR del APDS9960: mide RGBC por '
+                         'clase de objeto y evalúa si MatchColor() las separa '
+                         "(default 'rojo,azul'; también sirve 'rojo,verde,azul')")
+    ap.add_argument('--samples', type=int, default=30, metavar='N',
+                    help='con --color: lecturas por clase (default 30)')
     ap.add_argument('--motors', nargs='?', const=40, type=int, metavar='PWM%',
                     help='diagnóstico de tracción: mueve cada motor por separado '
                          'y distingue motor muerto / encoder muerto / motor flojo '
@@ -626,7 +878,14 @@ def main():
         print('⚠ Nadie respondió todavía (seguirá intentando en el sondeo).')
 
     drain(sock)
-    if a.motors is not None:
+    if a.color is not None:
+        clases = [c.strip().lower() for c in a.color.split(',') if c.strip()]
+        malas = [c for c in clases if c not in ('rojo', 'verde', 'azul')]
+        if malas:
+            sys.exit(f'Color(es) inválido(s): {", ".join(malas)}. '
+                     'MatchColor() solo conoce rojo/verde/azul.')
+        color_calibrate(sock, target, port, clases, a.samples, a.countdown)
+    elif a.motors is not None:
         motors(sock, target, port, a.motors)
     elif a.thr is not None:
         send(sock, target, port,
