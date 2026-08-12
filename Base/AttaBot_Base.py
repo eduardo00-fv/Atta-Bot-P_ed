@@ -77,6 +77,14 @@ _NO_LOG_CMD = frozenset(('POSE', 'POSITION_RESPONSE', 'LEADER_POSITION',
 # Comandos que viajan al robot. Se excluyen a propósito los de telemetría y los
 # que van en sentido robot→base (POSE, CHECK_OBSTACLE, MESSAGE_BASE...): no son
 # cosas que un operador escriba.
+#
+# El string es la AYUDA para el humano, no una gramática: '0|1' y 'L|C|R' son
+# enumeraciones, no varios argumentos. Las firmas exactas — las que salen de
+# leer los Handle*() del firmware — están en comandos_schema.py, y
+# `python Base/comandos_schema.py` avisa si esta tabla y aquélla se separan.
+# Vale la pena correrlo al tocar un handler: cuatro entradas de acá estuvieron
+# equivocadas y el firmware descarta EN SILENCIO lo que no entiende, así que
+# seguir la ayuda daba un robot quieto y ningún mensaje de error.
 _ROBOT_CMDS = {
     'MOVE':             'mm',
     'TURN':             'grados',
@@ -86,12 +94,15 @@ _ROBOT_CMDS = {
     'GT':               'x|y[|segmento_mm]',
     'RANDOMW':          '[segmento_mm]',
     'MEET':             'x|y[|radio]',
-    'CONGREGATION':     'slot|x|y',
+    # Decía 'slot|x|y', que sonaba plausible y no era: el firmware lee líder,
+    # índice y total. Quien mandaba coordenadas ponía el índice en la X.
+    'CONGREGATION':     'liderID|indiceSeguidor[|total]',
     'FORMATION':        'figura|liderID|idx|n|eje',
     'DISPERSE':         '[separacion_mm]',
     'CANCEL_CONGREGATION': '',
     'ABORT_NAV':        '',
-    'SEARCH_OBJECT':    '',
+    # Figuraba sin argumentos; el firmware exige el color a buscar.
+    'SEARCH_OBJECT':    'rojo|verde|azul',
     'COLOR_READ':       '',
     'RESET':            '',
     'WAIT':             'ms',
@@ -100,10 +111,13 @@ _ROBOT_CMDS = {
     'GETPPR':           '',
     'SETPPR':           'valor|TEMP|SAVE',
     'PID':              'kp|ki|kd[|SAVE]',
-    'KFPID':            'q|r',
+    # Decía 'q|r'. Son TRES y en este orden: HandleKalmanPID lee R, H y Q.
+    'KFPID':            'R|H|Q',
     'NAV_CONFIG':       'clave|valor[|SAVE]',
     'SENSOR_MASK':      'L|C|R|0o1',
-    'SENSOR_THRESHOLD': 'valor',
+    # Decía 'valor' a secas y el firmware exige la 'C' delante, así que
+    # 'SENSOR_THRESHOLD|25' no hacía nada ni avisaba.
+    'SENSOR_THRESHOLD': 'C|valor[|SAVE]',
     'SELFTEST':         '[pwm]',
     'EKF_NAV':          '0|1',
     'CLEAR_EVASION':    '',
