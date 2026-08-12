@@ -1145,6 +1145,14 @@ class Base(object):
         """
         self.port = configuration['port']
 
+        # Espejo de poses a localhost para consumidores externos (el puente ROS 2).
+        # Socket aparte para no tocar el de control, y antes del return de simMode
+        # para que funcione igual con cámara real que con Webots. 0/ausente = apagado.
+        self.telemetryPort = configuration.get('telemetry_port', 0)
+        self.telemetrySock = None
+        if self.telemetryPort:
+            self.telemetrySock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
         if self.simMode:
             # La base toma 127.0.0.1:6060 — los controllers de Webots mandan
             # todo ahí. Sin SO_REUSEPORT a propósito: si base_camera.py llega
@@ -1691,6 +1699,16 @@ class Base(object):
 
                 instruction = f'POSE|{x}|{y}|{angle}'
                 self.sendInstruction(robot.IP, [instruction], False)
+
+                if self.telemetrySock:
+                    # Mismo dato, gramática del lab, a localhost. Si nadie
+                    # escucha el datagrama se descarta: no debe afectar la corrida.
+                    try:
+                        self.telemetrySock.sendto(
+                            f'{robot.id}.{instruction}'.encode(),
+                            ('127.0.0.1', self.telemetryPort))
+                    except OSError:
+                        pass
 
                 self.addPositionLog(timeLog, robot.id, robot.name,
                                     robot.previousPose, displacement, robot)

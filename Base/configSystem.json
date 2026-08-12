@@ -44,7 +44,8 @@
                 "base_ip": "192.168.1.119",
                 "broadcast_ip": "192.168.1.255",
                 "port": 6060,
-                "network_interface": "wlan0"
+                "network_interface": "wlan0",
+                "telemetry_port": 6070
         },
         "general": {
                 "debug_enable": true,
