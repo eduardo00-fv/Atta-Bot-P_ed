@@ -2400,11 +2400,14 @@ class Base(object):
             pa = rad + math.pi / 2 + math.radians(axisDeg)
             k = idx // 2 + 1
             side = 1 if idx % 2 == 0 else -1
-            ox, oy = side * k * spacing * math.cos(pa), side * k * spacing * math.sin(pa)
+            # Dirección unitaria del brazo. La cuña la inclina 45° hacia atrás y
+            # se normaliza: los dos sumandos son unitarios y perpendiculares, así
+            # que sin el 1/√2 el slot k quedaría a k·spacing·1.414.
+            ax, ay = side * math.cos(pa), side * math.sin(pa)
             if shape == 'cuna':
-                ox -= k * spacing * math.cos(rad)
-                oy -= k * spacing * math.sin(rad)
-            return ox, oy
+                ax = (ax - math.cos(rad)) * math.sqrt(0.5)
+                ay = (ay - math.sin(rad)) * math.sqrt(0.5)
+            return k * spacing * ax, k * spacing * ay
 
         # Validar que TODOS los slots caigan dentro de la ARENA (con margen para
         # staging+robot). Antes el límite era cameraResolution × mmPixel, que no

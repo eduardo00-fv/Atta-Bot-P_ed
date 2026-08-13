@@ -144,10 +144,11 @@ bool RequestPositionQueued() {
 // que la recta al objetivo nunca cruce el círculo de parking ni al líder. Cómo
 // se arma ese par depende de la forma pedida:
 //
-//   linea, cuna  Slot perpendicular al heading del líder, con eje opcional de la
-//                Base (formationAxis). La cuna además lo desplaza k·s hacia
-//                atrás, formando la V detrás del líder. El staging va POR DETRÁS
-//                de la fila, opuesto al heading, para que cada robot entre por su
+//   linea, cuna  Slots sobre dos brazos que salen del líder, el k-ésimo a k·s.
+//                En la línea el brazo es perpendicular al heading (con el eje
+//                opcional de la Base, formationAxis); en la cuña va a 135°,
+//                atrás y al costado, formando la V. El staging va POR DETRÁS de
+//                la fila, opuesto al heading, para que cada robot entre por su
 //                propio carril y no cruce los slots vecinos.
 //
 //   circulo      Slot sobre el anillo wall-safe determinista que arma
@@ -173,9 +174,23 @@ void UpdateCongregationGoal(float leaderX, float leaderY, float leaderAngle) {
     float px  = cos(pa), py = sin(pa);
     int   k    = congregation.followerIndex / 2 + 1;
     int   side = (congregation.followerIndex % 2 == 0) ? 1 : -1;
-    float ox   = side * k * s * px;
-    float oy   = side * k * s * py;
-    if (shape == "cuna") { ox -= k * s * hx; oy -= k * s * hy; }
+
+    // Dirección UNITARIA del brazo sobre el que se reparten los slots de ese
+    // lado. La cuña lo inclina 45° hacia atrás sumándole el opuesto del rumbo:
+    // como los dos sumandos son unitarios y perpendiculares, la suma mide √2 y
+    // hay que normalizarla. Sin ese 1/√2 el slot k quedaba a k·s·1.414 del
+    // líder, o sea 566mm cuando se pedían 400 (medido en lab el 2026-08-13:
+    // 550, 558 y 1151mm contra un espaciado pedido de 400).
+    float ax = side * px, ay = side * py;
+    if (shape == "cuna") {
+      const float INV_SQRT2 = 0.70710678f;
+      ax = (ax - hx) * INV_SQRT2;
+      ay = (ay - hy) * INV_SQRT2;
+    }
+    // Con esto s significa lo mismo en las dos figuras: distancia del líder al
+    // primer slot, y separación entre slots consecutivos del mismo brazo.
+    float ox = k * s * ax;
+    float oy = k * s * ay;
     congregation.slotX = leaderX + ox;
     congregation.slotY = leaderY + oy;
     if (congregation.stagingDone) {
