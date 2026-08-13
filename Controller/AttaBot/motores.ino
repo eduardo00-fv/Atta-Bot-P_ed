@@ -64,14 +64,28 @@ void EkfTick() {
 
 // Clasifica una lectura RGBC del APDS9960 contra un color objetivo. Un canal
 // claro por debajo de 10 se descarta: está muy oscuro para que la proporción
-// entre canales signifique algo. Umbrales de primera pasada, hay que
-// calibrarlos en el lab con COLOR_READ.
+// entre canales signifique algo.
+//
+// Los canales van normalizados por el balance de blancos del propio robot
+// (COLOR_WB) antes de compararse. Sin eso el umbral tendría que absorber la
+// diferencia ENTRE SENSORES, y no puede: medido en lab, dos APDS9960 del mismo
+// modelo y distinto lote difieren 37% en la fracción de azul mirando el MISMO
+// objeto con la MISMA luz, y el más rojo de la flota clasificaba el obstáculo
+// beige como "rojo" de forma repetible. Sin calibrar se comparan los canales
+// crudos, que es el comportamiento de siempre.
 bool MatchColor(const char *target, uint16_t r, uint16_t g, uint16_t b,
                 uint16_t c) {
   if (c < 10) return false;
-  if (strcmp(target, "rojo") == 0)  return r > g * 3 / 2 && r > b * 3 / 2;
-  if (strcmp(target, "verde") == 0) return g > r * 3 / 2 && g > b * 3 / 2;
-  if (strcmp(target, "azul") == 0)  return b > r * 3 / 2 && b > g * 3 / 2;
+  float rn = r, gn = g, bn = b;
+  if (colorWbR && colorWbG && colorWbB) {
+    rn /= colorWbR;
+    gn /= colorWbG;
+    bn /= colorWbB;
+  }
+  const float k = COLOR_MATCH_K;
+  if (strcmp(target, "rojo") == 0)  return rn > gn * k && rn > bn * k;
+  if (strcmp(target, "verde") == 0) return gn > rn * k && gn > bn * k;
+  if (strcmp(target, "azul") == 0)  return bn > rn * k && bn > gn * k;
   return false;
 }
 

@@ -934,20 +934,102 @@ void HandleSearchObject(const std::array<String, 6> &arguments) {
                 robotID.c_str(), search.targetColor);
 }
 
-  // COLOR_READ — lectura puntual RGBC para calibrar umbrales de color en lab
+  // COLOR_READ — lectura puntual RGBC para calibrar umbrales de color en lab.
+  // Uso: COLOR_READ                (con la exposicion vigente)
+  //      COLOR_READ|16             (fija la ganancia)
+  //      COLOR_READ|16|100         (fija ganancia e integracion en ms)
+  //
+  // La exposicion queda fija hasta el proximo COLOR_READ que la cambie o hasta
+  // reiniciar: asi se barre desde la consola sin recompilar, y la respuesta la
+  // repite para que el log diga con que se midio cada lectura.
 void HandleColorRead(const std::array<String, 6> &arguments) {
   if (!frontSensorInitialized) {
     SendMessage(robots["Base"], "COLOR_READ: APDS9960 no disponible");
     return;
   }
-  frontSensor.enableColor(true);
-  unsigned long t0 = millis();
-  while (!frontSensor.colorDataReady() && millis() - t0 < 300) delay(5);
+  if (arguments[1] != "") {
+    SetColorExposure(arguments[1].toInt(), arguments[2] != ""
+                                               ? arguments[2].toInt()
+                                               : colorIntegrationMs);
+  }
   uint16_t r, g, b, c;
-  frontSensor.getColorData(&r, &g, &b, &c);
-  if (!search.active) frontSensor.enableColor(false);
-  char buf[80];
-  snprintf(buf, sizeof(buf), "COLOR: R=%u G=%u B=%u C=%u", r, g, b, c);
+  ReadColorRaw(r, g, b, c);
+  // Se informan tambien los canales NORMALIZADOS, que son los que mira
+  // MatchColor: sobre el patron con el que se calibro tienen que dar 1.00 en
+  // los tres, y eso hace verificable de un vistazo que COLOR_WB quedo bien.
+  char norm[40] = "";
+  if (colorWbR && colorWbG && colorWbB) {
+    snprintf(norm, sizeof(norm), " norm=%.2f/%.2f/%.2f", (float)r / colorWbR,
+             (float)g / colorWbG, (float)b / colorWbB);
+  }
+  char buf[140];
+  snprintf(buf, sizeof(buf), "COLOR: R=%u G=%u B=%u C=%u gain=%ux t=%ums%s", r,
+           g, b, c, colorGain, colorIntegrationMs, norm);
+  SendMessage(robots["Base"], buf);
+}
+
+  // COLOR_WB — balance de blancos del sensor de color, propio de cada robot.
+  // Uso: COLOR_WB           mide lo que tiene enfrente y lo toma de patron
+  //      COLOR_WB|R|G|B     lo fija a mano
+  //      COLOR_WB|RESET     vuelve a comparar canales crudos
+  //
+  // El patron es el obstaculo beige de la arena. Hay que medirlo A LA MISMA
+  // DISTANCIA a la que el robot lee de verdad (readProximity() >=
+  // SEARCH_PROX_NEAR) y con la luz de la arena: lo que se guarda es la respuesta
+  // conjunta del sensor Y de la iluminacion, y eso solo vale si las condiciones
+  // son las de la prueba.
+void HandleColorWhiteBalance(const std::array<String, 6> &arguments) {
+  if (arguments[1] == "RESET") {
+    SaveColorWhiteBalance(0, 0, 0);
+    SendMessage(robots["Base"], "COLOR_WB: sin calibrar (canales crudos)");
+    return;
+  }
+
+  uint16_t r, g, b, c = 0;
+  if (arguments[3] != "") {
+    r = arguments[1].toInt();
+    g = arguments[2].toInt();
+    b = arguments[3].toInt();
+  } else {
+    if (!frontSensorInitialized) {
+      SendMessage(robots["Base"], "COLOR_WB: APDS9960 no disponible");
+      return;
+    }
+    ReadColorRaw(r, g, b, c);
+  }
+
+  // Un patron mal medido es peor que no calibrar: queda guardado en NVS y
+  // deforma TODAS las clasificaciones posteriores sin avisar.
+  char buf[120];
+  if (r == 0 || g == 0 || b == 0) {
+    snprintf(buf, sizeof(buf),
+             "COLOR_WB: RECHAZADO — canal en cero (R=%u G=%u B=%u C=%u). "
+             "Acerca el patron o subi la exposicion.",
+             r, g, b, c);
+    SendMessage(robots["Base"], buf);
+    return;
+  }
+  if (c != 0 && c < 500) {
+    snprintf(buf, sizeof(buf),
+             "COLOR_WB: RECHAZADO — muy oscuro (C=%u, hace falta >=500). "
+             "Subi la exposicion con COLOR_READ|64|100.",
+             c);
+    SendMessage(robots["Base"], buf);
+    return;
+  }
+  if (r >= 65535 || g >= 65535 || b >= 65535 || c >= 65535) {
+    snprintf(buf, sizeof(buf),
+             "COLOR_WB: RECHAZADO — canal SATURADO (R=%u G=%u B=%u C=%u). "
+             "Baja la exposicion.",
+             r, g, b, c);
+    SendMessage(robots["Base"], buf);
+    return;
+  }
+
+  SaveColorWhiteBalance(r, g, b);
+  snprintf(buf, sizeof(buf),
+           "COLOR_WB: patron R=%u G=%u B=%u (gain=%ux t=%ums) GUARDADO", r, g, b,
+           colorGain, colorIntegrationMs);
   SendMessage(robots["Base"], buf);
 }
 
@@ -1031,6 +1113,7 @@ void ReadUdpPackets() {
   else if (command == "RESET_EVASION") HandleResetEvasion(arguments);
   else if (command == "SEARCH_OBJECT") HandleSearchObject(arguments);
   else if (command == "COLOR_READ") HandleColorRead(arguments);
+  else if (command == "COLOR_WB") HandleColorWhiteBalance(arguments);
   else if (command == "ABORT_NAV") HandleAbortNav(arguments);
   else if (command == "GET_YAW") HandleGetYaw(arguments);
 }

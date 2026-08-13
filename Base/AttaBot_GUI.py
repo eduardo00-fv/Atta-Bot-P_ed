@@ -317,6 +317,7 @@ class AttaBotGUI(QMainWindow):
             'RESET': 'vuelve al estado STOP',
             'ABORT_NAV': 'corta la navegación y la búsqueda en curso',
             'COLOR_READ': 'lee el APDS9960 y reporta RGBC',
+            'COLOR_WB': 'calibra el blanco de ESTE sensor contra el patrón que mira',
             'SELFTEST': 'pulso de motor a lazo abierto, cuenta encoders',
             'SENSOR_MASK': 'ignorar un sensor IR defectuoso (1 = ignorar)',
             'CLEAR_EVASION': 'limpia el estado de evasión',

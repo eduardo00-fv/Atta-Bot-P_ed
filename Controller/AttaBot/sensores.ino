@@ -37,6 +37,8 @@ void SetupFrontSensor() {
 
   if (frontSensor.begin()) {
     frontSensorInitialized = true;
+    // begin() deja 4x y 10ms, que sub-expone el color en la arena.
+    SetColorExposure(colorGain, colorIntegrationMs);
     ledCtrl.setOff();
     DebugSerialPrintln(" Sensor APDS-9960 inicializado correctamente");
   } else {
@@ -44,6 +46,42 @@ void SetupFrontSensor() {
         " Falló la inicialización del sensor APDS-9960. Reintentando...");
     ledCtrl.setBlink(255, 128, 0, maxBrightness, 500);
   }
+}
+
+// Fija la exposicion del canal de color (ALS). Una ganancia que no sea 1/4/16/64
+// se ignora y queda 16x; los ms se recortan al rango que el chip resuelve (pasos
+// de 2.78ms) y que la lectura puede esperar.
+// La proximidad del IR central NO se ve afectada: usa PGAIN, otro registro, asi
+// que el umbral calibrado con SENSOR_THRESHOLD sigue valiendo.
+void SetColorExposure(uint8_t gain, uint16_t ms) {
+  apds9960AGain_t g;
+  switch (gain) {
+    case 1:  g = APDS9960_AGAIN_1X;  break;
+    case 4:  g = APDS9960_AGAIN_4X;  break;
+    case 64: g = APDS9960_AGAIN_64X; break;
+    default: g = APDS9960_AGAIN_16X; gain = 16; break;
+  }
+  colorGain = gain;
+  colorIntegrationMs = constrain(ms, 3, COLOR_INTEGRATION_MS_MAX);
+  frontSensor.setADCGain(g);
+  frontSensor.setADCIntegrationTime(colorIntegrationMs);
+}
+
+// Una lectura RGBC del canal de color, esperando una conversion ENTERA.
+//
+// La conversion en vuelo se descarta a proposito: puede venir de la exposicion
+// anterior, con lo que un barrido de ganancia mentiria. Ademas leer los
+// registros limpia AVALID, asi que el colorDataReady() de abajo solo se
+// enciende con una medicion nueva de verdad.
+void ReadColorRaw(uint16_t &r, uint16_t &g, uint16_t &b, uint16_t &c) {
+  frontSensor.enableColor(true);
+  frontSensor.getColorData(&r, &g, &b, &c);
+  unsigned long t0 = millis();
+  unsigned long limite = colorIntegrationMs * 2UL + 100UL;
+  while (!frontSensor.colorDataReady() && millis() - t0 < limite) delay(5);
+  frontSensor.getColorData(&r, &g, &b, &c);
+  // La busqueda deja el canal prendido: lo usa en cada ciclo de SEARCH_APPROACH.
+  if (!search.active) frontSensor.enableColor(false);
 }
 
 // Vigila el enlace WiFi y reporta solo los CAMBIOS de estado, no cada ciclo.

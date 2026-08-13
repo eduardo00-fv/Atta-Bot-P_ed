@@ -126,7 +126,8 @@ Claves de `NAV_CONFIG`:
 | `SENSOR_THRESHOLD` | `<valor>` — umbral del IR central |
 | `CLEAR_EVASION` | — limpia el estado de evasión |
 | `RESET_EVASION` | — reinicia el contador de evasiones |
-| `COLOR_READ` | — lectura del APDS9960 |
+| `COLOR_READ` | `[<ganancia>\|<ms>]` — lectura RGBC del APDS9960; con argumentos fija la exposición (ganancia 1/4/16/64, integración 3-200 ms) |
+| `COLOR_WB` | `[<R>\|<G>\|<B>]` o `RESET` — balance de blancos del sensor de color, propio de cada robot. Sin argumentos mide el patrón que tiene enfrente y lo guarda en NVS |
 | `SEARCH_OBJECT` | — busca un objeto por color |
 
 ### Diagnóstico

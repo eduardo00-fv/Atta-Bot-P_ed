@@ -114,7 +114,18 @@ SCHEMA: dict[str, Cmd] = {
     # --- percepción ---------------------------------------------------------
     'SEARCH_OBJECT': Cmd('robot', (_e('color', COLORES),),
                          'Patrulla buscando un objeto de ese color y avisa al encontrarlo.'),
-    'COLOR_READ': Cmd('robot', (), 'Devuelve una lectura RGBC cruda para calibrar umbrales.'),
+    'COLOR_READ': Cmd('robot', (_i('ganancia', req=False, ayuda='1, 4, 16 o 64'),
+                                _i('integracion_ms', req=False, ayuda='3 a 200')),
+                      'Devuelve una lectura RGBC cruda para calibrar umbrales. '
+                      'Con argumentos fija además la exposición del sensor.'),
+    # Primer argumento suelto a propósito: acepta el valor R, la palabra RESET, o
+    # nada. El firmware lo resuelve; acá sólo se atrapa el número de argumentos.
+    'COLOR_WB': Cmd('robot', (_s('R', req=False,
+                                 ayuda='sin argumentos mide el patrón que tiene '
+                                       'enfrente; RESET vuelve a canales crudos'),
+                              _i('G', req=False), _i('B', req=False)),
+                    'Balance de blancos del sensor de color, propio de cada robot: '
+                    'guarda en NVS lo que ESE sensor lee sobre el patrón neutro.'),
 
     # --- calibración y ajustes ----------------------------------------------
     'GETPPR': Cmd('robot', (), 'Reporta los pulsos por revolución vigentes.'),

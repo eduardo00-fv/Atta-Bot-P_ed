@@ -241,6 +241,42 @@ const int SEARCH_CREEP_PWM = 70;
 const uint8_t SEARCH_PROX_NEAR = 180;
 const unsigned long SEARCH_APPROACH_TIMEOUT = 6000;
 
+// Exposicion del canal de COLOR del APDS9960: ganancia (1/4/16/64x) y tiempo de
+// integracion en ms. El begin() de la libreria arranca en 4x y 10ms, y con eso
+// la arena da C≈30 sobre un fondo de escala de 65535: a ese nivel una cuenta es
+// el 10% del valor y las razones entre canales con las que decide MatchColor
+// son ruido de cuantizacion. Se barren en vivo con COLOR_READ|<ganancia>|<ms>.
+// NO tocan la proximidad, que corre por otro registro (PGAIN).
+// Medido en la arena el 2026-08-13 sobre el obstaculo beige: 4x/10ms daba C≈30
+// (ruido puro), 16x/50ms da C≈760 y 64x/100ms da C≈6200 sobre 65535 — ~1% de
+// precision en las razones entre canales y todavia 10x de margen antes de
+// saturar. El sensor resulto lineal en la exposicion a un 3%.
+const uint8_t COLOR_GAIN_DEFAULT = 64;
+const uint16_t COLOR_INTEGRATION_MS_DEFAULT = 100;
+// El tope de integracion no es el del chip (~709ms) sino el que HandleColorRead
+// puede esperar sin dejar de atender la red.
+const uint16_t COLOR_INTEGRATION_MS_MAX = 200;
+uint8_t colorGain = COLOR_GAIN_DEFAULT;
+uint16_t colorIntegrationMs = COLOR_INTEGRATION_MS_DEFAULT;
+
+// Balance de blancos del canal de color, POR ROBOT (COLOR_WB, persistido en
+// NVS). Cada canal se divide por lo que ESE sensor lee sobre el patron neutro
+// —el obstaculo beige de la arena—, con lo que el patron da (1,1,1) en todos y
+// un solo umbral vuelve a valer para la flota.
+//
+// Medido el 2026-08-13 con los 4 robots mirando el MISMO obstaculo desde casi
+// el MISMO punto (dispersion de luz 8.9%): la fraccion de azul iba de 0.239
+// (Atta_3) a 0.328 (Atta_2) — 37% entre piezas del mismo modelo y distinto
+// lote. Con eso Atta_3 daba el beige por ROJO (razon 1.518 contra el 1.5 de
+// umbral) de forma repetible, en dos exposiciones y dos posiciones.
+//
+// (0,0,0) = sin calibrar: MatchColor compara los canales crudos, como antes.
+uint16_t colorWbR = 0, colorWbG = 0, colorWbB = 0;
+// Cuanto tiene que destacar un canal sobre los otros dos para dar el color por
+// bueno. Con el balance puesto, el neutro queda en 1.0 en los tres canales, asi
+// que este numero pasa a ser margen limpio sobre el fondo.
+const float COLOR_MATCH_K = 1.5f;
+
 ObstacleState obstacles;
 MovementMetrics movement;
 LedController ledCtrl;
@@ -381,6 +417,9 @@ void MessageDebugf(const char *format, ...);
 
 // Sensores y control
 void ReadSensors();
+void SetColorExposure(uint8_t gain, uint16_t ms);
+void ReadColorRaw(uint16_t &r, uint16_t &g, uint16_t &b, uint16_t &c);
+void SaveColorWhiteBalance(uint16_t r, uint16_t g, uint16_t b);
 void ResetPID();
 void ConfigureHBridge(int leftWheelPWM, int rightWheelPWM);
 
@@ -533,11 +572,31 @@ void InitializePPR() {
   centralIRThreshold = preferences.getInt("ir_cen_thr", 2);
   DebugSerialPrintf("Umbral IR central: %d\n", centralIRThreshold);
 
+  colorWbR = preferences.getUShort("cwb_r", 0);
+  colorWbG = preferences.getUShort("cwb_g", 0);
+  colorWbB = preferences.getUShort("cwb_b", 0);
+  DebugSerialPrintf("Balance de blancos del color: %u/%u/%u%s\n", colorWbR,
+                    colorWbG, colorWbB,
+                    (colorWbR && colorWbG && colorWbB) ? "" : " (SIN CALIBRAR)");
+
   preferences.end();
 
   uint64_t chipid = ESP.getEfuseMac();
   DebugSerialPrintf("Robot Chip ID: %04X%08X\n", (uint16_t)(chipid >> 32),
                     (uint32_t)chipid);
+}
+
+// Persiste el vector del blanco del sensor de color. (0,0,0) lo desactiva.
+void SaveColorWhiteBalance(uint16_t r, uint16_t g, uint16_t b) {
+  colorWbR = r;
+  colorWbG = g;
+  colorWbB = b;
+  preferences.begin("attabot-config", false);
+  preferences.putUShort("cwb_r", r);
+  preferences.putUShort("cwb_g", g);
+  preferences.putUShort("cwb_b", b);
+  preferences.end();
+  DebugSerialPrintf("Balance de blancos guardado: %u/%u/%u\n", r, g, b);
 }
 
 // Persiste un PPR nuevo y recalcula lo que depende de el.
