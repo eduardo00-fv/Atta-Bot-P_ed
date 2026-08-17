@@ -1,0 +1,263 @@
+// Sensores de obstaculo y su ciclo de muestreo, mas el arranque del APDS9960
+// y la conexion WiFi.
+//
+// Son dos infrarrojos laterales de umbral fijo (HW-488, el alcance se ajusta
+// por potenciometro) y un sensor de proximidad central graduado (APDS9960,
+// 0-255 por I2C). Los tres se leen como un patron de tres bits de ocupacion.
+//
+// Arduino concatena todos los .ino de la carpeta en una sola unidad de
+// traduccion — primero AttaBot.ino, despues el resto en orden alfabetico — asi
+// que las constantes, las variables globales y las declaraciones forward viven
+// en AttaBot.ino y desde aca se ven directo, sin extern ni cabeceras.
+
+// ============================================================================
+// FUNCIONES DE SENSORES Y HARDWARE
+// ============================================================================
+
+// Intenta arrancar el APDS9960, reintentando cada frontSensorRetryInterval si
+// no responde. Se llama desde loop porque el bus I2C a veces no esta listo en
+// el arranque.
+void SetupFrontSensor() {
+  if (frontSensorInitialized)
+    return;
+
+  unsigned long now = millis();
+
+  // CORRECCIÓN CLAVE: Permite la ejecución si es el primer intento
+  // (lastFrontSensorAttempt == 0), o si han pasado 5 segundos desde el último
+  // intento fallido.
+  if (lastFrontSensorAttempt != 0 &&
+      (now - lastFrontSensorAttempt < frontSensorRetryInterval)) {
+    return;
+  }
+
+  lastFrontSensorAttempt = now;
+
+  DebugSerialPrintln("Intentando inicializar APDS9960...");
+
+  if (frontSensor.begin()) {
+    frontSensorInitialized = true;
+    // begin() deja 4x y 10ms, que sub-expone el color en la arena.
+    SetColorExposure(colorGain, colorIntegrationMs);
+    ledCtrl.setOff();
+    DebugSerialPrintln(" Sensor APDS-9960 inicializado correctamente");
+  } else {
+    DebugSerialPrintln(
+        " Falló la inicialización del sensor APDS-9960. Reintentando...");
+    ledCtrl.setBlink(255, 128, 0, maxBrightness, 500);
+  }
+}
+
+// Fija la exposicion del canal de color (ALS). Una ganancia que no sea 1/4/16/64
+// se ignora y queda 16x; los ms se recortan al rango que el chip resuelve (pasos
+// de 2.78ms) y que la lectura puede esperar.
+// La proximidad del IR central NO se ve afectada: usa PGAIN, otro registro, asi
+// que el umbral calibrado con SENSOR_THRESHOLD sigue valiendo.
+void SetColorExposure(uint8_t gain, uint16_t ms) {
+  apds9960AGain_t g;
+  switch (gain) {
+    case 1:  g = APDS9960_AGAIN_1X;  break;
+    case 4:  g = APDS9960_AGAIN_4X;  break;
+    case 64: g = APDS9960_AGAIN_64X; break;
+    default: g = APDS9960_AGAIN_16X; gain = 16; break;
+  }
+  colorGain = gain;
+  colorIntegrationMs = constrain(ms, 3, COLOR_INTEGRATION_MS_MAX);
+  frontSensor.setADCGain(g);
+  frontSensor.setADCIntegrationTime(colorIntegrationMs);
+}
+
+// Una lectura RGBC del canal de color, esperando una conversion ENTERA.
+//
+// La conversion en vuelo se descarta a proposito: puede venir de la exposicion
+// anterior, con lo que un barrido de ganancia mentiria. Ademas leer los
+// registros limpia AVALID, asi que el colorDataReady() de abajo solo se
+// enciende con una medicion nueva de verdad.
+void ReadColorRaw(uint16_t &r, uint16_t &g, uint16_t &b, uint16_t &c) {
+  frontSensor.enableColor(true);
+  frontSensor.getColorData(&r, &g, &b, &c);
+  unsigned long t0 = millis();
+  unsigned long limite = colorIntegrationMs * 2UL + 100UL;
+  while (!frontSensor.colorDataReady() && millis() - t0 < limite) delay(5);
+  frontSensor.getColorData(&r, &g, &b, &c);
+  // La busqueda deja el canal prendido: lo usa en cada ciclo de SEARCH_APPROACH.
+  if (!search.active) frontSensor.enableColor(false);
+}
+
+// Vigila el enlace WiFi y reporta solo los CAMBIOS de estado, no cada ciclo.
+// lastStatus arranca en 255, un valor que WiFi.status() nunca devuelve, para que
+// el primer sondeo cuente como cambio.
+void WiFiStatus() {
+  static uint8_t lastStatus = 255;
+  uint8_t currentStatus = WiFi.status();
+
+  if (currentStatus != lastStatus) {
+    const char *statusStr[] = {
+        "WL_IDLE_STATUS",     // 0
+        "WL_NO_SSID_AVAIL",   // 1
+        "WL_SCAN_COMPLETED",  // 2
+        "WL_CONNECTED",       // 3
+        "WL_CONNECT_FAILED",  // 4
+        "WL_CONNECTION_LOST", // 5
+        "WL_DISCONNECTED"     // 6
+    };
+    if (currentStatus <= 6) {
+      DebugSerialPrintf("WiFi Status cambió: %s (%d)\n",
+                        statusStr[currentStatus], currentStatus);
+    }
+    lastStatus = currentStatus;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    static bool wifiConnecting = false;
+    static unsigned long lastWifiAttempt = 0;
+    static int retryCount = 0;
+
+    if (!wifiConnecting) {
+      ConfigureHBridge(0, 0);
+      DebugSerialPrintln("=== Iniciando conexión WiFi ===");
+      DebugSerialPrintf("SSID: %s\n", ssid);
+      DebugSerialPrintf("MAC: %s\n", WiFi.macAddress().c_str());
+      DebugSerialPrintf("Hostname: %s\n", WiFi.getHostname());
+      ledCtrl.setBlink(0, 255, 255, maxBrightness, 250);
+      wifiConnecting = true;
+      lastWifiAttempt = millis();
+      retryCount = 0;
+    }
+
+    // Timeout de conexión: reintentar después de 10 segundos
+    if (millis() - lastWifiAttempt > 10000) {
+      retryCount++;
+      DebugSerialPrintf("⚠ Timeout WiFi (intento #%d). Estado: %d\n",
+                        retryCount, WiFi.status());
+
+      // Después de 3 intentos, hacer un reset más agresivo
+      if (retryCount >= 3) {
+        DebugSerialPrintln(
+            "🔴 Múltiples fallos. Reiniciando WiFi completamente...");
+        WiFi.mode(WIFI_OFF);
+        delay(500);
+        WiFi.mode(WIFI_STA);
+        String hostname = "AttaBot-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+        WiFi.setHostname(hostname.c_str());
+        retryCount = 0;
+      }
+
+      WiFi.disconnect();
+      delay(100);
+      WiFi.begin(ssid, password);
+      lastWifiAttempt = millis();
+    }
+
+    return;
+  } else {
+    static bool firstConnect = true;
+    if (firstConnect) {
+      DebugSerialPrintln("=== ✓ WiFi CONECTADO ===");
+      DebugSerialPrintf("IP: %s\n", WiFi.localIP().toString().c_str());
+      DebugSerialPrintf("Gateway: %s\n", WiFi.gatewayIP().toString().c_str());
+      DebugSerialPrintf("Subnet: %s\n", WiFi.subnetMask().toString().c_str());
+      DebugSerialPrintf("DNS: %s\n", WiFi.dnsIP().toString().c_str());
+      DebugSerialPrintf("MAC: %s\n", WiFi.macAddress().c_str());
+      DebugSerialPrintf("Hostname: %s\n", WiFi.getHostname());
+      DebugSerialPrintf("RSSI: %d dBm\n", WiFi.RSSI());
+      DebugSerialPrintln("=======================");
+      firstConnect = false;
+    }
+    ledCtrl.setOff();
+  }
+}
+
+// Muestrea los tres sensores de obstaculo y arma el patron de ocupacion.
+//
+// Los laterales son de umbral fijo y se leen por interrupcion, asi que aca solo
+// se aplica el filtro por duracion minima: un flanco mas corto que
+// minObstacleTime es ruido. El central es graduado y se compara contra
+// centralIRThreshold. Cualquiera de los tres puede enmascararse en vivo con
+// SENSOR_MASK, que es como se convive con un sensor defectuoso sin desarmar el
+// robot.
+void ReadSensors() {
+  if (((millis() - movement.previousMillis) <= samplingTime - 2) ||
+      isLateralCycleActive || isCentralCycleActive || (debugUdp == 3)) {
+    currentMicros = micros();
+    if (currentMicros - previousMicros >= observationTime) {
+      previousMicros = currentMicros;
+      cycleCounter = (cycleCounter + 1) % numberOfCycles;
+
+      isLateralCycleActive = (lateralCycle == cycleCounter);
+
+      if (isLateralCycleActive != lateralSensorsEnabled) {
+        lateralSensorsEnabled = isLateralCycleActive;
+        digitalWrite(enableLeftInfraredSensor, lateralSensorsEnabled);
+        digitalWrite(enableRightInfraredSensor, lateralSensorsEnabled);
+
+        if (lateralSensorsEnabled) {
+          noInterrupts();
+          leftObsStartTime = micros();
+          rightObsStartTime = micros();
+          interrupts();
+        }
+      }
+
+      isCentralCycleActive = (centralCycle == cycleCounter);
+
+      // GUARDIA 1: Solo intenta habilitar la proximidad si el sensor ya está
+      // inicializado.
+      if (frontSensorInitialized) {
+        frontSensor.enableProximity(isCentralCycleActive);
+      }
+    }
+
+    if (isLateralCycleActive) {
+      noInterrupts();
+      unsigned long leftTime = leftObsStartTime;
+      unsigned long rightTime = rightObsStartTime;
+      interrupts();
+
+      unsigned long now = micros();
+      obstacles.leftObstacle = !maskLeftIR &&
+                               (digitalRead(leftInfraredSensor) == LOW) &&
+                               ((now - leftTime) >= minObstacleTime);
+      obstacles.rightObstacle = !maskRightIR &&
+                                (digitalRead(rightInfraredSensor) == LOW) &&
+                                ((now - rightTime) >= minObstacleTime);
+    }
+
+    if (isCentralCycleActive) {
+      // GUARDIA 2: Solo intenta leer la proximidad si el sensor ya está
+      // inicializado.
+      if (frontSensorInitialized) {
+        centralDistance = frontSensor.readProximity();
+        if (centralDistance > centralIRThreshold && !maskCentralIR) {
+          obstacles.centralObstacle =
+              (micros() - centralObsStartTime) >= minObstacleTime / 2;
+        } else {
+          centralObsStartTime = micros();
+          obstacles.centralObstacle = false;
+        }
+      } else {
+        // Si no está inicializado, asumimos que no hay obstáculo
+        obstacles.centralObstacle = false;
+      }
+    }
+  }
+
+  if (debugUdp == 3) {
+    if (obstacles.HasAnyObstacle()) {
+      ledCtrl.setSolid(255, 128, 0, maxBrightness);
+    } else {
+      ledCtrl.setOff();
+    }
+  } else {
+    if ((digitalRead(batteryStatus) == LOW) &&
+        ((millis() - lowBatteryTime) >= minLowBatteryTime)) {
+      ledCtrl.setSolid(255, 255, 0, 255);
+    }
+  }
+
+  if (isEvading && (millis() - evasionStartTime > evasionCooldown)) {
+    isEvading = false;
+    MessageDebugf("DEBUG: -1, ID: %s, Cooldown de evasión completado",
+                  robotID.c_str());
+  }
+}

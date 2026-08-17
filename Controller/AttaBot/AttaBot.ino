@@ -1,9 +1,16 @@
 #include "utils.h"
-#include <Adafruit_APDS9960.h> // v1.3.0
+// Versiones con las que se compila hoy (2026-07-29), sobre ESP32 Arduino core
+// 3.3.11. Actualizarlas al subir una librería: cuando el comentario miente, un
+// cambio de librería se confunde con una falla de hardware.
+// Ya no está ESP32Servo — el servo frontal se retiró (2026-07-29, no se usaba)
+// porque su PWM a 50Hz/10-bit se llevaba el mux de reloj del LEDC y dejaba a
+// los motores sin PWM: el robot no giraba ni avanzaba. Si algún día vuelve un
+// servo, leer primero Controller/Readme.md — necesita 16 bits de ancho de
+// timer y ESP32Servo 3.2.1 no deja ponérselos (attach() pisa el default).
+#include <Adafruit_APDS9960.h> // v1.3.1
 #include <ArduinoOTA.h>
-#include <ESP32Servo.h> // v3.0.9
-#include <FastLED.h>    // v3.10.2
-#include <ICM_20948.h>  // v1.2.12
+#include <FastLED.h>    // v3.10.5
+#include <ICM_20948.h>  // v1.3.2 — con ICM_20948_USE_DMP activo en ICM_20948_C.h
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
@@ -41,7 +48,7 @@
 
 #define enableLeftInfraredSensor 5
 #define leftInfraredSensor 33
-#define frontServoPin 26
+// GPIO 26 libre: era el servo frontal, retirado el 2026-07-29.
 #define enableRightInfraredSensor 18
 #define rightInfraredSensor 27
 
@@ -67,9 +74,39 @@ char receivedPacket[255];
 float pulsesPerRev = 574;
 const float wheelCircumference = PI * 44.5;
 float millimetersPerPulse = wheelCircumference / pulsesPerRev;
-float centerToWheelDistance = 41.5;  // configurable vía NAV_CONFIG|WHEEL_DIST
-float yawScale = 1.0f;  // escala del gyro por robot (físico/IMU, calibrada con
-                        // ArUco; ±2.4% medido) — NAV_CONFIG|YAW_SCALE|x|SAVE
+// Los dos se ajustan en vivo desde la Base y se persisten: la media distancia
+// entre ruedas con NAV_CONFIG|WHEEL_DIST y la escala del gyro con
+// NAV_CONFIG|YAW_SCALE|x|SAVE. yawScale es la razon entre el giro fisico y el
+// que reporta la IMU, calibrada contra ArUco; se midio hasta ±2.4% por robot.
+float centerToWheelDistance = 41.5;
+float yawScale = 1.0f;
+
+// NO USAR radians() EN ESTE SKETCH — usar DegToRad/DegToArc.
+//
+// FastLED hace `#undef radians` (fl/stl/undef.h) y después `using fl::radians`
+// (FastLED.h:226), así que radians() no es la macro de Arduino sino esto:
+//     template<typename T> constexpr T radians(T deg) {
+//         return deg * static_cast<T>(0.017453292519943295);
+//     }
+// La constante se castea al TIPO DEL ARGUMENTO. Con un ángulo entero,
+// static_cast<int>(0.01745…) es 0, así que radians(180) devuelve 0 y el giro
+// queda en un no-op silencioso. Con float anda bien, y de ahí el cuadro que
+// costó semanas: el robot navegaba hacia el objetivo (nav usa floats) pero no
+// esquivaba obstáculos (`int avoidanceAngle`), el RANDOM_WALK no giraba y
+// TURN|grados no hacía nada en ningún robot. Llegó con FastLED 3.10.5
+// (2026-07-27); antes la macro de Arduino promovía todo a double.
+// Estos helpers usan la constante literal en float y toman float a propósito:
+// fuerzan la promoción en el call site y no dependen ni de FastLED ni de
+// DEG_TO_RAD. Diagnosticado el 2026-07-29, ver Controller/Readme.md.
+inline float DegToRad(float degrees) {
+  return degrees * 0.017453292519943295f;
+}
+
+// Grados de giro en el lugar → arco (mm) que recorre cada rueda. Única vía
+// permitida para esa conversión, que antes vivía repetida en 9 lugares.
+inline float DegToArc(float degrees) {
+  return DegToRad(degrees) * centerToWheelDistance;
+}
 
 // Muestreo y velocidad
 const unsigned int samplingTime = 10;
@@ -102,6 +139,30 @@ const float maxRobotAngleMargin = 80;
 const int obstacleWaitTime = 600;
 const int reverseDistance = -40;
 
+// Escape de deadlock (ACTIVE_EVASION tras N evasiones): giro de rodeo de 95°
+// hacia el interior de la arena, en vez del giro 180° ciego, con un tramo de
+// 300mm. Espeja escape_turn() de la réplica de sim (attabot_firmware.py). El
+// lado se elige proyectando el tramo por cada lado y tomando el que queda más
+// adentro, con DISP_ARENA como límites.
+const float escapeTurnDeg = 95.0f;
+const float escapeMoveMm  = 300.0f;
+
+// Arena del escenario en curso (marco cámara). NO es constante: la base la
+// envía con NAV_CONFIG|ARENA|w|h al registrar cada robot, porque cambia por
+// escenario (4 robots = 2400×1750, 10 robots = 3800×2800).
+float arenaWidthMm  = 2400.0f;
+float arenaHeightMm = 1750.0f;
+
+// Límites de los saltos de dispersión: la arena en curso menos un inset, para
+// que ningún salto apunte a la pared. Antes eran cuatro #define fijos al montaje
+// de 2400×1550 del lab, así que en cualquier otro escenario los robots se
+// dispersaban contra un borde imaginario.
+#define DISP_INSET 350.0f
+#define DISP_ARENA_XMIN DISP_INSET
+#define DISP_ARENA_XMAX (arenaWidthMm - DISP_INSET)
+#define DISP_ARENA_YMIN DISP_INSET
+#define DISP_ARENA_YMAX (arenaHeightMm - DISP_INSET)
+
 // Debug
 int debugUdp = 0;
 int debugCounter = 0;
@@ -116,24 +177,21 @@ const std::array<int, 7> possibleAngles = {30, 45, 60, 75, 90, 135, 180};
 const std::array<int, 4> possibleAdvances = {200, 250, 300, 350};
 enum possibleDirections { TURN_POS = 0, MOVE_FORWARD, TURN_NEG };
 
-// Límites del área de trabajo (en milímetros)
-const float max_workspace_x = 2000;
-const float max_workspace_y = 2000;
-
-// Filtro de saltos bruscos en actualización de pose
-const float max_pose_jump =
-    500; // Máximo salto permitido en mm por actualización
-const float max_angle_jump = 179; // Máximo salto permitido en grados
-const int max_pose_jump_rejections =
-    3; // Rechazos consecutivos antes de re-sincronizar con la cámara
+// Filtro de saltos bruscos al actualizar la pose: un salto de mas de 500mm o de
+// mas de 179° entre lecturas se descarta por misread de la camara. Tras tres
+// rechazos seguidos se acepta igual, porque a esa altura el que esta mal es el
+// modelo interno y hay que re-sincronizar con la camara.
+const float max_pose_jump = 500;
+const float max_angle_jump = 179;
+const int max_pose_jump_rejections = 3;
 int poseJumpRejections = 0;
 
 // IMU
-const float gravity = 9806.65;
 const float conversionFactor = 8192.0;
 float yaw;
 float imuGravity;
-bool imuAvailable = false;  // true solo si setupIMU() completó exitosamente
+// Solo pasa a true si setupIMU() completo sin errores.
+bool imuAvailable = false;
 
 // LEDs
 int maxBrightness = 140;
@@ -144,32 +202,107 @@ int minLowBatteryTime = 200;
 
 // Contador de mensajes
 int countMessages = 0;
-int sendMessages = 0;
 
-// Servo
+// Sensor frontal (APDS9960). Si no arranca al principio se reintenta cada 5s,
+// porque el bus I2C a veces no esta listo en el primer intento.
 bool frontSensorInitialized = false;
 unsigned long lastFrontSensorAttempt = 0;
-const unsigned long frontSensorRetryInterval =
-    5000; // Reintentar cada 5 segundos
+const unsigned long frontSensorRetryInterval = 5000;
 volatile bool lateralSensorsEnabled = false;
 
 // ============================================================================
 // VARIABLES GLOBALES REFACTORIZADAS (usando estructuras de utils.h)
 // ============================================================================
 
-NavigationTarget navTarget;
 InterruptionContext intContext;
 EvasionTracker evasionTracker;
 CongregationState congregation;
+// Throttle del broadcast LEADER_POSITION que emite el lider.
+unsigned long lastLeaderCast = 0;
+
+// Ventana móvil sobre la pose que difunde el líder, para no propagar el ruido
+// de la cámara al goal de los seguidores. La usa SmoothLeaderPose().
+const int   LEADER_SMOOTH_N     = 4;
+const float LEADER_SMOOTH_RESET = 100.0f;
+float leaderSmX[LEADER_SMOOTH_N], leaderSmY[LEADER_SMOOTH_N];
+float leaderSmS[LEADER_SMOOTH_N], leaderSmC[LEADER_SMOOTH_N];
+int   leaderSmCount = 0, leaderSmIdx = 0;
+
+// Estado de los tres subsistemas de enjambre. Mientras la cámara conteste, la
+// navegación corre sobre robotPose; el EKF es el respaldo que la mantiene viva
+// cuando deja de contestar, y pasa a ser la fuente primaria con EKF_NAV.
+DisperseState disperse;
+EKFState ekf;
+SearchState search;
+
+// SEARCH_OBJECT: PWM de aproximación lenta, umbral de readProximity() a partir
+// del cual el objeto está al alcance, y tope de la fase de acercamiento.
+const int SEARCH_CREEP_PWM = 70;
+const uint8_t SEARCH_PROX_NEAR = 180;
+const unsigned long SEARCH_APPROACH_TIMEOUT = 6000;
+
+// Exposicion del canal de COLOR del APDS9960: ganancia (1/4/16/64x) y tiempo de
+// integracion en ms. El begin() de la libreria arranca en 4x y 10ms, y con eso
+// la arena da C≈30 sobre un fondo de escala de 65535: a ese nivel una cuenta es
+// el 10% del valor y las razones entre canales con las que decide MatchColor
+// son ruido de cuantizacion. Se barren en vivo con COLOR_READ|<ganancia>|<ms>.
+// NO tocan la proximidad, que corre por otro registro (PGAIN).
+// Medido en la arena el 2026-08-13 sobre el obstaculo beige: 4x/10ms daba C≈30
+// (ruido puro), 16x/50ms da C≈760 y 64x/100ms da C≈6200 sobre 65535 — ~1% de
+// precision en las razones entre canales y todavia 10x de margen antes de
+// saturar. El sensor resulto lineal en la exposicion a un 3%.
+const uint8_t COLOR_GAIN_DEFAULT = 64;
+const uint16_t COLOR_INTEGRATION_MS_DEFAULT = 100;
+// El tope de integracion no es el del chip (~709ms) sino el que HandleColorRead
+// puede esperar sin dejar de atender la red.
+const uint16_t COLOR_INTEGRATION_MS_MAX = 200;
+uint8_t colorGain = COLOR_GAIN_DEFAULT;
+uint16_t colorIntegrationMs = COLOR_INTEGRATION_MS_DEFAULT;
+
+// Balance de blancos del canal de color, POR ROBOT (COLOR_WB, persistido en
+// NVS). Cada canal se divide por lo que ESE sensor lee sobre el patron neutro
+// —el obstaculo beige de la arena—, con lo que el patron da (1,1,1) en todos y
+// un solo umbral vuelve a valer para la flota.
+//
+// Medido el 2026-08-13 con los 4 robots mirando el MISMO obstaculo desde casi
+// el MISMO punto (dispersion de luz 8.9%): la fraccion de azul iba de 0.239
+// (Atta_3) a 0.328 (Atta_2) — 37% entre piezas del mismo modelo y distinto
+// lote. Con eso Atta_3 daba el beige por ROJO (razon 1.518 contra el 1.5 de
+// umbral) de forma repetible, en dos exposiciones y dos posiciones.
+//
+// (0,0,0) = sin calibrar: MatchColor compara los canales crudos, como antes.
+uint16_t colorWbR = 0, colorWbG = 0, colorWbB = 0;
+// Cuanto tiene que destacar un canal sobre los otros dos para dar el color por
+// bueno. Con el balance puesto, el neutro queda en 1.0 en los tres canales, asi
+// que este numero pasa a ser margen limpio sobre el fondo.
+const float COLOR_MATCH_K = 1.5f;
+
 ObstacleState obstacles;
 MovementMetrics movement;
 LedController ledCtrl;
-Bug2State bug2;
-AutotuneState atState;
 
-// IMU — control de frecuencia de lectura
+// Lectura del IMU a 50Hz, por debajo del ODR del DMP (~112Hz).
 unsigned long lastImuRead = 0;
-const unsigned long imuReadInterval = 20;  // ms — 50Hz, por debajo del ODR del DMP (~112Hz)
+const unsigned long imuReadInterval = 20;
+
+// Reporte pasivo del EKF a la base, para VALIDARLO sin que controle nada.
+// El EKF corre siempre como observador (EKF_NAV arranca apagado), así que
+// mandando su pose se puede medir cuánto deriva contra el ArUco durante las
+// corridas normales: la base lo escribe en la misma fila del PositionLog que la
+// pose de cámara, y el error queda como una resta de columnas. Sin esto la única
+// forma de verlo era polear GET_STATUS a mano. 2Hz alcanza para medir deriva.
+unsigned long lastEkfReport = 0;
+const unsigned long ekfReportInterval = 500;
+
+// Navegación a ciegas: cuando la cámara no contesta el REQUEST_POSITION, el
+// robot sigue con la pose del EKF en vez de abandonar la navegación. Se limita
+// por dos lados porque la odometría sola se degrada rápido: un tope de pasos
+// seguidos sin ver la cámara, y un tope de incertidumbre del propio filtro. Al
+// pasarse cualquiera de los dos el robot se detiene y avisa, que es lo honesto;
+// lo que no puede pasar es lo de antes, quedarse quieto al primer timeout.
+int blindNavSteps = 0;
+const int BLIND_NAV_MAX_STEPS = 8;
+const float BLIND_NAV_MAX_SIGMA = 250.0f;
 
 // Variables de control de movimiento
 unsigned long currentMillis = millis();
@@ -187,8 +320,10 @@ bool isCentralCycleActive = false;
 bool maskLeftIR = false;
 bool maskRightIR = false;
 bool maskCentralIR = false;
+// Umbral de proximidad del APDS9960 central (0..255, mayor = más cerca).
+// Configurable en vivo con SENSOR_THRESHOLD|C|<n>[|SAVE] y persistido en NVS.
+int centralIRThreshold = 2;
 int cycleCounter = 0;
-int microsDifference;
 volatile unsigned long leftObsStartTime = 0;
 volatile unsigned long rightObsStartTime = 0;
 unsigned long centralObsStartTime = 0;
@@ -201,32 +336,44 @@ RobotState state = WAIT;
 float instructionValue = 100;
 bool movementReady = true;
 
-// Navegación reactiva unificada (GT + congregación)
+// Navegación reactiva unificada (GT + congregación). EKF_NAV|1 pasa la nav a la
+// pose del EKF en vez del ArUco crudo; arranca apagado para poder A/B-testearlo
+// contra el comportamiento conocido.
 ReactiveNav nav;
+bool ekfNavEnabled = false;
 
-// IMU-assisted TURN: giro cerrado en yaw — el arco restante se re-apunta con
-// el IMU en cada ciclo, y al final se corrige si quedó residuo
-bool  imuTurnActive   = false;
-bool  imuTurnIsCorrection = false;  // el residuo se cierra SIN brake-lead (lead=0);
-                                    // si no, en arcos chicos el coast reservado se
-                                    // come la corrección entera (cmd -5.3° → real 0.8°)
-int   imuTurnCorrCount = 0;         // correcciones hechas en este giro (tope: imuTurnMaxCorrections)
+// Giro cerrado en yaw: el arco restante se re-apunta con el IMU en cada ciclo y
+// al final se corrige el residuo. imuTurnPrevYaw sirve para el unwrap
+// incremental y imuTurnAccumDeg guarda el giro medido sin wrap, de modo que
+// soporta arcos de más de 180°. imuTurnTargetDeg lleva signo (+ = CCW).
+bool  imuTurnActive = false;
+bool  imuTurnIsCorrection = false;
+int   imuTurnCorrCount = 0;
 float imuTurnStartYaw = 0.0f;
-float imuTurnPrevYaw  = 0.0f;    // última lectura para unwrap incremental
-float imuTurnAccumDeg = 0.0f;    // giro acumulado medido por IMU (sin wrap, soporta >180°)
-float imuTurnTargetDeg = 0.0f;   // ángulo objetivo con signo (+ = CCW, - = CW)
-unsigned long imuTurnSettleUntil = 0;  // !=0: motores cortados, midiendo coast
-const float imuTurnBrakeLead = 3.0f;   // cortar motores N° antes: la inercia
-                                       // (coast, 2-12° medido vs ArUco) completa el giro
-const unsigned long imuTurnSettleMs = 400;  // ventana para que el coast termine
-                                            // antes de la verificación final
-const float imuTurnTolerance = 3.0f;   // residuo bajo el cual el giro se da por bueno;
-                                       // con corrección iterativa ahora sí aterriza acá
-const int imuTurnMaxCorrections = 4;   // tope de correcciones por giro — evita
-                                       // perseguir el ruido del gyro indefinidamente
+float imuTurnPrevYaw = 0.0f;
+float imuTurnAccumDeg = 0.0f;
+float imuTurnTargetDeg = 0.0f;
+unsigned long imuTurnSettleUntil = 0;
+
+// Constantes del giro asistido, todas medidas contra el ArUco:
+//   BrakeLead      cortar motores 3° antes, que la inercia (coast de 2-12°)
+//                  completa el giro;
+//   SettleMs       ventana para que ese coast termine antes de verificar;
+//   Tolerance      residuo bajo el cual el giro se da por bueno;
+//   MaxCorrections tope de correcciones por giro, para no perseguir el ruido
+//                  del gyro indefinidamente.
+// La corrección del residuo se hace SIN brake-lead (imuTurnIsCorrection): en
+// arcos chicos el coast reservado se comía la corrección entera, y un comando
+// de -5.3° terminaba girando 0.8°.
+const float imuTurnBrakeLead = 3.0f;
+const unsigned long imuTurnSettleMs = 400;
+const float imuTurnTolerance = 3.0f;
+const int imuTurnMaxCorrections = 4;
+
 const int instructionCompletedDelay = 400;
 std::array<float, 2> fsmInstruction;
 std::deque<std::array<float, 2>> instructionList;
+
 pose robotPose(0, 0, 0);
 
 // Evasión
@@ -243,7 +390,6 @@ pidController rightControl(kfPID, pidSpeed, samplingTimeS, minPWMValue,
                            maxPWMValue);
 
 // Hardware
-Servo frontServo;
 Adafruit_APDS9960 frontSensor;
 CRGB leds[NUM_LEDS];
 WiFiUDP udp;
@@ -268,30 +414,35 @@ void ReadUdpPackets();
 void SendMessage(IPAddress host, const char *message);
 void SendPose();
 void MessageDebugf(const char *format, ...);
-void CommunicationTest();
 
 // Sensores y control
 void ReadSensors();
+void SetColorExposure(uint8_t gain, uint16_t ms);
+void ReadColorRaw(uint16_t &r, uint16_t &g, uint16_t &b, uint16_t &c);
+void SaveColorWhiteBalance(uint16_t r, uint16_t g, uint16_t b);
 void ResetPID();
 void ConfigureHBridge(int leftWheelPWM, int rightWheelPWM);
 
 // Movimiento
 bool MoveDistanceByWheel(float leftDistance, float rightDistance);
 float DesiredSpeed(float distance, float wheelDistance);
-void RunAutotune();
-void FinishAutotune();
 bool IsStationary(float currentLeftSpeed, float currentRightSpeed,
                   float leftWheelDistance, float rightWheelDistance);
 void SelectMovementRW();
 
-// Navegación GT (Bug2 unificado)
-void InitiateBug2Navigation(float targetX, float targetY);
-void EnqueueNavStep(float targetX, float targetY, float maxSeg);
-void Bug2ProcessPosition();
-void Bug2WallFollowStep();
+// Navegación y congregación
+float SafeRingSlotAngle(float lx, float ly, int idx, int n, float nominalR,
+                        float bearing, bool useBearing, float *outR);
+void SmoothLeaderPose(float xIn, float yIn, float angIn,
+                      float *xOut, float *yOut, float *angOut);
+void UpdateCongregationGoal(float leaderX, float leaderY, float leaderAngle);
+void ReactiveNavStep();
+bool RequestPositionQueued();
 
 // Auxiliares
-std::array<String, 5> SeparateCommand(const String &command, char delimiter);
+std::array<String, 6> SeparateCommand(const String &command, char delimiter);
+void MaybeDisperseHop();
+int  MeetSlotIndex(float tx, float ty, float ring, int n);
 bool IsRobotObstacle(float x2, float y2, float angle, int sensors, String id);
 void ReadSerialCommands();
 // Nota: CalculateDistance, NormalizeAngle e InRange están definidas inline en utils.h
@@ -310,11 +461,17 @@ void setLedBlink(uint8_t red, uint8_t green, uint8_t blue,
 void setupIMU();
 void SaveIMUBias(biasStore* store);
 void LeerYaw();
+void EkfTick();
+bool MatchColor(const char *target, uint16_t r, uint16_t g, uint16_t b,
+                uint16_t c);
+void SearchEvadeAndResume();
 
 // ============================================================================
 // INTERRUPCIONES (ISR)
 // ============================================================================
 
+// Barre el bus I2C y lista lo que responde. Diagnostico de banco: si la IMU o
+// el APDS9960 no arrancan, esto dice si el problema es el cable o la libreria.
 void i2cScan() {
   Serial.println("\n=== I2C SCAN ===");
   int found = 0;
@@ -334,6 +491,9 @@ void i2cScan() {
   Serial.println("================\n");
 }
 
+// Encoder en cuadratura de la rueda izquierda. Compara la lectura anterior con
+// la nueva y suma o resta segun la transicion, de modo que el conteo lleva
+// signo y sobrevive a los rebotes.
 void IRAM_ATTR LeftWheelPulses() {
   int MSB = digitalRead(leftEncoderC2);
   int LSB = digitalRead(leftEncoderC1);
@@ -347,6 +507,7 @@ void IRAM_ATTR LeftWheelPulses() {
   pastLeftEncoder = encoder;
 }
 
+// Encoder en cuadratura de la rueda derecha, espejo del izquierdo.
 void IRAM_ATTR RightWheelPulses() {
   int MSB = digitalRead(rightEncoderC1);
   int LSB = digitalRead(rightEncoderC2);
@@ -360,18 +521,23 @@ void IRAM_ATTR RightWheelPulses() {
   pastRightEncoder = encoder;
 }
 
+// Flanco del infrarrojo izquierdo. Solo anota el instante: el filtro por
+// duracion minima corre en ReadSensors, fuera de la interrupcion.
 void IRAM_ATTR DetectLeftObstacle() {
   if (lateralSensorsEnabled && digitalRead(leftInfraredSensor) == LOW) {
     leftObsStartTime = micros();
   }
 }
 
+// Flanco del infrarrojo derecho, espejo del izquierdo.
 void IRAM_ATTR DetectRightObstacle() {
   if (lateralSensorsEnabled && digitalRead(rightInfraredSensor) == LOW) {
     rightObsStartTime = micros();
   }
 }
 
+// Aviso de bateria baja. Anota el instante para que el filtro por duracion
+// descarte los bajones momentaneos que produce el arranque de los motores.
 void LowBattery() {
   if (digitalRead(batteryStatus) == LOW) {
     lowBatteryTime = millis();
@@ -382,6 +548,9 @@ void LowBattery() {
 // FUNCIONES DE SETUP Y CONFIGURACIÓN
 // ============================================================================
 
+// Carga los pulsos por revolucion desde NVS, o guarda el valor por defecto la
+// primera vez. Cada robot tiene el suyo: se calibran contra ArUco y se midieron
+// diferencias de ~2% entre unidades.
 void InitializePPR() {
   preferences.begin("attabot-config", false);
 
@@ -400,6 +569,16 @@ void InitializePPR() {
   yawScale = preferences.getFloat("yaw_scale", 1.0f);
   DebugSerialPrintf("Yaw scale: %.4f\n", yawScale);
 
+  centralIRThreshold = preferences.getInt("ir_cen_thr", 2);
+  DebugSerialPrintf("Umbral IR central: %d\n", centralIRThreshold);
+
+  colorWbR = preferences.getUShort("cwb_r", 0);
+  colorWbG = preferences.getUShort("cwb_g", 0);
+  colorWbB = preferences.getUShort("cwb_b", 0);
+  DebugSerialPrintf("Balance de blancos del color: %u/%u/%u%s\n", colorWbR,
+                    colorWbG, colorWbB,
+                    (colorWbR && colorWbG && colorWbB) ? "" : " (SIN CALIBRAR)");
+
   preferences.end();
 
   uint64_t chipid = ESP.getEfuseMac();
@@ -407,6 +586,20 @@ void InitializePPR() {
                     (uint32_t)chipid);
 }
 
+// Persiste el vector del blanco del sensor de color. (0,0,0) lo desactiva.
+void SaveColorWhiteBalance(uint16_t r, uint16_t g, uint16_t b) {
+  colorWbR = r;
+  colorWbG = g;
+  colorWbB = b;
+  preferences.begin("attabot-config", false);
+  preferences.putUShort("cwb_r", r);
+  preferences.putUShort("cwb_g", g);
+  preferences.putUShort("cwb_b", b);
+  preferences.end();
+  DebugSerialPrintf("Balance de blancos guardado: %u/%u/%u\n", r, g, b);
+}
+
+// Persiste un PPR nuevo y recalcula lo que depende de el.
 void SavePPR(float newPPR) {
   preferences.begin("attabot-config", false);
   preferences.putFloat("ppr", newPPR);
@@ -414,6 +607,8 @@ void SavePPR(float newPPR) {
   DebugSerialPrintf("PPR guardado permanentemente: %.2f\n", newPPR);
 }
 
+// Carga las constantes del PID desde NVS, o guarda las de fabrica la primera
+// vez.
 void InitializePID() {
   preferences.begin("attabot-config", false);
   int   savedRes = preferences.getInt  ("pid_res", -1);
@@ -440,6 +635,7 @@ void InitializePID() {
   }
 }
 
+// Persiste constantes de PID nuevas.
 void SavePID(float kp, float ki, float kd) {
   preferences.begin("attabot-config", false);
   preferences.putInt  ("pid_res", pwm_resolution);
@@ -451,6 +647,8 @@ void SavePID(float kp, float ki, float kd) {
                     pwm_resolution, kp, ki, kd);
 }
 
+// Persiste los sesgos de giroscopo y acelerometro que dejo la calibracion del
+// DMP, para no tener que repetirla en cada arranque.
 void SaveIMUBias(biasStore* store) {
   preferences.begin("attabot-config", false);
   preferences.putInt("bias_gx", store->biasGyroX);
@@ -466,14 +664,22 @@ void SaveIMUBias(biasStore* store) {
   DebugSerialPrintln("Bias IMU guardados en Preferences");
 }
 
+// Recalcula la constante de conversion pulso->mm. Hay que llamarla despues de
+// cambiar el PPR o la circunferencia de rueda.
 void updateMillimetersPerPulse() {
   millimetersPerPulse = wheelCircumference / pulsesPerRev;
 }
 
+// Arranque: pines, PWM de motores, interrupciones de encoder e infrarrojos,
+// carga de la configuracion persistida, LED, IMU, sensor frontal, WiFi y OTA.
+//
+// El arranque se escalona con un retardo aleatorio: con varios robots
+// encendiendo a la vez, todos pedian IP en el mismo instante y el AP dejaba
+// afuera a alguno.
 void setup() {
 #ifdef DebugSerial
   Serial.begin(115200);
-  delay(500); // Dar tiempo al Serial Monitor para conectar
+  delay(500);
   Serial.println("\n\n=== INICIO DE SETUP ===");
 #endif
 
@@ -481,7 +687,7 @@ void setup() {
   // juntos Usa la MAC address como semilla para que cada robot tenga un delay
   // único
   randomSeed(ESP.getEfuseMac());
-  unsigned long startupDelay = random(100, 2000); // Entre 100ms y 2 segundos
+  unsigned long startupDelay = random(100, 2000);
   DebugSerialPrintf("Esperando %lu ms antes de iniciar WiFi...\n",
                     startupDelay);
   delay(startupDelay);
@@ -494,21 +700,39 @@ void setup() {
   InitializePID();
   DebugSerialPrintln("[1b] PID OK");
 
-  DebugSerialPrintln("[2] Inicializando servo...");
-  frontServo.setPeriodHertz(50);
-  frontServo.attach(frontServoPin, 1000, 2000);
-  frontServo.write(90);
-  DebugSerialPrintln("[2] Servo OK");
+  // Reloj del LEDC clavado en APB (80MHz), antes de cualquier canal (con
+  // canales ya tomados la llamada falla a propósito). Por defecto el driver va
+  // en LEDC_AUTO_CLK y lo elige el PRIMER periférico que se attachea; los
+  // motores a 1kHz/14-bit necesitan 16.384MHz de fuente, que solo sale de APB,
+  // y los 4 timers low-speed comparten un único mux de reloj. Cuando el servo
+  // frontal (50Hz/10-bit) se lo llevaba al reloj lento, los ledcAttach() de
+  // los motores fallaban y el robot no giraba ni avanzaba (2026-07-29). El
+  // servo ya no está, pero esto deja el reloj explícito en vez de heredado.
+  DebugSerialPrintln("[2] Fijando reloj del LEDC en APB...");
+  if (!ledcSetClockSource(LEDC_USE_APB_CLK))
+    DebugSerialPrintln("[2] AVISO: no se pudo fijar el reloj del LEDC en APB");
 
   DebugSerialPrintln("[3] Inicializando motores PWM...");
   bool pwmOk = ledcAttach(leftMotorForward,  pwm_freq, pwm_resolution)
              & ledcAttach(leftMotorBackward,  pwm_freq, pwm_resolution)
              & ledcAttach(rightMotorForward,  pwm_freq, pwm_resolution)
              & ledcAttach(rightMotorBackward, pwm_freq, pwm_resolution);
-  if (!pwmOk) DebugSerialPrintf("[3] ERROR: ledcAttach falló — freq=%d res=%d incompatibles\n",
+  if (!pwmOk) DebugSerialPrintf("[3] ERROR: ledcAttach falló — freq=%d res=%d "
+                                "incompatibles, o algo más se quedó con el "
+                                "reloj del LEDC (ver nota en [2])\n",
                                  pwm_freq, pwm_resolution);
-  DebugSerialPrintf("[3] Motores PWM: %dHz %d-bit (max=%d) %s\n",
-                    pwm_freq, pwm_resolution, maxPWMValue, pwmOk ? "OK" : "FALLO");
+  // Frecuencia REAL del timer, no la pedida: si el LEDC tuvo que ajustar (o si
+  // otro periférico le movió el reloj), acá se ve. Debe leer 1000Hz.
+  // ledcReadFreq() mide el CANAL y devuelve 0 si el duty es 0 (core 3.3.11,
+  // esp32-hal-ledc.c:411), y en el arranque las ruedas están quietas: hay que
+  // darle un duty mínimo para que la lectura sea legible. 1/16384 son 61ns de
+  // pulso, muy por debajo del 20% que el puente H necesita para mover el motor.
+  ledcWrite(leftMotorForward, 1);
+  uint32_t realPwmFreq = ledcReadFreq(leftMotorForward);
+  ledcWrite(leftMotorForward, 0);
+  DebugSerialPrintf("[3] Motores PWM: %dHz %d-bit (max=%d) %s — real=%uHz\n",
+                    pwm_freq, pwm_resolution, maxPWMValue, pwmOk ? "OK" : "FALLO",
+                    realPwmFreq);
 
   DebugSerialPrintln("[4] Inicializando I2C...");
   Wire.begin();
@@ -543,7 +767,8 @@ void setup() {
 
   DebugSerialPrintln("[8] Configurando encoders...");
   pinMode(leftEncoderC1, INPUT_PULLUP);
-  pinMode(leftEncoderC2, INPUT); // GPIO 35 es input-only, sin pull-up
+  // GPIO 35 es input-only y no admite pull-up interno.
+  pinMode(leftEncoderC2, INPUT);
                                  // (compatible con ESP32 Core 3.x)
   pinMode(rightEncoderC1, INPUT_PULLUP);
   pinMode(rightEncoderC2, INPUT_PULLUP);
@@ -590,2556 +815,4 @@ void setup() {
   delay(200);
 
   DebugSerialPrintln("\n=== SETUP COMPLETO ===\n");
-}
-
-// ============================================================================
-// LOOP PRINCIPAL
-// ============================================================================
-
-void loop() {
-  ledCtrl.update();
-  WiFiStatus();
-  if (WiFi.status() != WL_CONNECTED)
-    return;
-  ReadUdpPackets();
-  ReadSensors();
-  SetupFrontSensor();
-
-  // Lectura IMU no bloqueante — se ejecuta solo si la IMU está disponible
-  // y han pasado al menos imuReadInterval ms desde la última lectura.
-  if (imuAvailable && (millis() - lastImuRead >= imuReadInterval)) {
-    lastImuRead = millis();
-    LeerYaw();
-  }
-
-#ifdef DebugSerial
-  ReadSerialCommands();
-#endif
-
-  switch (state) {
-  case WAIT: {
-    ArduinoOTA.handle();
-
-    if ((millis() - movement.previousMillis) >= instructionValue) {
-      movement.previousMillis = millis();
-      ResetPID();
-      if (movementReady) {
-        state = READ_INSTRUCTION;
-      } else {
-        direction = '-';
-        state = REVERSE;
-      }
-    }
-
-    break;
-  }
-
-  case MOVE: {
-    movementReady = MoveDistanceByWheel(instructionValue, instructionValue);
-
-    if (movementReady) {
-      MessageDebugf("DEBUG: -1, ID: %s, Movimiento completado",
-                    robotID.c_str());
-      intContext.Clear();
-      isEvading = false;
-      state = STOP;
-
-    } else if (obstacles.HasAnyObstacle() && !isEvading) {
-      obstacles.UpdateBitmap();
-
-      intContext.wasInterrupted = true;
-      intContext.previousState = MOVE;
-      intContext.leftPulsesBeforeStop = movement.pastLeftPulseCount;
-      intContext.rightPulsesBeforeStop = movement.pastRightPulseCount;
-
-      float avgTraveled =
-          (movement.pastLeftPulseCount + movement.pastRightPulseCount) / 2.0 *
-          millimetersPerPulse;
-      intContext.remainingValue = instructionValue - avgTraveled;
-
-      isEvading = true;
-      evasionStartTime = millis();
-
-      MessageDebugf("DEBUG: -1, ID: %s, MOVE interrumpido: restante=%.1fmm",
-                    robotID.c_str(), intContext.remainingValue);
-
-      state = STOP;
-    }
-
-    break;
-  }
-
-  case TURN: {
-    // Capturar yaw inicial la primera vez que se entra al estado
-    if (imuAvailable && !imuTurnActive) {
-      imuTurnActive      = true;
-      imuTurnStartYaw    = yaw;
-      imuTurnPrevYaw     = yaw;
-      imuTurnAccumDeg    = 0.0f;
-      imuTurnSettleUntil = 0;
-      imuTurnTargetDeg = (instructionValue / centerToWheelDistance) * RAD_TO_DEG;
-    }
-
-    if (imuAvailable && imuTurnActive) {
-      // Giro cerrado en yaw: acumular el giro real con unwrap incremental y
-      // re-apuntar el arco restante en cada ciclo. El objetivo lo define el
-      // IMU, no la geometría supuesta — rueda loca, stiction y wheel_dist
-      // dejan de producir déficit.
-      float dYaw = yaw - imuTurnPrevYaw;
-      if (dYaw >  180.0f) dYaw -= 360.0f;
-      if (dYaw < -180.0f) dYaw += 360.0f;
-      imuTurnAccumDeg += dYaw * yawScale;  // grados físicos, no crudos del gyro
-      imuTurnPrevYaw   = yaw;
-
-      if (imuTurnSettleUntil != 0) {
-        // Motores ya cortados: seguir midiendo hasta que el coast termine,
-        // así la verificación final incluye la inercia (la cámara mostraba
-        // 2-12° de giro extra después del corte que el IMU no contaba)
-        if (millis() < imuTurnSettleUntil) {
-          break;
-        }
-        imuTurnSettleUntil = 0;
-
-        float delta = imuTurnAccumDeg;           // unwrapped: válido >180°
-        float error = imuTurnTargetDeg - delta;  // positivo = giró de menos
-        MessageDebugf("DEBUG: -1, ID: %s, TURN IMU: objetivo=%.1f° real=%.1f° error=%.1f° corr#%d (yaw %.1f→%.1f)",
-                      robotID.c_str(), imuTurnTargetDeg, delta, error,
-                      imuTurnCorrCount, imuTurnStartYaw, yaw);
-
-        if (abs(error) > imuTurnTolerance &&
-            imuTurnCorrCount < imuTurnMaxCorrections) {
-          // Closed-loop iterativo: encolar otra corrección y volver a medir
-          // tras su settle. Ya no es de un solo tiro — itera hasta |error|<tol
-          // o agotar imuTurnMaxCorrections. La corrección corre SIN brake-lead
-          // (ver rama de manejo) para que el arco chico no se cancele solo.
-          float corrArc = radians(error) * centerToWheelDistance;
-          fsmInstruction[0] = TURN;
-          fsmInstruction[1] = corrArc;
-          instructionList.push_front(fsmInstruction);
-          imuTurnIsCorrection = true;
-          imuTurnCorrCount++;
-          MessageDebugf("DEBUG: -1, ID: %s, TURN corrección #%d: %.1f° (arc=%.1fmm)",
-                        robotID.c_str(), imuTurnCorrCount, error, corrArc);
-        } else {
-          imuTurnIsCorrection = false;
-          imuTurnCorrCount    = 0;
-        }
-        imuTurnActive = false;
-        movementReady = true;
-      } else {
-        float leftTraveled  = movement.leftPulseCount * millimetersPerPulse;
-        float rightTraveled = movement.rightPulseCount * millimetersPerPulse;
-
-        // Failsafe: si el yaw no avanza (IMU muda/congelada), cerrar por
-        // encoders para no girar infinito
-        if (fabs(leftTraveled) > fabs(instructionValue) * 1.5f + 20.0f) {
-          MessageDebugf("DEBUG: -1, ID: %s, TURN failsafe: yaw estancado "
-                        "(%.1f° de %.1f°), cierro por encoders",
-                        robotID.c_str(), imuTurnAccumDeg, imuTurnTargetDeg);
-          imuTurnActive       = false;
-          imuTurnIsCorrection = false;
-          imuTurnCorrCount    = 0;
-          movementReady       = true;
-        } else {
-          // Frenar imuTurnBrakeLead antes del objetivo: la inercia completa el
-          // giro. PERO en una corrección el arco es chico y no hay momento que
-          // costear → lead=0; con lead la corrección se cancelaría a sí misma.
-          float lead = imuTurnIsCorrection
-                           ? 0.0f
-                           : ((imuTurnTargetDeg >= 0) ? imuTurnBrakeLead
-                                                      : -imuTurnBrakeLead);
-          float remainingArc =
-              radians(imuTurnTargetDeg - lead - imuTurnAccumDeg) *
-              centerToWheelDistance;
-          bool reached = MoveDistanceByWheel(leftTraveled + remainingArc,
-                                             rightTraveled - remainingArc);
-          if (reached) {
-            ConfigureHBridge(0, 0);
-            imuTurnSettleUntil = millis() + imuTurnSettleMs;
-          }
-          movementReady = false;  // el giro termina tras el settle
-        }
-      }
-    } else {
-      movementReady = MoveDistanceByWheel(instructionValue, -instructionValue);
-    }
-
-    if (movementReady) {
-      MessageDebugf("DEBUG: -1, ID: %s, Giro completado", robotID.c_str());
-      intContext.Clear();
-      isEvading = false;
-      state = STOP;
-
-    } else if (obstacles.HasAnyObstacle() && !isEvading) {
-      obstacles.UpdateBitmap();
-
-      intContext.wasInterrupted = true;
-      intContext.previousState = TURN;
-      intContext.leftPulsesBeforeStop = movement.pastLeftPulseCount;
-
-      float traveled = movement.pastLeftPulseCount * millimetersPerPulse;
-      intContext.remainingValue = instructionValue - traveled;
-
-      isEvading = true;
-      evasionStartTime = millis();
-
-      float angleRemaining =
-          (intContext.remainingValue / centerToWheelDistance) * RAD_TO_DEG;
-      MessageDebugf("DEBUG: -1, ID: %s, TURN interrumpido: restante=%.1f°",
-                    robotID.c_str(), angleRemaining);
-
-      if (obstacles.centralObstacle) {
-        movementReady = false;
-      }
-
-      imuTurnActive = false;  // cancelar seguimiento IMU si el giro fue interrumpido
-      imuTurnIsCorrection = false;
-      imuTurnCorrCount = 0;
-      state = STOP;
-    }
-
-    break;
-  }
-
-  case RANDOM_WALK: {
-    if (previousMillisRW == 0) {
-      previousMillisRW = millis();
-    }
-
-    currentMillis = millis();
-    millisDifference = currentMillis - previousMillisRW;
-    if (millisDifference < instructionValue) {
-      previousMillisRW = currentMillis;
-      fsmInstruction[0] = RANDOM_WALK;
-      fsmInstruction[1] = instructionValue - millisDifference;
-      instructionList.push_front(fsmInstruction);
-      SelectMovementRW();
-    } else {
-      previousMillisRW = 0;
-      MessageDebugf("DEBUG: -1, ID: %s, Random Walk terminado",
-                    robotID.c_str());
-    }
-
-    state = READ_INSTRUCTION;
-    break;
-  }
-
-  case REVERSE: {
-    movementReady = MoveDistanceByWheel(reverseDistance, reverseDistance);
-
-    if (movementReady) {
-      obstacleDetected = true;
-      MessageDebugf("DEBUG: -1, ID: %s, Retroceso completado", robotID.c_str());
-      state = STOP;
-    } else if (obstacles.HasAnyObstacle() && !isEvading) {
-      MessageDebugf("DEBUG: -1, ID: %s, Obstáculo durante retroceso!",
-                    robotID.c_str());
-      state = STOP;
-    }
-
-    break;
-  }
-
-  case STOP: {
-    ConfigureHBridge(0, 0);
-
-    if (movementReady == true) {
-      if (!intContext.wasInterrupted) {
-        isEvading = false;
-        resumeScheduled = false;
-      }
-
-      state = WAIT;
-      instructionValue = instructionCompletedDelay;
-
-    } else {
-      SendPose();
-      state = IDENTIFY_OBSTACLE;
-    }
-
-    break;
-  }
-
-  case READ_INSTRUCTION: {
-    if (!isEvading && !intContext.wasInterrupted) {
-
-      obstacles.Clear();
-    }
-
-    if (!instructionList.empty()) {
-      fsmInstruction = instructionList.front();
-      instructionList.pop_front();
-      instructionValue = fsmInstruction[1];
-      state = static_cast<RobotState>(fsmInstruction[0]);
-      direction = instructionValue > 0 ? '+' : '-';
-
-    } else {
-      state = WAIT;
-      instructionValue = instructionCompletedDelay;
-    }
-
-    break;
-  }
-
-  case MESSAGE_BASE: {
-    const char *message = "";
-    if (instructionValue == 1) {
-      message = "READY";
-    }
-
-    SendMessage(robots["Base"], message);
-    state = WAIT;
-    instructionValue = instructionCompletedDelay;
-
-    break;
-  }
-
-  case IDENTIFY_OBSTACLE: {
-    currentMillis = millis();
-    if (obstacles.robotDetected) {
-      state = WAIT;
-      instructionValue = instructionCompletedDelay / 2;
-      MessageDebugf("DEBUG: -1, ID: %s, Obstáculo encontrado es robot id: %s",
-                    robotID.c_str(), obstacles.fromRobotID.c_str());
-    } else if ((currentMillis - movement.previousMillis) >= obstacleWaitTime) {
-      movement.previousMillis = currentMillis;
-      state = ACTIVE_EVASION;
-      instructionValue = 0;
-      MessageDebugf("DEBUG: -1, ID: %s, Obstáculo encontrado no es un robot",
-                    robotID.c_str());
-    }
-
-    break;
-  }
-
-  case REQUEST_POSITION: {
-    if (robots.find("Base") == robots.end() ||
-        robots["Base"] == IPAddress(0, 0, 0, 0)) {
-      MessageDebugf("DEBUG: -1, ID: %s, No hay IP de base — abortando nav",
-                    robotID.c_str());
-      congregation.CompleteRequest();
-      bug2.Reset();
-      state = WAIT;
-      instructionValue = 500;
-      break;
-    }
-
-    if (!congregation.waitingForResponse) {
-      // Mensaje enriquecido para Bug2; estándar para el resto
-      char reqMsg[96];
-      if (bug2.isActive) {
-        const char *subStr =
-            (bug2.subState == Bug2State::GOAL_SEEK) ? "SEEK" : "WALL";
-        snprintf(reqMsg, sizeof(reqMsg), "REQUEST_POSITION|BUG2|%s|%d|%.0f",
-                 subStr, bug2.wallFollowSteps,
-                 CalculateDistance(robotPose.x, robotPose.y,
-                                   bug2.goalX, bug2.goalY));
-      } else {
-        strcpy(reqMsg, "REQUEST_POSITION");
-      }
-      SendMessage(robots["Base"], reqMsg);
-      MessageDebugf("DEBUG: -1, ID: %s, Solicitud enviada: %s",
-                    robotID.c_str(), reqMsg);
-      congregation.StartRequest();
-    }
-
-    if (congregation.HasTimedOut()) {
-      MessageDebugf("DEBUG: -1, ID: %s, Timeout en REQUEST_POSITION",
-                    robotID.c_str());
-      congregation.CompleteRequest();
-
-      if (bug2.isActive || bug2.pendingInit) {
-        // Reintentar: la navegación sigue activa
-        fsmInstruction[0] = REQUEST_POSITION;
-        fsmInstruction[1] = 0;
-        instructionList.push_back(fsmInstruction);
-        MessageDebugf("DEBUG: -1, ID: %s, Reintentando REQUEST_POSITION",
-                      robotID.c_str());
-      } else {
-        bug2.Reset();
-      }
-
-      state = WAIT;
-      instructionValue = 500;
-      break;
-    }
-
-    if (congregation.positionReceived) {
-      MessageDebugf("DEBUG: -1, ID: %s, Posición recibida",
-                    robotID.c_str());
-      congregation.CompleteRequest();
-      congregation.positionReceived = false;
-
-      // nav activo: obstáculo ya en obstacles struct, ReactiveNavStep lo procesará
-      state = READ_INSTRUCTION;
-      instructionValue = 0;
-    }
-
-    break;
-  }
-
-  case ACTIVE_EVASION: {
-    if (!obstacles.HasAnyObstacle()) {
-      // Sin obstáculo real — puede haber desaparecido entre detección y aquí
-      MessageDebugf(
-          "DEBUG: -1, ID: %s, ACTIVE_EVASION sin obstáculo. Abortando.",
-          robotID.c_str());
-      obstacles.Clear();
-      state = READ_INSTRUCTION;
-      break;
-    }
-
-    // Si solo disparó el sensor frontal APDS9960 (sin IR laterales),
-    // normalizarlo como obstáculo central para el pattern matching.
-    if (obstacles.obstacleSensors == 0 && obstacles.centralObstacle) {
-      obstacles.obstacleSensors = 0b010;
-    }
-
-    unsigned long timeSinceDetection = millis() - evasionStartTime;
-    if (timeSinceDetection > 1500) {
-      MessageDebugf("DEBUG: -1, ID: %s, Datos de obstáculo obsoletos (%lums). "
-                    "Re-escaneando.",
-                    robotID.c_str(), timeSinceDetection);
-      state = STOP;
-      break;
-    }
-
-    // GT activo: registrar hit y dejar que Bug2WallFollowStep maneje el rodeo
-    if (bug2.isActive) {
-      if (bug2.subState == Bug2State::GOAL_SEEK) {
-        bug2.RecordHitPoint(robotPose.x, robotPose.y);
-        MessageDebugf(
-            "DEBUG: -1, ID: %s, GT: obstáculo en SEEK -> hitPoint (%.1f,%.1f), "
-            "iniciando WALL_FOLLOW",
-            robotID.c_str(), robotPose.x, robotPose.y);
-      } else {
-        MessageDebugf("DEBUG: -1, ID: %s, GT: obstáculo en WALL_FOLLOW, "
-                      "re-evaluando",
-                      robotID.c_str());
-      }
-
-      instructionList.clear();
-      obstacleDetected = false;
-      // isEvading se mantiene true: READ_INSTRUCTION lo usaría para NO limpiar obstacles.
-      // Bug2WallFollowStep los limpia después de leerlos.
-      resumeScheduled = false;
-      intContext.Clear();
-      // No limpiar obstacles: Bug2WallFollowStep necesita el estado actual de sensores
-
-      fsmInstruction[0] = REQUEST_POSITION;
-      fsmInstruction[1] = 0;
-      instructionList.push_back(fsmInstruction);
-
-      state = READ_INSTRUCTION;
-      break;
-    }
-
-    evasionTracker.RecordEvasion();
-
-    int avoidanceDistance = 0;
-    int avoidanceAngle = 0;
-    bool needsRetreat = evasionTracker.ShouldRetreat();
-
-    if (needsRetreat) {
-      MessageDebugf(
-          "DEBUG: -1, ID: %s, Ejecutando retroceso forzado (evasiones: %d)",
-          robotID.c_str(), evasionTracker.consecutiveEvasions);
-
-      std::deque<std::array<float, 2>> retreatSequence;
-
-      fsmInstruction[0] = REVERSE;
-      fsmInstruction[1] = reverseDistance * 3;
-      retreatSequence.push_back(fsmInstruction);
-
-      fsmInstruction[0] = TURN;
-      fsmInstruction[1] =
-          radians(random(2) ? 180 : -180) * centerToWheelDistance;
-      retreatSequence.push_back(fsmInstruction);
-
-      fsmInstruction[0] = MOVE;
-      fsmInstruction[1] = 300;
-      retreatSequence.push_back(fsmInstruction);
-
-      for (auto it = retreatSequence.rbegin(); it != retreatSequence.rend();
-           ++it) {
-        instructionList.push_front(*it);
-      }
-
-      evasionTracker.Reset();
-
-    } else {
-      if (obstacles.obstacleSensors == 0b100) {
-        avoidanceAngle = 45;
-        avoidanceDistance = 120;
-      } else if (obstacles.obstacleSensors == 0b001) {
-        avoidanceAngle = -45;
-        avoidanceDistance = 120;
-      } else if (obstacles.obstacleSensors == 0b010) {
-        avoidanceAngle = (random(2) == 0) ? 60 : -60;
-        avoidanceDistance = 150;
-      } else if (obstacles.obstacleSensors == 0b110) {
-        avoidanceAngle = 90;
-        avoidanceDistance = 150;
-      } else if (obstacles.obstacleSensors == 0b011) {
-        avoidanceAngle = -90;
-        avoidanceDistance = 150;
-      } else if (obstacles.obstacleSensors == 0b111) {
-        avoidanceAngle = (random(2) == 0) ? 135 : -135;
-        avoidanceDistance = 100;
-      }
-
-      if (!obstacles.HasAnyObstacle()) {
-        MessageDebugf("DEBUG: -1, ID: %s, Obstáculo desapareció durante "
-                      "cálculo de evasión",
-                      robotID.c_str());
-        obstacles.Clear();
-        state = READ_INSTRUCTION;
-        break;
-      }
-
-      std::deque<std::array<float, 2>> evasionSequence;
-
-      if (obstacles.obstacleSensors & 0b010 ||
-          obstacles.obstacleSensors == 0b111) {
-        fsmInstruction[0] = REVERSE;
-        fsmInstruction[1] = reverseDistance * 1.5;
-        evasionSequence.push_back(fsmInstruction);
-      }
-
-      if (avoidanceAngle != 0) {
-        fsmInstruction[0] = TURN;
-        fsmInstruction[1] = radians(avoidanceAngle) * centerToWheelDistance;
-        evasionSequence.push_back(fsmInstruction);
-      }
-
-      if (avoidanceDistance > 0) {
-        fsmInstruction[0] = MOVE;
-        fsmInstruction[1] = avoidanceDistance;
-        evasionSequence.push_back(fsmInstruction);
-      }
-
-      for (auto it = evasionSequence.rbegin(); it != evasionSequence.rend();
-           ++it) {
-        instructionList.push_front(*it);
-      }
-    }
-
-    if (intContext.wasInterrupted && !resumeScheduled) {
-      fsmInstruction[0] = RESUME_AFTER_EVASION;
-      fsmInstruction[1] = 0;
-      instructionList.push_back(fsmInstruction);
-      resumeScheduled = true;
-    }
-
-    obstacleDetected = false;
-
-    state = READ_INSTRUCTION;
-
-    MessageDebugf("DEBUG: -1, ID: %s, Evasión: patrón=%s, giro=%d°, "
-                  "avance=%dmm, forzado=%d",
-                  robotID.c_str(), obstacles.GetObstaclePattern().c_str(),
-                  avoidanceAngle, avoidanceDistance, needsRetreat);
-
-    break;
-  }
-
-  case RESUME_AFTER_EVASION: {
-    if (!intContext.wasInterrupted) {
-      resumeScheduled = false;
-      obstacles.Clear();
-      state = READ_INSTRUCTION;
-      break;
-    }
-
-    MessageDebugf(
-        "DEBUG: -1, ID: %s, Resumiendo: estado=%d, valor=%.1f",
-        robotID.c_str(), intContext.previousState, intContext.remainingValue);
-
-    if (bug2.isActive || nav.isActive) {
-      // Navegación activa: re-solicitar posición para recalcular ruta en vez
-      // de terminar a ciegas el segmento interrumpido (nav.isActive faltaba
-      // tras la migración a ReactiveNav — causaba desvíos largos al evadir)
-      MessageDebugf(
-          "DEBUG: -1, ID: %s, GT activo: solicitando posición post-evasión",
-          robotID.c_str());
-      fsmInstruction[0] = REQUEST_POSITION;
-      fsmInstruction[1] = 0;
-      instructionList.push_front(fsmInstruction);
-
-    } else {
-      switch (intContext.previousState) {
-      case MOVE: {
-        if (intContext.remainingValue > 20) {
-          fsmInstruction[0] = MOVE;
-          fsmInstruction[1] = intContext.remainingValue;
-          instructionList.push_front(fsmInstruction);
-
-          MessageDebugf("DEBUG: -1, ID: %s, Reanudando MOVE: %.1fmm restantes",
-                        robotID.c_str(), intContext.remainingValue);
-        }
-        break;
-      }
-
-      case TURN: {
-        float angleRemaining = abs(
-            (intContext.remainingValue / centerToWheelDistance) * RAD_TO_DEG);
-        if (angleRemaining > 5) {
-          fsmInstruction[0] = TURN;
-          fsmInstruction[1] = intContext.remainingValue;
-          instructionList.push_front(fsmInstruction);
-
-          MessageDebugf("DEBUG: -1, ID: %s, Reanudando TURN: %.1f° restantes",
-                        robotID.c_str(), angleRemaining);
-        }
-        break;
-      }
-      }
-    }
-
-    intContext.Clear();
-    resumeScheduled = false;
-    isEvading = false;
-    obstacles.Clear();
-
-    evasionTracker.Reset();
-
-    state = READ_INSTRUCTION;
-    break;
-  }
-
-    // =========================================================================
-    // BUG2 FSM CASES
-    // =========================================================================
-
-  case BUG2_SEEK: {
-    // Avance hacia el objetivo. Si hay obstáculo, pasa a WALL_FOLLOW.
-    if (obstacleDetected && obstacles.HasAnyObstacle()) {
-      MessageDebugf(
-          "DEBUG: -1, ID: %s, GT SEEK: obstáculo detectado -> WALL_FOLLOW",
-          robotID.c_str());
-
-      bug2.RecordHitPoint(robotPose.x, robotPose.y);
-      instructionList.clear();
-      obstacleDetected = false;
-      isEvading = true;  // evita que READ_INSTRUCTION limpie obstacles antes de WallFollowStep
-
-      state = ACTIVE_EVASION;
-      intContext.wasInterrupted = true;
-      intContext.previousState = BUG2_SEEK;
-    } else {
-      state = READ_INSTRUCTION;
-    }
-    break;
-  }
-
-  case BUG2_WALL_FOLLOW: {
-    // Rodeo de obstáculo. Si se detecta otro obstáculo, re-evalúa.
-    if (obstacleDetected && obstacles.HasAnyObstacle()) {
-      MessageDebugf(
-          "DEBUG: -1, ID: %s, GT WALL_FOLLOW: obstáculo adicional detectado",
-          robotID.c_str());
-
-      instructionList.clear();
-      obstacleDetected = false;
-      isEvading = true;  // evita que READ_INSTRUCTION limpie obstacles
-
-      state = ACTIVE_EVASION;
-      intContext.wasInterrupted = true;
-      intContext.previousState = BUG2_WALL_FOLLOW;
-    } else {
-      state = READ_INSTRUCTION;
-    }
-    break;
-  }
-
-  case AUTOTUNE: {
-    RunAutotune();
-    break;
-  }
-  }
-}
-
-// ============================================================================
-// FUNCIONES DE NAVEGACIÓN GT (Bug2 unificado — GOAL_SEEK + WALL_FOLLOW)
-// ============================================================================
-
-// Código legado — ya no se llama. Se mantiene para referencia durante refactor.
-void InitiateIterativeNavigation(float targetX, float targetY) {
-  navTarget.targetX = targetX;
-  navTarget.targetY = targetY;
-  navTarget.StartNavigation();
-
-  MessageDebugf(
-      "DEBUG: -1, ID: %s, Navegación iterativa iniciada: objetivo=(%.1f, %.1f)",
-      robotID.c_str(), targetX, targetY);
-
-  fsmInstruction[0] = REQUEST_POSITION;
-  fsmInstruction[1] = 0;
-  instructionList.push_back(fsmInstruction);
-}
-
-void CalculateIterativeMovement() {
-  if (!navTarget.isActive) {
-    MessageDebugf("DEBUG: -1, ID: %s, NavigationTarget no está activo",
-                  robotID.c_str());
-    return;
-  }
-
-  if (navTarget.HasExceededMaxIterations()) {
-    MessageDebugf("DEBUG: -1, ID: %s, Límite de iteraciones alcanzado (%d). "
-                  "Abortando navegación.",
-                  robotID.c_str(), navTarget.maxIterations);
-    navTarget.Reset();
-    return;
-  }
-
-  if (navTarget.HasTimedOut()) {
-    MessageDebugf(
-        "DEBUG: -1, ID: %s, Timeout de navegación (>5min). Abortando.",
-        robotID.c_str());
-    navTarget.Reset();
-    return;
-  }
-
-  navTarget.currentIteration++;
-
-  float deltaX = navTarget.targetX - robotPose.x;
-  float deltaY = navTarget.targetY - robotPose.y;
-  float totalDistance = sqrt(deltaX * deltaX + deltaY * deltaY);
-
-  MessageDebugf("DEBUG: -1, ID: %s, Iteración %d: pos=(%.1f,%.1f), "
-                "target=(%.1f,%.1f), dist=%.1fmm",
-                robotID.c_str(), navTarget.currentIteration, robotPose.x,
-                robotPose.y, navTarget.targetX, navTarget.targetY,
-                totalDistance);
-
-  if (navTarget.IsInLoop(robotPose.x, robotPose.y)) {
-    MessageDebugf("DEBUG: -1, ID: %s, LOOP DETECTADO. Abortando navegación.",
-                  robotID.c_str());
-    navTarget.Reset();
-    return;
-  }
-
-  if (!navTarget.IsMakingProgress(totalDistance)) {
-    MessageDebugf(
-        "DEBUG: -1, ID: %s, Sin progreso en %d iteraciones. Abortando.",
-        robotID.c_str(), navTarget.maxIterationsWithoutProgress);
-    navTarget.Reset();
-    return;
-  }
-
-  navTarget.RecordPosition(robotPose.x, robotPose.y);
-
-  if (totalDistance < navTarget.arrivalThreshold) {
-    MessageDebugf("DEBUG: -1, ID: %s, Objetivo alcanzado. Distancia final: "
-                  "%.1fmm (iteraciones: %d)",
-                  robotID.c_str(), totalDistance, navTarget.currentIteration);
-    navTarget.Reset();
-    return;
-  }
-
-  float targetAngle = atan2(deltaY, deltaX) * RAD_TO_DEG;
-  float angleDiff = NormalizeAngle(targetAngle - robotPose.angle);
-
-  float segmentDistance;
-
-  if (totalDistance <= navTarget.segmentDistance) {
-    segmentDistance = totalDistance * 0.9;
-  } else {
-    segmentDistance = navTarget.segmentDistance;
-  }
-
-  segmentDistance = constrain(segmentDistance, navTarget.minSegmentDistance,
-                              navTarget.maxSegmentDistance);
-
-  MessageDebugf(
-      "DEBUG: -1, ID: %s, Segmento: dist=%.1fmm, ángulo=%.1f°, progreso=%d/%d",
-      robotID.c_str(), segmentDistance, angleDiff,
-      navTarget.maxIterationsWithoutProgress -
-          navTarget.iterationsWithoutProgress,
-      navTarget.maxIterationsWithoutProgress);
-
-  if (abs(angleDiff) > 5) {
-    fsmInstruction[0] = TURN;
-    fsmInstruction[1] = radians(angleDiff) * centerToWheelDistance;
-    instructionList.push_back(fsmInstruction);
-  }
-
-  if (segmentDistance > navTarget.minSegmentDistance) {
-    fsmInstruction[0] = MOVE;
-    fsmInstruction[1] = segmentDistance;
-    instructionList.push_back(fsmInstruction);
-  }
-
-  fsmInstruction[0] = REQUEST_POSITION;
-  fsmInstruction[1] = 0;
-  instructionList.push_back(fsmInstruction);
-
-  MessageDebugf("DEBUG: -1, ID: %s, Programando REQUEST_POSITION para "
-                "siguiente iteración",
-                robotID.c_str());
-}
-
-// ============================================================================
-// FUNCIONES DE NAVEGACIÓN BUG 2
-// ============================================================================
-
-// ============================================================================
-// NAVEGACIÓN REACTIVA UNIFICADA — GT y Congregación
-// ============================================================================
-
-// Ejecuta un paso de navegación hacia (nav.goalX, nav.goalY).
-// Calcula el ángulo hacia el objetivo y aplica bias reactivo si hay obstáculo
-// en los sensores IR. Encola TURN+WAIT+MOVE+WAIT+REQUEST_POSITION.
-// Llamar desde el handler de POSITION_RESPONSE cuando nav.isActive.
-void ReactiveNavStep() {
-  float x = robotPose.x;
-  float y = robotPose.y;
-
-  if (nav.HasReached(x, y)) {
-    MessageDebugf("DEBUG: -1, ID: %s, NAV: llegó a (%.1f,%.1f)",
-                  robotID.c_str(), x, y);
-    nav.Reset();
-    instructionList.clear();
-    return;
-  }
-
-  if (nav.HasTimedOut()) {
-    MessageDebugf("DEBUG: -1, ID: %s, NAV: timeout", robotID.c_str());
-    nav.Reset();
-    return;
-  }
-
-  float dx   = nav.goalX - x;
-  float dy   = nav.goalY - y;
-  float dist = sqrt(dx * dx + dy * dy);
-
-  float goalAngle = atan2(dy, dx) * RAD_TO_DEG;
-
-  // ── Capa reactiva de obstáculos ──────────────────────────────────────────
-  bool frontBlocked = obstacles.centralObstacle || obstacles.IsFrontalObstacle();
-  bool rightBlocked = obstacles.rightObstacle;
-  bool leftBlocked  = obstacles.leftObstacle;
-  obstacles.Clear();
-  isEvading = false;
-
-  float bias    = 0.0f;
-  float seg     = constrain(dist * 0.9f, 10.0f, nav.segmentDistance);
-  bool avoiding = false;
-
-  if (frontBlocked) {
-    // Elegir lado de evasión hacia el objetivo para "doblar" correctamente
-    float relGoal = NormalizeAngle(goalAngle - robotPose.angle);
-    bias    = (relGoal >= 0.0f) ? -nav.avoidFrontAngle : nav.avoidFrontAngle;
-    seg     = nav.avoidSegment;
-    avoiding = true;
-  } else if (rightBlocked) {
-    bias    = nav.avoidSideAngle;   // bias izquierda
-    seg     = nav.avoidSegment;
-    avoiding = true;
-  } else if (leftBlocked) {
-    bias    = -nav.avoidSideAngle;  // bias derecha
-    seg     = nav.avoidSegment;
-    avoiding = true;
-  }
-
-  float finalAngle = NormalizeAngle(goalAngle + bias);
-  float angleDiff  = NormalizeAngle(finalAngle - robotPose.angle);
-
-  MessageDebugf("DEBUG: -1, ID: %s, NAV: dist=%.1f goal=%.1f° bias=%.1f° seg=%.1f%s",
-                robotID.c_str(), dist, goalAngle, bias, seg,
-                avoiding ? " [AVOID]" : "");
-
-  if (abs(angleDiff) > 5.0f) {
-    fsmInstruction[0] = TURN;
-    fsmInstruction[1] = radians(angleDiff) * centerToWheelDistance;
-    instructionList.push_back(fsmInstruction);
-    fsmInstruction[0] = WAIT;
-    fsmInstruction[1] = 300;
-    instructionList.push_back(fsmInstruction);
-  }
-
-  if (seg > 10.0f) {
-    fsmInstruction[0] = MOVE;
-    fsmInstruction[1] = seg;
-    instructionList.push_back(fsmInstruction);
-    fsmInstruction[0] = WAIT;
-    fsmInstruction[1] = 300;
-    instructionList.push_back(fsmInstruction);
-  }
-
-  fsmInstruction[0] = REQUEST_POSITION;
-  fsmInstruction[1] = 0;
-  instructionList.push_back(fsmInstruction);
-}
-
-void InitiateBug2Navigation(float targetX, float targetY) {
-  bug2.Start(robotPose.x, robotPose.y, targetX, targetY);
-
-  MessageDebugf(
-      "DEBUG: -1, ID: %s, GT iniciado: start=(%.1f,%.1f), goal=(%.1f,%.1f)",
-      robotID.c_str(), robotPose.x, robotPose.y, targetX, targetY);
-  // No enqueues REQUEST_POSITION — el caller ya tiene robotPose válida y
-  // llama Bug2ProcessPosition() directamente para evitar un round-trip extra.
-}
-
-// Encola TURN + MOVE + REQUEST_POSITION hacia (targetX, targetY).
-// seg: distancia máxima del segmento. Compartido por GOAL_SEEK y futuros algoritmos.
-void EnqueueNavStep(float targetX, float targetY, float maxSeg) {
-  float deltaX = targetX - robotPose.x;
-  float deltaY = targetY - robotPose.y;
-  float dist   = sqrt(deltaX * deltaX + deltaY * deltaY);
-
-  float targetAngle = atan2(deltaY, deltaX) * RAD_TO_DEG;
-  float angleDiff   = NormalizeAngle(targetAngle - robotPose.angle);
-
-  float seg = (dist <= maxSeg) ? dist * 0.9f : maxSeg;
-  seg = constrain(seg, 10.0f, maxSeg);
-
-  if (abs(angleDiff) > 5.0f) {
-    fsmInstruction[0] = TURN;
-    fsmInstruction[1] = radians(angleDiff) * centerToWheelDistance;
-    instructionList.push_back(fsmInstruction);
-  }
-  if (seg > 10.0f) {
-    fsmInstruction[0] = MOVE;
-    fsmInstruction[1] = seg;
-    instructionList.push_back(fsmInstruction);
-  }
-  fsmInstruction[0] = WAIT;
-  fsmInstruction[1] = 300;
-  instructionList.push_back(fsmInstruction);
-  fsmInstruction[0] = REQUEST_POSITION;
-  fsmInstruction[1] = 0;
-  instructionList.push_back(fsmInstruction);
-}
-
-void Bug2ProcessPosition() {
-  if (!bug2.isActive) {
-    MessageDebugf("DEBUG: -1, ID: %s, Bug2 no está activo", robotID.c_str());
-    return;
-  }
-
-  float currentX = robotPose.x;
-  float currentY = robotPose.y;
-
-  // ¿Llegó al objetivo?
-  if (bug2.HasReachedGoal(currentX, currentY)) {
-    MessageDebugf("DEBUG: -1, ID: %s, Bug2: OBJETIVO ALCANZADO en (%.1f, %.1f)",
-                  robotID.c_str(), currentX, currentY);
-    bug2.Reset();
-    instructionList.clear();  // cancelar TURNs/MOVEs residuales de pasos anteriores
-    return;
-  }
-
-  // ¿Timeout?
-  if (bug2.HasTimedOut()) {
-    MessageDebugf("DEBUG: -1, ID: %s, Bug2: TIMEOUT. Abortando navegación.",
-                  robotID.c_str());
-    bug2.Reset();
-    return;
-  }
-
-  if (bug2.subState == Bug2State::GOAL_SEEK) {
-    // === GOAL SEEK: ir directo al objetivo ===
-    float distance = CalculateDistance(currentX, currentY, bug2.goalX, bug2.goalY);
-    MessageDebugf("DEBUG: -1, ID: %s, GT SEEK: dist=%.1fmm",
-                  robotID.c_str(), distance);
-    EnqueueNavStep(bug2.goalX, bug2.goalY, bug2.seekSegmentDistance);
-
-  } else if (bug2.subState == Bug2State::WALL_FOLLOW) {
-    // === WALL FOLLOW: rodear obstáculo ===
-    bug2.wallFollowSteps++;
-
-    MessageDebugf("DEBUG: -1, ID: %s, Bug2 WALL_FOLLOW: paso %d, "
-                  "pos=(%.1f,%.1f), distM=%.1f",
-                  robotID.c_str(), bug2.wallFollowSteps, currentX, currentY,
-                  bug2.DistanceToMLine(currentX, currentY));
-
-    // ¿Puede dejar de seguir la pared? (Condición Bug 2)
-    if (bug2.ShouldLeaveWall(currentX, currentY)) {
-      MessageDebugf("DEBUG: -1, ID: %s, Bug2: Cruzó Línea M más cerca del "
-                    "objetivo. Volviendo a SEEK.",
-                    robotID.c_str());
-      bug2.subState = Bug2State::GOAL_SEEK;
-
-      // Recalcular y volver a SEEK
-      fsmInstruction[0] = REQUEST_POSITION;
-      fsmInstruction[1] = 0;
-      instructionList.push_back(fsmInstruction);
-      return;
-    }
-
-    // ¿Loop completo? (el objetivo es inalcanzable)
-    if (bug2.HasCompletedLoop(currentX, currentY)) {
-      MessageDebugf("DEBUG: -1, ID: %s, Bug2: LOOP COMPLETO detectado. "
-                    "Objetivo inalcanzable.",
-                    robotID.c_str());
-      bug2.Reset();
-      return;
-    }
-
-    // ¿Demasiados pasos?
-    if (bug2.HasExceededMaxSteps()) {
-      MessageDebugf("DEBUG: -1, ID: %s, Bug2: Máximo de pasos WALL_FOLLOW "
-                    "alcanzado. Abortando.",
-                    robotID.c_str());
-      bug2.Reset();
-      return;
-    }
-
-    // Ejecutar un paso de seguimiento de pared
-    Bug2WallFollowStep();
-  }
-}
-
-void Bug2WallFollowStep() {
-  float turnAngle = 0;
-  float moveDistance = bug2.wallFollowSegment;
-
-  // Leer sensores de obstáculos actuales, luego limpiar estado para siguientes ciclos
-  bool frontBlocked =
-      obstacles.centralObstacle || obstacles.IsFrontalObstacle();
-  bool rightBlocked = obstacles.rightObstacle;
-  bool leftBlocked = obstacles.leftObstacle;
-  isEvading = false;
-  obstacles.Clear();
-
-  // Determinar dirección de rodeo en el primer paso si no fue asignada por comando
-  if (!bug2.directionAutoSet) {
-    if (rightBlocked && !leftBlocked) {
-      bug2.wallFollowDirection = 1;
-    } else if (leftBlocked && !rightBlocked) {
-      bug2.wallFollowDirection = -1;
-    }
-    // Si frontal o ambos lados: mantener dirección actual (default 1)
-    bug2.directionAutoSet = true;
-    MessageDebugf("DEBUG: -1, ID: %s, Bug2 WF: dirección auto=%d (L=%d,C=%d,R=%d)",
-                  robotID.c_str(), bug2.wallFollowDirection,
-                  (int)leftBlocked, (int)frontBlocked, (int)rightBlocked);
-  }
-
-  if (frontBlocked) {
-    bug2.lostWallSteps = 0;
-    turnAngle = -90 * bug2.wallFollowDirection;
-    moveDistance = 0;
-    MessageDebugf("DEBUG: -1, ID: %s, Bug2 WF: Pared frontal -> Girar %.0f°",
-                  robotID.c_str(), turnAngle);
-  } else if (rightBlocked && bug2.wallFollowDirection == 1) {
-    bug2.lostWallSteps = 0;
-    turnAngle = 0;
-    MessageDebugf(
-        "DEBUG: -1, ID: %s, Bug2 WF: Pared derecha -> Avanzar paralelo",
-        robotID.c_str());
-  } else if (leftBlocked && bug2.wallFollowDirection == -1) {
-    bug2.lostWallSteps = 0;
-    turnAngle = 0;
-    MessageDebugf(
-        "DEBUG: -1, ID: %s, Bug2 WF: Pared izquierda -> Avanzar paralelo",
-        robotID.c_str());
-  } else {
-    bug2.lostWallSteps++;
-    if (bug2.lostWallSteps >= bug2.maxLostWallSteps) {
-      MessageDebugf(
-          "DEBUG: -1, ID: %s, Bug2 WF: Sin pared por %d pasos -> GOAL_SEEK",
-          robotID.c_str(), bug2.lostWallSteps);
-      bug2.lostWallSteps = 0;
-      bug2.subState = Bug2State::GOAL_SEEK;
-      fsmInstruction[0] = REQUEST_POSITION;
-      fsmInstruction[1] = 0;
-      instructionList.push_back(fsmInstruction);
-      return;
-    }
-    turnAngle = bug2.wallFollowTurnAngle * bug2.wallFollowDirection;
-    MessageDebugf(
-        "DEBUG: -1, ID: %s, Bug2 WF: Sin pared (%d/%d) -> Girar %.0f°",
-        robotID.c_str(), bug2.lostWallSteps, bug2.maxLostWallSteps, turnAngle);
-  }
-
-  if (abs(turnAngle) > 1) {
-    fsmInstruction[0] = TURN;
-    fsmInstruction[1] = radians(turnAngle) * centerToWheelDistance;
-    instructionList.push_back(fsmInstruction);
-    // Pausa post-giro: deja que el robot pare y los sensores IR se estabilicen
-    // antes de la siguiente detección de obstáculos
-    fsmInstruction[0] = WAIT;
-    fsmInstruction[1] = 300;
-    instructionList.push_back(fsmInstruction);
-  }
-
-  if (moveDistance > 10) {
-    fsmInstruction[0] = MOVE;
-    fsmInstruction[1] = moveDistance;
-    instructionList.push_back(fsmInstruction);
-    fsmInstruction[0] = WAIT;
-    fsmInstruction[1] = 300;
-    instructionList.push_back(fsmInstruction);
-  }
-
-  fsmInstruction[0] = REQUEST_POSITION;
-  fsmInstruction[1] = 0;
-  instructionList.push_back(fsmInstruction);
-}
-
-// ============================================================================
-// FUNCIONES DE SENSORES Y HARDWARE
-// ============================================================================
-
-void SetupFrontSensor() {
-  if (frontSensorInitialized)
-    return;
-
-  unsigned long now = millis();
-
-  // CORRECCIÓN CLAVE: Permite la ejecución si es el primer intento
-  // (lastFrontSensorAttempt == 0), o si han pasado 5 segundos desde el último
-  // intento fallido.
-  if (lastFrontSensorAttempt != 0 &&
-      (now - lastFrontSensorAttempt < frontSensorRetryInterval)) {
-    return;
-  }
-
-  lastFrontSensorAttempt = now;
-
-  DebugSerialPrintln("Intentando inicializar APDS9960...");
-
-  if (frontSensor.begin()) {
-    frontSensorInitialized = true;
-    ledCtrl.setOff();
-    DebugSerialPrintln(" Sensor APDS-9960 inicializado correctamente");
-  } else {
-    DebugSerialPrintln(
-        " Falló la inicialización del sensor APDS-9960. Reintentando...");
-    ledCtrl.setBlink(255, 128, 0, maxBrightness, 500);
-  }
-}
-
-void WiFiStatus() {
-  static uint8_t lastStatus = 255; // Inicializar con valor inválido
-  uint8_t currentStatus = WiFi.status();
-
-  // Debug: mostrar cambios de estado
-  if (currentStatus != lastStatus) {
-    const char *statusStr[] = {
-        "WL_IDLE_STATUS",     // 0
-        "WL_NO_SSID_AVAIL",   // 1
-        "WL_SCAN_COMPLETED",  // 2
-        "WL_CONNECTED",       // 3
-        "WL_CONNECT_FAILED",  // 4
-        "WL_CONNECTION_LOST", // 5
-        "WL_DISCONNECTED"     // 6
-    };
-    if (currentStatus <= 6) {
-      DebugSerialPrintf("WiFi Status cambió: %s (%d)\n",
-                        statusStr[currentStatus], currentStatus);
-    }
-    lastStatus = currentStatus;
-  }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    static bool wifiConnecting = false;
-    static unsigned long lastWifiAttempt = 0;
-    static int retryCount = 0;
-
-    if (!wifiConnecting) {
-      ConfigureHBridge(0, 0);
-      DebugSerialPrintln("=== Iniciando conexión WiFi ===");
-      DebugSerialPrintf("SSID: %s\n", ssid);
-      DebugSerialPrintf("MAC: %s\n", WiFi.macAddress().c_str());
-      DebugSerialPrintf("Hostname: %s\n", WiFi.getHostname());
-      ledCtrl.setBlink(0, 255, 255, maxBrightness, 250);
-      wifiConnecting = true;
-      lastWifiAttempt = millis();
-      retryCount = 0;
-    }
-
-    // Timeout de conexión: reintentar después de 10 segundos
-    if (millis() - lastWifiAttempt > 10000) {
-      retryCount++;
-      DebugSerialPrintf("⚠ Timeout WiFi (intento #%d). Estado: %d\n",
-                        retryCount, WiFi.status());
-
-      // Después de 3 intentos, hacer un reset más agresivo
-      if (retryCount >= 3) {
-        DebugSerialPrintln(
-            "🔴 Múltiples fallos. Reiniciando WiFi completamente...");
-        WiFi.mode(WIFI_OFF);
-        delay(500);
-        WiFi.mode(WIFI_STA);
-        String hostname = "AttaBot-" + String((uint32_t)ESP.getEfuseMac(), HEX);
-        WiFi.setHostname(hostname.c_str());
-        retryCount = 0;
-      }
-
-      WiFi.disconnect();
-      delay(100);
-      WiFi.begin(ssid, password);
-      lastWifiAttempt = millis();
-    }
-
-    return;
-  } else {
-    static bool firstConnect = true;
-    if (firstConnect) {
-      DebugSerialPrintln("=== ✓ WiFi CONECTADO ===");
-      DebugSerialPrintf("IP: %s\n", WiFi.localIP().toString().c_str());
-      DebugSerialPrintf("Gateway: %s\n", WiFi.gatewayIP().toString().c_str());
-      DebugSerialPrintf("Subnet: %s\n", WiFi.subnetMask().toString().c_str());
-      DebugSerialPrintf("DNS: %s\n", WiFi.dnsIP().toString().c_str());
-      DebugSerialPrintf("MAC: %s\n", WiFi.macAddress().c_str());
-      DebugSerialPrintf("Hostname: %s\n", WiFi.getHostname());
-      DebugSerialPrintf("RSSI: %d dBm\n", WiFi.RSSI());
-      DebugSerialPrintln("=======================");
-      firstConnect = false;
-    }
-    ledCtrl.setOff();
-  }
-}
-
-void ReadSensors() {
-  if (((millis() - movement.previousMillis) <= samplingTime - 2) ||
-      isLateralCycleActive || isCentralCycleActive || (debugUdp == 3)) {
-    currentMicros = micros();
-    if (currentMicros - previousMicros >= observationTime) {
-      previousMicros = currentMicros;
-      cycleCounter = (cycleCounter + 1) % numberOfCycles;
-
-      isLateralCycleActive = (lateralCycle == cycleCounter);
-
-      if (isLateralCycleActive != lateralSensorsEnabled) {
-        lateralSensorsEnabled = isLateralCycleActive;
-        digitalWrite(enableLeftInfraredSensor, lateralSensorsEnabled);
-        digitalWrite(enableRightInfraredSensor, lateralSensorsEnabled);
-
-        if (lateralSensorsEnabled) {
-          noInterrupts();
-          leftObsStartTime = micros();
-          rightObsStartTime = micros();
-          interrupts();
-        }
-      }
-
-      isCentralCycleActive = (centralCycle == cycleCounter);
-
-      // GUARDIA 1: Solo intenta habilitar la proximidad si el sensor ya está
-      // inicializado.
-      if (frontSensorInitialized) {
-        frontSensor.enableProximity(isCentralCycleActive);
-      }
-    }
-
-    if (isLateralCycleActive) {
-      noInterrupts();
-      unsigned long leftTime = leftObsStartTime;
-      unsigned long rightTime = rightObsStartTime;
-      interrupts();
-
-      unsigned long now = micros();
-      obstacles.leftObstacle = !maskLeftIR &&
-                               (digitalRead(leftInfraredSensor) == LOW) &&
-                               ((now - leftTime) >= minObstacleTime);
-      obstacles.rightObstacle = !maskRightIR &&
-                                (digitalRead(rightInfraredSensor) == LOW) &&
-                                ((now - rightTime) >= minObstacleTime);
-    }
-
-    if (isCentralCycleActive) {
-      // GUARDIA 2: Solo intenta leer la proximidad si el sensor ya está
-      // inicializado.
-      if (frontSensorInitialized) {
-        centralDistance = frontSensor.readProximity();
-        if (centralDistance > 2 && !maskCentralIR) {
-          obstacles.centralObstacle =
-              (micros() - centralObsStartTime) >= minObstacleTime / 2;
-        } else {
-          centralObsStartTime = micros();
-          obstacles.centralObstacle = false;
-        }
-      } else {
-        // Si no está inicializado, asumimos que no hay obstáculo
-        obstacles.centralObstacle = false;
-      }
-    }
-  }
-
-  if (debugUdp == 3) {
-    if (obstacles.HasAnyObstacle()) {
-      ledCtrl.setSolid(255, 128, 0, maxBrightness);
-    } else {
-      ledCtrl.setOff();
-    }
-  } else {
-    if ((digitalRead(batteryStatus) == LOW) &&
-        ((millis() - lowBatteryTime) >= minLowBatteryTime)) {
-      ledCtrl.setSolid(255, 255, 0, 255);
-    }
-  }
-
-  if (isEvading && (millis() - evasionStartTime > evasionCooldown)) {
-    isEvading = false;
-    MessageDebugf("DEBUG: -1, ID: %s, Cooldown de evasión completado",
-                  robotID.c_str());
-  }
-}
-
-// ============================================================================
-// FUNCIONES DE CONTROL DE MOTORES
-// ============================================================================
-
-void ResetPID() {
-  leftControl.Reset();
-  rightControl.Reset();
-  debugCounter = 0;
-  movement.Reset();
-}
-
-void ConfigureHBridge(int leftWheelPWM, int rightWheelPWM) {
-  if (leftWheelPWM >= 0) {
-    ledcWrite(leftMotorBackward, 0);
-    ledcWrite(leftMotorForward, leftWheelPWM);
-  } else {
-    ledcWrite(leftMotorForward, 0);
-    ledcWrite(leftMotorBackward, abs(leftWheelPWM));
-  }
-
-  if (rightWheelPWM >= 0) {
-    ledcWrite(rightMotorBackward, 0);
-    ledcWrite(rightMotorForward, rightWheelPWM);
-  } else {
-    ledcWrite(rightMotorForward, 0);
-    ledcWrite(rightMotorBackward, abs(rightWheelPWM));
-  }
-}
-
-float DesiredSpeed(float distance, float wheelDistance) {
-  float remainingDistance = distance - wheelDistance;
-  float desiredSpeed = maxSpeed;
-  if (abs(remainingDistance) < speedReductionThreshold) {
-    desiredSpeed = map(abs(remainingDistance), 0, speedReductionThreshold,
-                       minSpeed, maxSpeed);
-  }
-
-  return (remainingDistance < 0) ? -desiredSpeed : desiredSpeed;
-}
-
-bool IsStationary(float currentLeftSpeed, float currentRightSpeed,
-                  float leftWheelDistance, float rightWheelDistance) {
-  bool speedsAtZero =
-      (static_cast<int>(abs(currentLeftSpeed) + abs(currentRightSpeed)) == 0);
-  bool wheelsHaveMoved =
-      (static_cast<int>(abs(leftWheelDistance) + abs(rightWheelDistance)) != 0);
-  if (!speedsAtZero) {
-    movement.steadyStatePreviousMillis = millis();
-  } else if ((millis() - movement.steadyStatePreviousMillis >=
-              SteadyStateTime) &&
-             wheelsHaveMoved) {
-    return true;
-  }
-
-  return false;
-}
-
-// ============================================================================
-// AUTOTUNING PID — Relay Method (Åström-Hägglund)
-// ============================================================================
-
-// Procesa un semiciclo del relay para una rueda.
-// Detecta cruce por cero con histéresis, registra semiperíodo y amplitud.
-static void RelayWheelStep(float currentSpeed, float setpoint,
-                            int8_t &relay, int8_t &prevSign,
-                            unsigned long &lastCross, float &peak,
-                            float *halfPeriods, float *amps, int &samples,
-                            unsigned long now, bool record,
-                            float hyst) {
-  float error = setpoint - currentSpeed;
-  if (fabsf(error) > peak) peak = fabsf(error);
-
-  int8_t sig = (error > hyst) ? 1 : (error < -hyst) ? -1 : 0;
-  if (sig != 0 && sig != prevSign) {
-    if (record && prevSign != 0 && samples < AutotuneState::kMaxSamples) {
-      float hp = (now - lastCross) / 1000.0f;
-      if (hp > 0.02f && hp < 30.0f) {  // descarta ruido (<20ms) y stalls (>30s)
-        halfPeriods[samples] = hp;
-        amps[samples]        = peak;
-        samples++;
-      }
-    }
-    relay     = sig;
-    prevSign  = sig;
-    lastCross = now;
-    peak      = 0.0f;
-  }
-}
-
-void FinishAutotune() {
-  auto mean = [](const float *arr, int n) -> float {
-    float s = 0.0f;
-    for (int i = 0; i < n; i++) s += arr[i];
-    return s / n;
-  };
-
-  float tuL = 2.0f * mean(atState.halfPeriodsL, atState.samplesL);
-  float auL = mean(atState.ampsL, atState.samplesL);
-  float tuR = 2.0f * mean(atState.halfPeriodsR, atState.samplesR);
-  float auR = mean(atState.ampsR, atState.samplesR);
-
-  // Solo mezclar ruedas con suficientes muestras; una sola muestra es ruido
-  float tu, au;
-  const char *wheelsUsed;
-  bool okL = atState.samplesL >= AutotuneState::kMinSamples;
-  bool okR = atState.samplesR >= AutotuneState::kMinSamples;
-  if (okL && okR) {
-    tu = (tuL + tuR) * 0.5f;
-    au = (auL + auR) * 0.5f;
-    wheelsUsed = "L+R";
-  } else if (okR) {
-    tu = tuR; au = auR;
-    wheelsUsed = "R";
-  } else {
-    tu = tuL; au = auL;
-    wheelsUsed = "L";
-  }
-
-  float ku = (4.0f * atState.relayPWM) / (PI * au);
-
-  // Tyreus-Luyben: más conservador que ZN clásico, mejor para motores con ruido
-  float kp = ku / 3.2f;
-  float ki = ku / (7.04f * tu);
-  float kd = ku * tu / 20.16f;
-
-  atState.pendingKp = kp;
-  atState.pendingKi = ki;
-  atState.pendingKd = kd;
-  atState.phase     = AutotuneState::DONE;
-  state = WAIT;
-
-  char buf[200];
-  snprintf(buf, sizeof(buf),
-           "AUTOTUNE OK [%s] sL=%d sR=%d: Tu=%.2fs Au=%.1f Ku=%.1f => Kp=%.2f Ki=%.2f Kd=%.3f | SAVEPID para guardar",
-           wheelsUsed, atState.samplesL, atState.samplesR, tu, au, ku, kp, ki, kd);
-  SendMessage(robots["Base"], buf);
-}
-
-void RunAutotune() {
-  currentMillis = millis();
-  millisDifference = currentMillis - movement.previousMillis;
-  if (millisDifference < samplingTime) return;
-  movement.previousMillis = currentMillis;
-
-  float leftSpeed  = (float)(movement.leftPulseCount  - movement.pastLeftPulseCount)
-                   * millimetersPerPulse / samplingTimeS;
-  float rightSpeed = (float)(movement.rightPulseCount - movement.pastRightPulseCount)
-                   * millimetersPerPulse / samplingTimeS;
-  movement.pastLeftPulseCount  = movement.leftPulseCount;
-  movement.pastRightPulseCount = movement.rightPulseCount;
-
-  unsigned long now = millis();
-  bool record = (atState.phase == AutotuneState::MEASURING);
-
-  RelayWheelStep(leftSpeed,   atState.setpointMms,  atState.relayL, atState.prevSignL,
-                 atState.lastCrossL, atState.peakL,
-                 atState.halfPeriodsL, atState.ampsL, atState.samplesL,
-                 now, record, atState.hysteresisMms);
-
-  RelayWheelStep(rightSpeed,  atState.setpointMms,  atState.relayR, atState.prevSignR,
-                 atState.lastCrossR, atState.peakR,
-                 atState.halfPeriodsR, atState.ampsR, atState.samplesR,
-                 now, record, atState.hysteresisMms);
-
-  // Marcha recta: relay=+1 → adelante → velocidad positiva sube hacia setpoint positivo.
-  ConfigureHBridge(atState.relayL * (int)atState.relayPWM,
-                   atState.relayR * (int)atState.relayPWM);
-
-  if (atState.phase == AutotuneState::WARMUP) {
-    if (now - atState.phaseStart >= AutotuneState::kWarmupMs) {
-      atState.phase      = AutotuneState::MEASURING;
-      atState.phaseStart = now;
-      // Reiniciar estado de medición limpio tras el precalentamiento
-      atState.lastCrossL = atState.lastCrossR = now;
-      atState.prevSignL  = atState.prevSignR  = 0;
-      atState.samplesL   = atState.samplesR   = 0;
-      atState.peakL      = atState.peakR      = 0.0f;
-    }
-    return;
-  }
-
-  // Diagnóstico periódico cada 4s
-  static unsigned long lastAutotuneLog = 0;
-  if (now - lastAutotuneLog >= 4000) {
-    lastAutotuneLog = now;
-    char dbg[120];
-    snprintf(dbg, sizeof(dbg),
-             "AUTOTUNE DBG: vL=%.1f vR=%.1f sL=%d sR=%d relL=%d relR=%d",
-             leftSpeed, rightSpeed, atState.samplesL, atState.samplesR,
-             (int)atState.relayL, (int)atState.relayR);
-    SendMessage(robots["Base"], dbg);
-  }
-
-  if (now - atState.phaseStart >= AutotuneState::kTimeoutMs) {
-    ConfigureHBridge(0, 0);
-    atState.Abort();
-    state = WAIT;
-    char buf[100];
-    snprintf(buf, sizeof(buf),
-             "AUTOTUNE: timeout — sL=%d sR=%d (necesita %d cada uno)",
-             atState.samplesL, atState.samplesR, AutotuneState::kMinSamples);
-    SendMessage(robots["Base"], buf);
-    return;
-  }
-
-  if (atState.HasEnoughSamples()) {
-    ConfigureHBridge(0, 0);
-    FinishAutotune();
-  }
-}
-
-bool MoveDistanceByWheel(float leftDistance, float rightDistance) {
-  currentMillis = millis();
-  millisDifference = currentMillis - movement.previousMillis;
-  if (millisDifference < samplingTime) {
-    return false;
-  }
-
-  movement.previousMillis = currentMillis;
-
-  movement.currentLeftSpeed =
-      ((movement.leftPulseCount - movement.pastLeftPulseCount) *
-       millimetersPerPulse) /
-      samplingTimeS;
-  movement.pastLeftPulseCount = movement.leftPulseCount;
-  movement.currentRightSpeed =
-      ((movement.rightPulseCount - movement.pastRightPulseCount) *
-       millimetersPerPulse) /
-      samplingTimeS;
-  movement.pastRightPulseCount = movement.rightPulseCount;
-
-  float leftWheelDistance = movement.pastLeftPulseCount * millimetersPerPulse;
-  float desiredLeftSpeed = DesiredSpeed(leftDistance, leftWheelDistance);
-  int leftWheelPWM =
-      leftControl.Calculate(desiredLeftSpeed, movement.currentLeftSpeed);
-
-  float rightWheelDistance = movement.pastRightPulseCount * millimetersPerPulse;
-  float desiredRightSpeed = DesiredSpeed(rightDistance, rightWheelDistance);
-  int rightWheelPWM =
-      rightControl.Calculate(desiredRightSpeed, movement.currentRightSpeed);
-
-  ConfigureHBridge(leftWheelPWM, rightWheelPWM);
-  bool IsMoveFinished =
-      ((abs(leftWheelDistance) + distanceOffset) >= abs(leftDistance)) &&
-      ((abs(rightWheelDistance) + distanceOffset) >= abs(rightDistance));
-  IsMoveFinished =
-      IsMoveFinished ||
-      IsStationary(movement.currentLeftSpeed, movement.currentRightSpeed,
-                   leftWheelDistance, rightWheelDistance);
-
-  if (debugUdp >= 2) {
-    MessageDebugf(debugMessage, debugCounter, robotID.c_str(), direction,
-                  movement.leftPulseCount, movement.rightPulseCount,
-                  movement.currentLeftSpeed, movement.currentRightSpeed,
-                  leftWheelPWM, rightWheelPWM, leftControl.error,
-                  rightControl.error, leftControl.sumError,
-                  rightControl.sumError, leftWheelDistance, rightWheelDistance,
-                  millisDifference);
-  }
-
-  return IsMoveFinished;
-}
-
-// ============================================================================
-// FUNCIONES DE COMUNICACIÓN
-// ============================================================================
-
-void SendMessage(IPAddress host, const char *message) {
-  udp.beginPacket(host, localPort);
-  udp.write(reinterpret_cast<const uint8_t *>(message), strlen(message));
-  udp.endPacket();
-}
-
-void MessageDebugf(const char *format, ...) {
-  char buffer[200];
-  va_list args;
-  va_start(args, format);
-  vsnprintf(buffer, sizeof(buffer), format, args);
-  va_end(args);
-
-  DebugSerialPrintln(buffer);
-  if (debugUdp != 0) {
-    SendMessage(robots["Base"], buffer);
-  }
-
-  debugCounter++;
-}
-
-void SendPose() {
-  obstacles.robotDetected = false;
-  const char *message = "CHECK_OBSTACLE|%d|%.1f|%.1f|%.1f";
-  char buffer[40];
-  snprintf(buffer, sizeof(buffer), message, obstacles.obstacleSensors,
-           robotPose.x, robotPose.y, robotPose.angle);
-  SendMessage(robots["Broadcast"], buffer);
-  movement.previousMillis = millis();
-}
-
-std::array<String, 5> SeparateCommand(const String &command, char delimiter) {
-  std::array<String, 5> results;
-  int startIndex = 0;
-  int endIndex;
-  int count = 0;
-
-  while (count < results.size()) {
-    endIndex = command.indexOf(delimiter, startIndex);
-    if (endIndex == -1) {
-      results[count] = command.substring(startIndex);
-      break;
-    } else {
-      results[count] = command.substring(startIndex, endIndex);
-      startIndex = endIndex + 1;
-    }
-    count++;
-  }
-
-  return results;
-}
-
-bool IsRobotObstacle(float x2, float y2, float angle, int sensors, String id) {
-  float deltaX = x2 - robotPose.x;
-  float deltaY = y2 - robotPose.y;
-
-  float distanceBetweenRobots = sqrt(deltaX * deltaX + deltaY * deltaY);
-  if (distanceBetweenRobots > robotDistanceMargin) {
-    return false;
-  }
-
-  float angleBetweenRobots = atan2f(deltaY, deltaX) * RAD_TO_DEG + 180;
-  float angleDifference = angleBetweenRobots - angle;
-https://meet.google.com/fdh-njby-vde?hs=224
-  if (angleDifference > 180) {
-    angleDifference -= 360;
-  } else if (angleDifference < -180) {
-    angleDifference += 360;
-  }
-
-  MessageDebugf("DEBUG: -1, ID: %s, From ID: %s, Distancia: %.1f, Angulo: "
-                "%.1f, DifAngulo: %.1f, sensors: %d",
-                robotID.c_str(), id.c_str(), distanceBetweenRobots,
-                angleBetweenRobots, angleDifference, sensors);
-
-  if (abs(angleDifference) <= maxRobotAngleMargin) {
-    if (sensors == 0b100 && angleDifference <= 0) {
-      return true;
-    } else if (sensors == 0b001 && angleDifference >= 0) {
-      return true;
-    } else if (sensors != 0b100 && sensors != 0b001) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-// ============================================================================
-// FUNCIÓN DE LECTURA DE PAQUETES UDP (REFACTORIZADA)
-// ============================================================================
-
-void ReadUdpPackets() {
-  int packetBytes = udp.parsePacket();
-  if (!packetBytes) {
-    return;
-  }
-
-  int len = udp.read(receivedPacket, sizeof(receivedPacket) - 1);
-  if (len > 0) {
-    receivedPacket[len] = 0;
-  }
-  DebugSerialPrintf("Recibidos %d bytes de %s: %s\n", packetBytes,
-                    udp.remoteIP().toString().c_str(), receivedPacket);
-
-  String command(receivedPacket);
-  std::array<String, 5> arguments = SeparateCommand(command, '|');
-  command = arguments[0];
-
-  // CONFIG
-  if (command == "CONFIG") {
-    if (arguments[1] == "START") {
-      robots["Base"] = udp.remoteIP();
-      IPAddress ipAddress;
-      ipAddress.fromString(arguments[2]);
-      robots["Broadcast"] = ipAddress;
-      // Reset completo: limpia cualquier navegación activa de sesiones anteriores
-      bug2.Reset();
-      navTarget.Reset();
-      instructionList.clear();
-      isEvading = false;
-      obstacles.Clear();
-      state = STOP;
-      SendMessage(robots["Base"], "CONFIG|RECEIVED");
-      debugUdp = 0;
-      countMessages = 0;
-      sendMessages = 0;
-
-    } else if (arguments[1] == "SAVE") {
-      robots[arguments[2]] = udp.remoteIP();
-
-    } else if (arguments[1] == "ROBOTS") {
-      for (const auto &pair : robots) {
-        DebugSerialPrintf("Nombre: %s, IP: %s\n", pair.first.c_str(),
-                          pair.second.toString().c_str());
-      }
-
-    } else if (arguments[1] == "DEBUG") {
-      debugUdp = arguments[2].toInt();
-      SendMessage(robots["Base"], debugUdp != 0 ? "Modo debug activado"
-                                                : "Modo debug desactivado");
-
-    } else {
-      robotID = arguments[1];
-      char buffer[50];
-      snprintf(buffer, sizeof(buffer), "CONFIG|SAVE|%s", robotID.c_str());
-      SendMessage(robots["Broadcast"], buffer);
-    }
-  }
-
-  // INSTRUCCIONES DE MOVIMIENTO
-  else if (command == "MOVE" || command == "TURN" || command == "WAIT" ||
-           command == "RANDOMW" || command == "MESSAGE_BASE") {
-    short value = arguments[1].toInt();
-
-    if (command == "MOVE") {
-      fsmInstruction[0] = MOVE;
-      fsmInstruction[1] = value;
-    } else if (command == "TURN") {
-      fsmInstruction[0] = TURN;
-      fsmInstruction[1] = radians(value) * centerToWheelDistance;
-    } else if (command == "WAIT") {
-      fsmInstruction[0] = WAIT;
-      fsmInstruction[1] = value * 1000;
-    } else if (command == "RANDOMW") {
-      fsmInstruction[0] = RANDOM_WALK;
-      fsmInstruction[1] = value * 1000;
-    } else if (command == "MESSAGE_BASE") {
-      fsmInstruction[0] = MESSAGE_BASE;
-      fsmInstruction[1] = arguments[1].toInt();
-    }
-    instructionList.push_back(fsmInstruction);
-  }
-
-  // AUTOTUNE — inicia test de relay para calcular PID por robot
-  // Uso: AUTOTUNE           — inicia con parámetros por defecto
-  //      AUTOTUNE ABORT     — aborta test en curso
-  else if (command == "AUTOTUNE") {
-    if (arguments[1] == "ABORT") {
-      if (atState.IsActive()) {
-        ConfigureHBridge(0, 0);
-        atState.Abort();
-        state = WAIT;
-        SendMessage(robots["Base"], "AUTOTUNE: abortado");
-      } else {
-        SendMessage(robots["Base"], "AUTOTUNE: ningún test en curso");
-      }
-    } else if (state == WAIT) {
-      // relay alto (75%) + setpoint bajo (25%) garantiza que el motor cruza el setpoint
-      float relayAmp = maxPWMValue * 0.75f;
-      float setpoint = maxSpeed   * 0.25f;
-      atState.Begin(setpoint, relayAmp, 3.0f);
-      movement.pastLeftPulseCount  = movement.leftPulseCount;
-      movement.pastRightPulseCount = movement.rightPulseCount;
-      movement.previousMillis = millis();
-      ResetPID();
-      state = AUTOTUNE;
-      char buf[90];
-      snprintf(buf, sizeof(buf),
-               "AUTOTUNE iniciado: setpoint=%.1fmm/s relay=%d PWM (robot oscila adelante/atras ~60s)",
-               setpoint, (int)relayAmp);
-      SendMessage(robots["Base"], buf);
-    } else {
-      SendMessage(robots["Base"], "AUTOTUNE: el robot debe estar en WAIT");
-    }
-  }
-
-  // SAVEPID — guarda en flash los gains calculados por AUTOTUNE
-  else if (command == "SAVEPID") {
-    if (atState.HasPendingGains()) {
-      leftControl.pidConst.kp  = atState.pendingKp;
-      leftControl.pidConst.ki  = atState.pendingKi;
-      leftControl.pidConst.kd  = atState.pendingKd;
-      rightControl.pidConst.kp = atState.pendingKp;
-      rightControl.pidConst.ki = atState.pendingKi;
-      rightControl.pidConst.kd = atState.pendingKd;
-      SavePID(atState.pendingKp, atState.pendingKi, atState.pendingKd);
-      atState.pendingKp = atState.pendingKi = atState.pendingKd = -1.0f;
-      SendMessage(robots["Base"], "PID guardado en flash y aplicado");
-    } else {
-      SendMessage(robots["Base"], "SAVEPID: no hay gains pendientes — corre AUTOTUNE primero");
-    }
-  }
-
-  // RESET
-  else if (command == "RESET") {
-    ESP.restart();
-  }
-
-  // SERVO
-  else if (command == "SERVO") {
-    int servoAngle = constrain(arguments[1].toInt(), 5, 175);
-    DebugSerialPrintf("Servo: %d°\n", servoAngle);
-    frontServo.write(servoAngle);
-  }
-
-  // PID
-  else if (command == "PID") {
-    float kp = arguments[1].toFloat();
-    float ki = arguments[2].toFloat();
-    float kd = arguments[3].toFloat();
-
-    leftControl.pidConst.kp  = kp;
-    leftControl.pidConst.ki  = ki;
-    leftControl.pidConst.kd  = kd;
-    rightControl.pidConst.kp = kp;
-    rightControl.pidConst.ki = ki;
-    rightControl.pidConst.kd = kd;
-
-    char pidBuf[100];
-    if (arguments[4] == "SAVE") {
-      SavePID(kp, ki, kd);
-      snprintf(pidBuf, sizeof(pidBuf),
-               "PID modificado y GUARDADO: Kp=%.2f Ki=%.2f Kd=%.3f", kp, ki, kd);
-    } else {
-      snprintf(pidBuf, sizeof(pidBuf),
-               "PID modificado temporalmente: Kp=%.2f Ki=%.2f Kd=%.3f", kp, ki, kd);
-    }
-    SendMessage(robots["Base"], pidBuf);
-  }
-
-  // KFPID
-  else if (command == "KFPID") {
-    float R = arguments[1].toFloat();
-    float H = arguments[2].toFloat();
-    float Q = arguments[3].toFloat();
-
-    leftControl.kf.R = R;
-    leftControl.kf.H = H;
-    leftControl.kf.Q = Q;
-    rightControl.kf.R = R;
-    rightControl.kf.H = H;
-    rightControl.kf.Q = Q;
-    SendMessage(robots["Base"], "Filtro de kalman modificado");
-  }
-
-  // POSE
-  else if (command == "POSE") {
-    // Durante navegación Bug2 activa, ignorar POSE — robotPose solo se actualiza
-    // por POSITION_RESPONSE para evitar lecturas ArUco distorsionadas mid-rotación.
-    if (bug2.isActive) return;
-
-    float newX = arguments[1].toFloat();
-    float newY = arguments[2].toFloat();
-    float newAngle = arguments[3].toFloat();
-
-    if (robotPose.x != 0 || robotPose.y != 0) {
-      float deltaX = newX - robotPose.x;
-      float deltaY = newY - robotPose.y;
-      float distanceJump = sqrt(deltaX * deltaX + deltaY * deltaY);
-
-      float angleDiff = NormalizeAngle(newAngle - robotPose.angle);
-
-      if (distanceJump > max_pose_jump || abs(angleDiff) > max_angle_jump) {
-        // Saltos consistentes = la pose interna quedó obsoleta (robot movido a
-        // mano, cambio de origen). Tras varios rechazos seguidos, re-sincronizar
-        // con la cámara en vez de quedar atrapado ignorando para siempre.
-        poseJumpRejections++;
-        if (poseJumpRejections < max_pose_jump_rejections) {
-          char buffer[150];
-          snprintf(buffer, sizeof(buffer),
-                   "WARNING: Salto brusco detectado. ΔPos=%.1fmm, ΔAng=%.1f°. "
-                   "Ignorando actualización (%d/%d).",
-                   distanceJump, angleDiff, poseJumpRejections,
-                   max_pose_jump_rejections);
-          MessageDebugf("DEBUG: -1, ID: %s, %s", robotID.c_str(), buffer);
-          return;
-        }
-        MessageDebugf("DEBUG: -1, ID: %s, WARNING: %d saltos consecutivos — "
-                      "re-sincronizando pose con la cámara.",
-                      robotID.c_str(), poseJumpRejections);
-      }
-    }
-
-    poseJumpRejections = 0;
-    robotPose.x = newX;
-    robotPose.y = newY;
-    robotPose.angle = newAngle;
-  }
-
-  // SETPPR
-  else if (command == "SETPPR") {
-    float newPPR = arguments[1].toFloat();
-    bool permanent = (arguments[2] == "SAVE");
-
-    if (newPPR > 100 && newPPR < 5000) {
-      pulsesPerRev = newPPR;
-      updateMillimetersPerPulse();
-
-      char buffer[100];
-      if (permanent) {
-        SavePPR(newPPR);
-        snprintf(buffer, sizeof(buffer),
-                 "PPR modificado y GUARDADO: %.2f (Robot ID: %s)", newPPR,
-                 robotID.c_str());
-      } else {
-        snprintf(buffer, sizeof(buffer),
-                 "PPR modificado temporalmente: %.2f (Robot ID: %s)", newPPR,
-                 robotID.c_str());
-      }
-      SendMessage(robots["Base"], buffer);
-
-    } else {
-      SendMessage(robots["Base"], "Error: PPR debe estar entre 100-5000");
-    }
-  }
-
-  // GETPPR
-  else if (command == "GETPPR") {
-    char buffer[100];
-    snprintf(buffer, sizeof(buffer),
-             "Robot %s - PPR actual: %.2f, Chip ID: %04X%08X", robotID.c_str(),
-             pulsesPerRev, (uint16_t)(ESP.getEfuseMac() >> 32),
-             (uint32_t)ESP.getEfuseMac());
-    SendMessage(robots["Base"], buffer);
-  }
-
-  // CHECK_OBSTACLE
-  else if (command == "CHECK_OBSTACLE") {
-    int sensors = arguments[1].toInt();
-    float x = arguments[2].toFloat();
-    float y = arguments[3].toFloat();
-    float angle = arguments[4].toFloat();
-
-    String id = "-1";
-    for (const auto &pair : robots) {
-      if (pair.second.toString() == udp.remoteIP().toString()) {
-        id = pair.first;
-        break;
-      }
-    }
-
-    if (IsRobotObstacle(x, y, angle, sensors, id)) {
-      char buffer[50];
-      snprintf(buffer, sizeof(buffer), "OBSTACLE_DETECTED|%s", robotID.c_str());
-      delayMicroseconds(800);
-      SendMessage(robots[id], buffer);
-      SendMessage(robots[id], buffer);
-    }
-  }
-
-  // OBSTACLE_DETECTED
-  else if (command == "OBSTACLE_DETECTED") {
-    obstacles.fromRobotID = arguments[1];
-    obstacles.robotDetected = true;
-  }
-
-  // COUNT_MESSAGE
-  else if (command == "COUNT_MESSAGE") {
-    countMessages++;
-  }
-
-  // SEND_COUNT_MESSAGE
-  else if (command == "SEND_COUNT_MESSAGE") {
-    char buffer[50];
-    snprintf(buffer, sizeof(buffer), "Robot ID: %s, Total messages: %d",
-             robotID.c_str(), countMessages);
-    SendMessage(robots["Base"], buffer);
-  }
-
-  // CONGREGATION
-  else if (command == "CONGREGATION") {
-    congregation.leaderID = arguments[1];
-    congregation.isLeader = (congregation.leaderID == robotID);
-    congregation.positionReceived = false;
-    congregation.hasGlobalTarget = false;
-    congregation.followerIndex  = arguments[2].toInt();
-    congregation.totalFollowers = (arguments[3] != "") ? arguments[3].toInt() : 1;
-
-    nav.Reset();
-    navTarget.Reset();
-    instructionList.clear();
-
-    MessageDebugf("DEBUG: -1, ID: %s, Congregación iniciada. Líder: %s, slot: %d/%d",
-                  robotID.c_str(), congregation.leaderID.c_str(),
-                  congregation.followerIndex, congregation.totalFollowers);
-
-    int delay = robotID.toInt() * 200;
-    fsmInstruction[0] = WAIT;
-    fsmInstruction[1] = delay;
-    instructionList.push_back(fsmInstruction);
-
-    fsmInstruction[0] = REQUEST_POSITION;
-    fsmInstruction[1] = 0;
-    instructionList.push_back(fsmInstruction);
-  }
-
-  // GT / GOTO / POSITIONGT / BUG2 — Navegación con evasión activa de obstáculos
-  // Uso: GT|x|y          — navega al objetivo con Bug2
-  //      GT|x|y|seg      — ídem con segmento personalizado (50–400mm)
-  //      GT|x|y|dir      — dir=1 (pared derecha) o -1 (pared izquierda)
-  else if (command == "GT" || command == "GOTO" ||
-           command == "POSITIONGT" || command == "BUG2") {
-    float targetX = arguments[1].toFloat();
-    float targetY = arguments[2].toFloat();
-
-    if (abs(targetX) > max_workspace_x || abs(targetY) > max_workspace_y) {
-      char buffer[100];
-      snprintf(buffer, sizeof(buffer),
-               "ERROR: GT objetivo fuera de rango. X=%.1f (max=%.1f), "
-               "Y=%.1f (max=%.1f)",
-               targetX, max_workspace_x, targetY, max_workspace_y);
-      SendMessage(robots["Base"], buffer);
-      return;
-    }
-
-    // Argumento 3 opcional: distancia de segmento personalizada
-    if (arguments[3] != "") {
-      float arg3 = arguments[3].toFloat();
-      if (arg3 >= 50 && arg3 <= 400) nav.segmentDistance = arg3;
-    }
-
-    nav.goalX       = targetX;
-    nav.goalY       = targetY;
-    nav.pendingInit = true;
-    nav.isActive    = false;
-    instructionList.clear();
-
-    fsmInstruction[0] = REQUEST_POSITION;
-    fsmInstruction[1] = 0;
-    instructionList.push_back(fsmInstruction);
-
-    MessageDebugf("DEBUG: -1, ID: %s, GT: goal=(%.1f,%.1f) seg=%.0fmm",
-                  robotID.c_str(), targetX, targetY, nav.segmentDistance);
-    char ack[60];
-    snprintf(ack, sizeof(ack), "GT iniciado: goal=(%.0f,%.0f)", targetX, targetY);
-    SendMessage(robots["Base"], ack);
-  }
-
-  // POSITION_RESPONSE
-  else if (command == "POSITION_RESPONSE") {
-    // Ignorar respuestas no solicitadas (paquetes residuales de sesiones anteriores)
-    if (!congregation.waitingForResponse && !bug2.pendingInit && !nav.pendingInit) {
-      MessageDebugf("DEBUG: -1, ID: %s, POSITION_RESPONSE ignorado (no esperado)",
-                    robotID.c_str());
-      return;
-    }
-    robotPose.x = arguments[1].toFloat();
-    robotPose.y = arguments[2].toFloat();
-    robotPose.angle = arguments[3].toFloat();
-
-    MessageDebugf(
-        "DEBUG: -1, ID: %s, Posición recibida: x=%.1f, y=%.1f, ángulo=%.1f",
-        robotID.c_str(), robotPose.x, robotPose.y, robotPose.angle);
-
-    if (congregation.isLeader && congregation.leaderID != "-1") {
-      char buffer[64];
-      snprintf(buffer, sizeof(buffer), "LEADER_POSITION|%s|%.1f|%.1f|%.1f",
-               robotID.c_str(), robotPose.x, robotPose.y, robotPose.angle);
-
-      if (robots.find("Broadcast") != robots.end()) {
-        SendMessage(robots["Broadcast"], buffer);
-        delayMicroseconds(500);
-        SendMessage(robots["Broadcast"], buffer);
-      }
-    }
-
-    if (nav.isActive) {
-      ReactiveNavStep();
-    } else if (nav.pendingInit) {
-      nav.pendingInit = false;
-      nav.Start(nav.goalX, nav.goalY);
-      ReactiveNavStep();
-    }
-
-    congregation.positionReceived = true;
-  }
-
-  // LEADER_POSITION
-  else if (command == "LEADER_POSITION") {
-    String receivedLeaderID = arguments[1];
-
-    if (!congregation.isLeader && receivedLeaderID == congregation.leaderID) {
-      float leaderX = arguments[2].toFloat();
-      float leaderY = arguments[3].toFloat();
-
-      // Calcular punto de estacionamiento: slot en círculo alrededor del líder
-      // Distancia = 200mm (dos radios de robot + margen de 50mm)
-      const float PARKING_DIST = 200.0f;
-      int   n     = max(1, congregation.totalFollowers);
-      float angle = (2.0f * PI * congregation.followerIndex) / n;
-      float parkX = leaderX + PARKING_DIST * cos(angle);
-      float parkY = leaderY + PARKING_DIST * sin(angle);
-
-      if (nav.isActive) {
-        nav.goalX = parkX;
-        nav.goalY = parkY;
-      } else if (!nav.pendingInit) {
-        nav.goalX       = parkX;
-        nav.goalY       = parkY;
-        nav.pendingInit = true;
-        if (!congregation.waitingForResponse) {
-          fsmInstruction[0] = REQUEST_POSITION;
-          fsmInstruction[1] = 0;
-          instructionList.push_back(fsmInstruction);
-        }
-        MessageDebugf("DEBUG: -1, ID: %s, CONGREGATION: slot %d/%d → parking (%.1f,%.1f)",
-                      robotID.c_str(), congregation.followerIndex, n, parkX, parkY);
-      }
-    }
-  }
-
-  // CANCEL_CONGREGATION
-  else if (command == "CANCEL_CONGREGATION") {
-    congregation.Reset();
-    nav.Reset();
-    navTarget.Reset();
-    instructionList.clear();
-    state = STOP;
-    MessageDebugf("DEBUG: -1, ID: %s, Congregación cancelada", robotID.c_str());
-  }
-
-  // CLEAR_EVASION
-  else if (command == "CLEAR_EVASION") {
-    intContext.Clear();
-    isEvading = false;
-    resumeScheduled = false;
-    obstacles.Clear();
-    instructionList.clear();
-    state = STOP;
-    MessageDebugf("DEBUG: -1, ID: %s, Sistema de evasión reseteado",
-                  robotID.c_str());
-  }
-
-  // NAV_CONFIG — configura parámetros de GT (Bug2 seek)
-  // Uso: NAV_CONFIG|SEGMENT_DIST|250   NAV_CONFIG|ARRIVAL_THRESHOLD|20
-  else if (command == "NAV_CONFIG") {
-    if (arguments[1] == "SEGMENT_DIST") {
-      float newDist = arguments[2].toFloat();
-      if (newDist >= 50 && newDist <= 400) {
-        nav.segmentDistance = newDist;        // ReactiveNav (GT/congregación actual)
-        bug2.seekSegmentDistance = newDist;   // compat Bug2 legacy
-        navTarget.segmentDistance = newDist;
-        char buf[60];
-        snprintf(buf, sizeof(buf), "NAV_CONFIG: segmento=%.0fmm", newDist);
-        SendMessage(robots["Base"], buf);
-      }
-    } else if (arguments[1] == "ARRIVAL_THRESHOLD") {
-      float newThr = arguments[2].toFloat();
-      if (newThr >= 5 && newThr <= 200) {
-        nav.arrivalThreshold = newThr;        // ReactiveNav (GT/congregación actual)
-        bug2.arrivalThreshold = newThr;       // compat Bug2 legacy
-        char buf[60];
-        snprintf(buf, sizeof(buf), "NAV_CONFIG: llegada=%.0fmm", newThr);
-        SendMessage(robots["Base"], buf);
-      }
-    } else if (arguments[1] == "WHEEL_DIST") {
-      float newDist = arguments[2].toFloat();
-      if (newDist >= 20.0 && newDist <= 100.0) {
-        centerToWheelDistance = newDist;
-        char buf[60];
-        snprintf(buf, sizeof(buf), "NAV_CONFIG: wheel_dist=%.1fmm", newDist);
-        SendMessage(robots["Base"], buf);
-      }
-    } else if (arguments[1] == "YAW_SCALE") {
-      float newScale = arguments[2].toFloat();
-      if (newScale >= 0.9 && newScale <= 1.1) {
-        yawScale = newScale;
-        bool save = (arguments[3] == "SAVE");
-        if (save) {
-          preferences.begin("attabot-config", false);
-          preferences.putFloat("yaw_scale", yawScale);
-          preferences.end();
-        }
-        char buf[70];
-        snprintf(buf, sizeof(buf), "NAV_CONFIG: yaw_scale=%.4f%s", yawScale,
-                 save ? " (guardado)" : "");
-        SendMessage(robots["Base"], buf);
-      }
-    }
-  }
-
-  // SENSOR_MASK — ignora un sensor IR (diagnóstico de falsos positivos)
-  // Uso: SENSOR_MASK|L|1 (ignorar izquierdo)  SENSOR_MASK|L|0 (reactivar)
-  else if (command == "SENSOR_MASK") {
-    bool masked = (arguments[2].toInt() != 0);
-    if      (arguments[1] == "L") maskLeftIR    = masked;
-    else if (arguments[1] == "R") maskRightIR   = masked;
-    else if (arguments[1] == "C") maskCentralIR = masked;
-    char buf[80];
-    snprintf(buf, sizeof(buf), "SENSOR_MASK: L=%d R=%d C=%d (1=ignorado)",
-             (int)maskLeftIR, (int)maskRightIR, (int)maskCentralIR);
-    SendMessage(robots["Base"], buf);
-  }
-
-  // GET_STATUS
-  else if (command == "GET_STATUS") {
-    char buffer[250];
-    snprintf(
-        buffer, sizeof(buffer),
-        "STATUS|ID:%s|State:%d|NAV:%d|Evading:%d|Obs:%d|"
-        "Sensors:L%d-C%d-R%d|Pos:(%.1f,%.1f,%.1f)|"
-        "Goal:(%.1f,%.1f)|Yaw:%.1f|IMU:%d",
-        robotID.c_str(), state, (int)nav.isActive, (int)isEvading,
-        (int)obstacles.HasAnyObstacle(), (int)obstacles.leftObstacle,
-        (int)obstacles.centralObstacle, (int)obstacles.rightObstacle,
-        robotPose.x, robotPose.y, robotPose.angle,
-        nav.goalX, nav.goalY,
-        yaw, (int)imuAvailable);
-    SendMessage(robots["Base"], buffer);
-  }
-
-  else if (command == "RESET_EVASION") {
-    evasionTracker.Reset();
-    intContext.Clear();
-    isEvading = false;
-    resumeScheduled = false;
-    obstacles.Clear();
-    MessageDebugf(
-        "DEBUG: -1, ID: %s, ✅ Sistema de evasión reseteado manualmente",
-        robotID.c_str());
-  }
-
-  else if (command == "ABORT_NAV") {
-    nav.Reset();
-    bug2.Reset();
-    navTarget.Reset();
-    instructionList.clear();
-    imuTurnActive       = false;  // si se abortó a mitad de un giro, no dejar el
-    imuTurnIsCorrection = false;  // tracking IMU activo: el próximo TURN debe
-    imuTurnCorrCount    = 0;      // reinicializarse limpio (start yaw/accum/target)
-    state = STOP;
-    SendMessage(robots["Base"], "GT abortado");
-    MessageDebugf("DEBUG: -1, ID: %s, Navegación abortada manualmente",
-                  robotID.c_str());
-  }
-
-  // GET_YAW — retorna el yaw actual de la IMU para validación en Fase 2
-  // Uso desde la base: BASE.GET_YAW → responde YAW|<valor>|<imuAvailable>
-  else if (command == "GET_YAW") {
-    char buffer[60];
-    snprintf(buffer, sizeof(buffer), "YAW|%.2f|%d|%.3f",
-             yaw, (int)imuAvailable, imuGravity);
-    SendMessage(robots["Base"], buffer);
-  }
-}
-
-// ============================================================================
-// FUNCIONES AUXILIARES
-// ============================================================================
-
-void SelectMovementRW() {
-  int probabilityTurnPos = 15;
-  int probabilityMove = 70 * (obstacleDetected ? 0 : 1);
-  int probabilityTurnNeg = 15;
-  int totalProbabilities =
-      probabilityTurnPos + probabilityMove + probabilityTurnNeg;
-  std::array<int, 3> cumulativeProbabilities = {
-      probabilityTurnPos, probabilityTurnPos + probabilityMove,
-      totalProbabilities};
-  obstacleDetected = false;
-
-  int randomSelection = random(totalProbabilities);
-  int directionRW;
-  if (randomSelection < cumulativeProbabilities[0]) {
-    directionRW = TURN_POS;
-  } else if (randomSelection < cumulativeProbabilities[1]) {
-    directionRW = MOVE_FORWARD;
-  } else {
-    directionRW = TURN_NEG;
-  }
-
-  int angle = possibleAngles[random(possibleAngles.size() * 10) %
-                             possibleAngles.size()];
-  int distance = possibleAdvances[random(possibleAdvances.size() * 10) %
-                                  possibleAdvances.size()];
-  switch (directionRW) {
-  case TURN_POS: {
-    fsmInstruction[0] = TURN;
-    fsmInstruction[1] = radians(angle) * centerToWheelDistance;
-    break;
-  }
-
-  case MOVE_FORWARD: {
-    fsmInstruction[0] = MOVE;
-    fsmInstruction[1] = distance;
-    break;
-  }
-
-  case TURN_NEG: {
-    fsmInstruction[0] = TURN;
-    fsmInstruction[1] = -radians(angle) * centerToWheelDistance;
-    break;
-  }
-  }
-
-  instructionList.push_front(fsmInstruction);
-}
-
-void CommunicationTest() {
-  if (sendMessages < 500) {
-    sendMessages++;
-    for (const auto &pair : robots) {
-      if (pair.first != "Broadcast" && pair.first != "Base") {
-        SendMessage(pair.second, "COUNT_MESSAGE");
-      }
-    }
-  } else {
-    ledCtrl.setSolid(255, 0, 0, 255);
-  }
-}
-
-#ifdef DebugSerial
-void ReadSerialCommands() {
-  if (Serial.available()) {
-    String command = Serial.readString();
-    command.trim();
-
-    int separatorIndex = command.indexOf('|');
-    String cmd = command.substring(0, separatorIndex);
-    String valueStr = command.substring(separatorIndex + 1);
-    int value = valueStr.toInt();
-
-    if (cmd == "MOVE") {
-      fsmInstruction[0] = MOVE;
-      fsmInstruction[1] = value;
-      instructionList.push_back(fsmInstruction);
-      Serial.printf("Comando MOVE %d mm agregado\n", value);
-
-    } else if (cmd == "TURN") {
-      fsmInstruction[0] = TURN;
-      fsmInstruction[1] = radians(value) * centerToWheelDistance;
-      instructionList.push_back(fsmInstruction);
-      Serial.printf("Comando TURN %d grados agregado\n", value);
-
-    } else if (cmd == "STOP") {
-      instructionList.clear();
-      ConfigureHBridge(0, 0);
-      state = STOP;
-      Serial.println("Robot detenido");
-
-    } else {
-      Serial.println("Comandos: MOVE|valor, TURN|valor, STOP");
-    }
-  }
-}
-#endif
-
-// ============================================================================
-// FUNCIONES DE LED
-// ============================================================================
-
-void LedController::update() {
-  unsigned long now = millis();
-  switch (currentState) {
-  case OFF:
-    if (brightness != 0) {
-      brightness = 0;
-      FastLED.setBrightness(0);
-      FastLED.show();
-    }
-    break;
-
-  case SOLID:
-    if (now - lastUpdate > 50) {
-      leds[0] = CRGB(red, green, blue);
-      FastLED.setBrightness(brightness);
-      FastLED.show();
-      lastUpdate = now;
-    }
-    break;
-
-  case BLINKING:
-    if (now - lastUpdate >= interval) {
-      blinkState = !blinkState;
-      if (blinkState) {
-        leds[0] = CRGB(red, green, blue);
-        FastLED.setBrightness(brightness);
-      } else {
-        FastLED.setBrightness(0);
-      }
-      FastLED.show();
-      lastUpdate = now;
-    }
-    break;
-  }
-}
-
-void setLedColor(uint8_t red, uint8_t green, uint8_t blue) {
-  ledCtrl.setSolid(red, green, blue, maxBrightness);
-}
-
-void setLedBrightness(uint8_t brightness) {
-  ledCtrl.brightness = brightness;
-  if (brightness == 0)
-    ledCtrl.setOff();
-  else
-    ledCtrl.currentState = LedController::SOLID;
-}
-
-void setLedBlink(uint8_t red, uint8_t green, uint8_t blue,
-                 unsigned long intervalMs) {
-  ledCtrl.setBlink(red, green, blue, maxBrightness, intervalMs);
-}
-
-// ============================================================================
-// FUNCIONES IMU
-// ============================================================================
-
-void setupIMU() {
-  DebugSerialPrintln("Inicializando IMU ICM-20948...");
-
-  bool imuDetected = false;
-  int attempts = 0;
-  const int maxAttempts = 3;
-
-  while (!imuDetected && attempts < maxAttempts) {
-    attempts++;
-    DebugSerialPrintf("Intento %d/%d de conexión con IMU...\n", attempts, maxAttempts);
-
-    imu.begin(Wire, AD0_VAL);
-
-    if (imu.status == ICM_20948_Stat_Ok) {
-      imuDetected = true;
-      DebugSerialPrintln("IMU detectada correctamente");
-    } else {
-      DebugSerialPrintf("Error al conectar con IMU. Status: %d\n", imu.status);
-      delay(500);
-    }
-  }
-
-  if (!imuDetected) {
-    DebugSerialPrintln("ERROR CRÍTICO: No se pudo detectar la IMU");
-    DebugSerialPrintln("Verifica:");
-    DebugSerialPrintln("  1. Conexión física del cable Qwiic");
-    DebugSerialPrintln("  2. AD0_VAL debe ser 1 (0x69) o 0 (0x68)");
-    DebugSerialPrintln("  3. Que no haya conflictos con otros dispositivos I2C");
-    ledCtrl.setBlink(255, 0, 0, maxBrightness, 500);
-    return;  // imuAvailable permanece false
-  }
-
-  DebugSerialPrintln("Inicializando DMP...");
-  bool success = true;
-
-  success &= (imu.initializeDMP() == ICM_20948_Stat_Ok);
-  if (!success) {
-    DebugSerialPrintln("ERROR: Falló initializeDMP()");
-    DebugSerialPrintln("Verifica que ICM_20948_USE_DMP esté definido en ICM_20948_C.h");
-    ledCtrl.setBlink(255, 128, 0, maxBrightness, 300);
-    return;
-  }
-
-  success &= (imu.enableDMPSensor(INV_ICM20948_SENSOR_ROTATION_VECTOR) == ICM_20948_Stat_Ok);
-  success &= (imu.enableDMPSensor(INV_ICM20948_SENSOR_ACCELEROMETER)   == ICM_20948_Stat_Ok);
-
-  if (!success) {
-    DebugSerialPrintln("ERROR: Falló habilitando sensores DMP");
-    return;
-  }
-
-  success &= (imu.setDMPODRrate(DMP_ODR_Reg_Quat9, 1) == ICM_20948_Stat_Ok);
-  success &= (imu.setDMPODRrate(DMP_ODR_Reg_Accel, 1) == ICM_20948_Stat_Ok);
-  success &= (imu.enableFIFO()  == ICM_20948_Stat_Ok);
-  success &= (imu.enableDMP()   == ICM_20948_Stat_Ok);
-  success &= (imu.resetDMP()    == ICM_20948_Stat_Ok);
-  success &= (imu.resetFIFO()   == ICM_20948_Stat_Ok);
-
-  if (!success) {
-    DebugSerialPrintln("ERROR: Falló configurando FIFO/DMP");
-    ledCtrl.setBlink(0, 255, 0, maxBrightness, 300);
-    return;
-  }
-
-  // --- Restaurar calibración desde Preferences ---
-  biasStore store;
-  preferences.begin("attabot-config", true);  // read-only
-  store.biasGyroX  = preferences.getInt("bias_gx", 0);
-  store.biasGyroY  = preferences.getInt("bias_gy", 0);
-  store.biasGyroZ  = preferences.getInt("bias_gz", 0);
-  store.biasAccelX = preferences.getInt("bias_ax", 0);
-  store.biasAccelY = preferences.getInt("bias_ay", 0);
-  store.biasAccelZ = preferences.getInt("bias_az", 0);
-  store.biasCPassX = preferences.getInt("bias_cx", 0);
-  store.biasCPassY = preferences.getInt("bias_cy", 0);
-  store.biasCPassZ = preferences.getInt("bias_cz", 0);
-  preferences.end();
-
-  if (store.IsValid()) {
-    DebugSerialPrintln("Calibración válida encontrada en Preferences");
-    bool calOk = true;
-    calOk &= (imu.setBiasGyroX(store.biasGyroX)   == ICM_20948_Stat_Ok);
-    calOk &= (imu.setBiasGyroY(store.biasGyroY)   == ICM_20948_Stat_Ok);
-    calOk &= (imu.setBiasGyroZ(store.biasGyroZ)   == ICM_20948_Stat_Ok);
-    calOk &= (imu.setBiasAccelX(store.biasAccelX) == ICM_20948_Stat_Ok);
-    calOk &= (imu.setBiasAccelY(store.biasAccelY) == ICM_20948_Stat_Ok);
-    calOk &= (imu.setBiasAccelZ(store.biasAccelZ) == ICM_20948_Stat_Ok);
-    calOk &= (imu.setBiasCPassX(store.biasCPassX) == ICM_20948_Stat_Ok);
-    calOk &= (imu.setBiasCPassY(store.biasCPassY) == ICM_20948_Stat_Ok);
-    calOk &= (imu.setBiasCPassZ(store.biasCPassZ) == ICM_20948_Stat_Ok);
-
-    if (calOk) {
-      DebugSerialPrintln("Calibración restaurada correctamente");
-    } else {
-      DebugSerialPrintln("ADVERTENCIA: Falló al aplicar calibración");
-    }
-  } else {
-    DebugSerialPrintln("ADVERTENCIA: No hay calibración válida en Preferences");
-    DebugSerialPrintln("La IMU funcionará con valores por defecto");
-  }
-
-  imuAvailable = true;
-  DebugSerialPrintln("IMU inicializada exitosamente");
-  ledCtrl.setSolid(0, 255, 0, maxBrightness);
-  delay(1000);
-  ledCtrl.setOff();
-}
-
-void LeerYaw() {
-  if (!imuAvailable) return;
-
-  // El DMP produce a ~112Hz y este loop lee a ≤50Hz: hay que drenar TODOS
-  // los paquetes pendientes y quedarse con el más reciente. No usar
-  // resetFIFO() con el DMP activo — deja paquetes parciales que corrompen
-  // las lecturas siguientes (yaw congelado durante giros).
-  icm_20948_DMP_data_t data;
-  bool   gotQuat = false;
-  double q1 = 0, q2 = 0, q3 = 0;
-
-  for (int i = 0; i < 20; i++) {
-    imu.readDMPdataFromFIFO(&data);
-
-    if ((imu.status != ICM_20948_Stat_Ok) &&
-        (imu.status != ICM_20948_Stat_FIFOMoreDataAvail)) {
-      if (imu.status != ICM_20948_Stat_FIFONoDataAvail) {
-        DebugSerialPrintf("Error leyendo FIFO: %d\n", imu.status);
-      }
-      break;
-    }
-
-    if ((data.header & DMP_header_bitmap_Quat9) > 0) {
-      q1 = ((double)data.Quat9.Data.Q1) / 1073741824.0;
-      q2 = ((double)data.Quat9.Data.Q2) / 1073741824.0;
-      q3 = ((double)data.Quat9.Data.Q3) / 1073741824.0;
-      gotQuat = true;
-    }
-
-    if ((data.header & DMP_header_bitmap_Accel) > 0) {
-      float accX = (float)data.Raw_Accel.Data.X / conversionFactor;
-      float accY = (float)data.Raw_Accel.Data.Y / conversionFactor;
-      float accZ = (float)data.Raw_Accel.Data.Z / conversionFactor;
-      imuGravity = sqrt(accX * accX + accY * accY + accZ * accZ);
-    }
-
-    if (imu.status != ICM_20948_Stat_FIFOMoreDataAvail) break;
-  }
-
-  if (gotQuat) {
-    double q0 = sqrt(1.0 - ((q1 * q1) + (q2 * q2) + (q3 * q3)));
-    double t3 = +2.0 * (q0 * q3 + q1 * q2);
-    double t4 = +1.0 - 2.0 * (q2 * q2 + q3 * q3);
-    yaw = fmod(-atan2(t3, t4) * RAD_TO_DEG + 450.0, 360.0);
-    DebugSerialPrintf("Yaw actual: %.2f°\n", yaw);
-  }
 }

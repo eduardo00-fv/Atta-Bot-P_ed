@@ -1,0 +1,19 @@
+{
+    "files.associations": {
+        "*.ino": "cpp"
+    },
+    "python.defaultInterpreterPath": "${workspaceFolder}/Base/.venv/bin/python",
+    "explorer.excludeGitIgnore": true,
+    "files.exclude": {
+        "**/__pycache__": true
+    },
+    "search.exclude": {
+        "**/.venv": true,
+        "Controller/AttaBot/build": true,
+        "Base/PositionLogs": true,
+        "Base/ConsoleLogs": true,
+        "Base/Videos": true,
+        "Base/analisis_30-07": true,
+        "Base/simulacion_31-07": true
+    }
+}
